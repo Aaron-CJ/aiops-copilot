@@ -1,8 +1,18 @@
 server:
   port: 8080
+
 spring:
   application:
     name: aiops-copilot
   threads:
     virtual:
       enabled: true
+  ai:
+    model:
+      chat: ollama
+    ollama:
+      base-url: http://localhost:11434
+      init:
+        pull-model-strategy: never
+      chat:
+        model: deepseek-r1:8b

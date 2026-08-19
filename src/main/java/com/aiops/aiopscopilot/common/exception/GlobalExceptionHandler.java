@@ -7,9 +7,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.validation.BindException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
  * 全局异常处理器，统一返回 Result 结构
@@ -38,6 +40,26 @@ public class GlobalExceptionHandler {
 		String message = extractValidationMessage(e);
 		log.warn("参数校验失败: {}", message);
 		return Result.fail(ResultCode.BAD_REQUEST, message);
+	}
+
+	/**
+	 * 处理缺少请求参数异常（@RequestParam 必填参数缺失）
+	 */
+	@ExceptionHandler(MissingServletRequestParameterException.class)
+	@ResponseStatus(HttpStatus.BAD_REQUEST)
+	public Result<Void> handleMissingParameterException(MissingServletRequestParameterException e) {
+		log.warn("缺少请求参数: {}", e.getParameterName());
+		return Result.fail(ResultCode.BAD_REQUEST, "缺少必需的请求参数: " + e.getParameterName());
+	}
+
+	/**
+	 * 处理静态资源不存在异常（如浏览器自动请求 favicon.ico）
+	 */
+	@ExceptionHandler(NoResourceFoundException.class)
+	@ResponseStatus(HttpStatus.NOT_FOUND)
+	public Result<Void> handleNoResourceFoundException(NoResourceFoundException e) {
+		log.debug("静态资源不存在: {}", e.getResourcePath());
+		return Result.fail(ResultCode.NOT_FOUND);
 	}
 
 	/**
