@@ -10,9 +10,27 @@ spring:
   ai:
     model:
       chat: ollama
+      embedding: ollama
     ollama:
       base-url: http://localhost:11434
       init:
         pull-model-strategy: never
       chat:
         model: deepseek-r1:8b
+      embedding:
+        model: nomic-embed-text
+    vectorstore:
+      milvus:
+        client:
+          host: localhost
+          port: 19530
+          username: root
+          password: milvus
+        database-name: default
+        collection-name: aiops_knowledge
+        # 必须与 Ollama embedding 模型维度保持一致（nomic-embed-text = 768）
+        embedding-dimension: 768
+        index-type: IVF_FLAT
+        metric-type: COSINE
+        # 启动时自动创建 Milvus Collection（含向量字段与索引）
+        initialize-schema: true

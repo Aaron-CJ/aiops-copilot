@@ -28,7 +28,10 @@ dependencies {
 	
     // Spring AI 2.0 Ollama Starter
     implementation 'org.springframework.ai:spring-ai-starter-model-ollama'
-	
+
+    // Spring AI 2.0 Milvus Vector Store Starter
+    implementation 'org.springframework.ai:spring-ai-starter-vector-store-milvus'
+
 	testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
 	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
