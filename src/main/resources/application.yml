@@ -4,33 +4,48 @@ server:
 spring:
   application:
     name: aiops-copilot
+  # 启用 JDK 21 虚拟线程：Tomcat 每个请求改由轻量虚拟线程处理，
+  # 等待 LLM 生成这类长时间阻塞 IO 时不再占满平台线程池
   threads:
     virtual:
       enabled: true
   ai:
+    # Spring AI 2.0 允许同时引入多种模型实现（ollama/openai/...），
+    # 此处显式指定 chat 与 embedding 分别激活哪一种实现
     model:
       chat: ollama
       embedding: ollama
     ollama:
+      # Ollama 后台服务地址（Windows 服务默认监听 11434）
       base-url: http://localhost:11434
       init:
+        # 启动时不自动 pull 缺失的模型，由开发者手动 ollama pull，
+        # 避免应用启动时因静默下载大模型而长时间卡住
         pull-model-strategy: never
       chat:
+        # 对话模型：deepseek-r1:8b（带 thinking 能力的推理模型）
         model: deepseek-r1:8b
       embedding:
+        # 向量化模型：输出 768 维，必须与下方 Milvus embedding-dimension 一致
         model: nomic-embed-text
     vectorstore:
       milvus:
         client:
+          # Milvus standalone（Docker）的 gRPC 地址与默认凭据
           host: localhost
           port: 19530
           username: root
           password: milvus
+        # Milvus 的 database（类似关系库的"库"），下方的 collection 类似"表"
         database-name: default
+        # 存放知识片段的 collection 名，含向量与文本字段
         collection-name: aiops_knowledge
-        # 必须与 Ollama embedding 模型维度保持一致（nomic-embed-text = 768）
+        # 必须与 Ollama embedding 模型维度保持一致（nomic-embed-text = 768），
+        # 不一致会导致写入/检索时报维度不匹配
         embedding-dimension: 768
+        # 向量索引类型：IVF_FLAT 是中小规模数据的常用取舍（内存占用小，召回精度略降）
         index-type: IVF_FLAT
+        # 相似度度量方式：COSINE 余弦相似度，语义检索场景最常用
         metric-type: COSINE
-        # 启动时自动创建 Milvus Collection（含向量字段与索引）
+        # 启动时自动创建 Collection（含向量字段与索引），已存在则跳过
         initialize-schema: true

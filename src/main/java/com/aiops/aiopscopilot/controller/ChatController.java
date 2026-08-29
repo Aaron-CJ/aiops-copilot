@@ -7,6 +7,10 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+/**
+ * 基础对话接口：一次性返回完整回复（非流式）。
+ * SSE 流式版本与 RAG 问答见 {@link AiChatController}。
+ */
 @RestController
 @RequestMapping("/api/chat")
 public class ChatController {
