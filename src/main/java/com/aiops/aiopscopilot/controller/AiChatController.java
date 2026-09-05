@@ -159,7 +159,7 @@ public class AiChatController {
     private String retrieveContext(String message) {
         List<Document> docs = vectorStore.similaritySearch(
                 SearchRequest.builder().query(message).topK(3).build());
-        if (docs == null || docs.isEmpty()) {
+        if (docs.isEmpty()) {
             return null;
         }
         return docs.stream()
