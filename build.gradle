@@ -24,6 +24,14 @@ repositories {
 
 dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter-webmvc'
+
+	// Actuator：暴露 /actuator/** 监控端点（health/metrics/prometheus 等）
+	implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+	// Micrometer Prometheus 注册表：把 JVM/GC/HTTP 等指标转成 Prometheus 文本格式，
+	// 供 /actuator/prometheus 输出。版本由 Spring Boot BOM 统一管理
+	implementation 'io.micrometer:micrometer-registry-prometheus'
+
 	implementation platform("org.springframework.ai:spring-ai-bom:2.0.0")
 	
     // Spring AI 2.0 Ollama Starter

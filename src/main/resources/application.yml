@@ -49,3 +49,16 @@ spring:
         metric-type: COSINE
         # 启动时自动创建 Collection（含向量字段与索引），已存在则跳过
         initialize-schema: true
+
+# Actuator 监控端点配置
+management:
+  endpoints:
+    web:
+      exposure:
+        # 默认只暴露 health，这里显式放行 prometheus（指标抓取）与 info
+        # 不建议 include: *，env/beans/threaddump 等端点会泄露敏感信息
+        include: health,info,prometheus
+  metrics:
+    tags:
+      # 给所有指标打上应用名标签，Prometheus/Grafana 可按 application 维度聚合
+      application: ${spring.application.name}
