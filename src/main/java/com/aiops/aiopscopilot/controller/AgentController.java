@@ -11,13 +11,15 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 智能运维 Agent 接口（被动响应）：基于 deepseek-r1:8b + Spring AI Function Calling。
+ * 智能运维 Agent 接口（被动响应）：基于 qwen3:8b + Spring AI Function Calling。
  * <p>
  * 与 RAG 接口的区别：RAG 是"检索知识库 + 生成答案"，
  * Agent 是"模型自主调用工具拿到真实数据 + 生成答案"——本质都是给 LLM 接外部能力。
  * <p>
  * 与 {@link com.aiops.aiopscopilot.service.OpsScheduler}（主动巡检）的区别：
- * 本接口是"用户问才查"，调度器是"每分钟自己查"。两者共用同一个 opsAgentClient Bean。
+ * 本接口是"用户问才查"，调度器是"每分钟自己查"。两者模型统一为 qwen3:8b
+ * （本接口走 opsAgentClient 带工具 schema，调度器走 qwenChatClient 无需工具），
+ * 避免 Ollama 单模型驻留下两模型交替触发反复换载。
  */
 @RestController
 @RequestMapping("/api/agent")
@@ -30,14 +32,14 @@ public class AgentController {
     }
 
     /**
-     * 服务器健康检查 Agent：用户用自然语言提问，由 deepseek-r1 自主决定调用哪些工具。
+     * 服务器健康检查 Agent：用户用自然语言提问，由模型（qwen3:8b）自主决定调用哪些工具。
      * <p>
      * 可用工具：
      * <ul>
      *   <li>{@link SystemHealthTools#getServerHealth()} — 瞬时 CPU/内存（本地 MXBean）</li>
      *   <li>{@link PrometheusTool#queryMetric(String)} — 时序指标（Prometheus 历史 QPS/GC/线程数）</li>
      * </ul>
-     * 调用链：用户问题 → deepseek-r1 分析 → Function Calling 拿真实指标 → 模型生成评估 → 返回。
+     * 调用链：用户问题 → qwen3:8b 分析 → Function Calling 拿真实指标 → 模型生成评估 → 返回。
      *
      * @param message 用户提问，默认请求一次综合健康检查
      * @return 模型生成的健康评估文本

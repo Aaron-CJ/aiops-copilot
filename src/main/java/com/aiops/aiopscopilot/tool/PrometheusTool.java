@@ -1,5 +1,6 @@
 package com.aiops.aiopscopilot.tool;
 
+import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
@@ -31,9 +32,11 @@ import tools.jackson.databind.ObjectMapper;
 public class PrometheusTool {
 
     private final RestClient restClient;
+    private final String prometheusBaseUrl;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public PrometheusTool(@Value("${aiops.prometheus.base-url:http://localhost:9090}") String baseUrl) {
+        this.prometheusBaseUrl = baseUrl;
         this.restClient = RestClient.builder().baseUrl(baseUrl).build();
     }
 
@@ -78,7 +81,7 @@ public class PrometheusTool {
     /**
      * 巡检调度器专用：一次性批量查询 6 条核心指标返回结构化快照。
      * <p>
-     * 设计意图：巡检每分钟跑一次，让 deepseek-r1 通过 Function Calling 自主查 6 个指标
+     * 设计意图：巡检每分钟跑一次，让模型通过 Function Calling 自主查 6 个指标
      * 会产生 5-10 次工具调用往返、消耗大量 token 且时延高。改为调度器预拉数据塞 Prompt，
      * 模型只负责"判断"——这正是用户描述的"让模型当判断工，不是查询工"。
      */
@@ -134,10 +137,25 @@ public class PrometheusTool {
         return result;
     }
 
+    /**
+     * 调用 Prometheus /api/v1/query 并返回 data.result 节点。
+     * <p>
+     * 编码方案（踩过两次坑后的最终版）：
+     * 1) 坑一：手动 URLEncoder.encode 后拼进 uriBuilder 字符串 —— RestClient 会对 % 再次编码（% → %25），
+     *    全部查询失败，只有纯字母指标名侥幸通过；
+     * 2) 坑二：改用 uriBuilder.queryParam(...) 依赖 Spring 自动编码 —— 双引号（PromQL label 过滤必备，
+     *    如 {state="blocked"}、{area="heap"}）不被正确编码，请求发坏，heap/blocked 类查询全挂，
+     *    而不带引号的 rate(...[1m]) 反而成功——症状极具迷惑性；
+     * 3) 最终方案：URLEncoder.encode 编码一次 + 传 java.net.URI 绝对地址，
+     *    RestClient 对 URI 对象不做任何再编码，发出去的就是编码好的最终形态。
+     * <p>
+     * URLEncoder 会把空格编成 +，query 参数的标准解码规则会把 + 还原为空格，对 PromQL 语法无影响。
+     */
     private JsonNode queryRaw(String promql) throws Exception {
-        String encoded = URLEncoder.encode(promql, StandardCharsets.UTF_8);
+        String url = prometheusBaseUrl + "/api/v1/query?query="
+                + URLEncoder.encode(promql, StandardCharsets.UTF_8);
         String body = restClient.get()
-                .uri("/api/v1/query?query=" + encoded)
+                .uri(URI.create(url))
                 .retrieve()
                 .body(String.class);
         return objectMapper.readTree(body).path("data").path("result");

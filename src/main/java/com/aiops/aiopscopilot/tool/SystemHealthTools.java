@@ -24,8 +24,9 @@ public class SystemHealthTools {
 
     /**
      * 获取服务器 CPU 占用率与内存剩余。
-     * 由 qwenChatClient 注册为可调用工具，用户提问"服务器健康"等运维问题时，
-     * 模型会自动调用本方法获取真实指标，避免幻觉。
+     * 由 opsAgentClient（/api/agent/ops 交互问答）注册为可调用工具，
+     * 用户提问"服务器健康"等运维问题时模型自动调用本方法获取真实指标，避免幻觉。
+     * 注意：巡检用的 qwenChatClient 刻意不挂工具——巡检数据由调度器预拉后直接塞 Prompt。
      */
     @Tool(description = "获取当前服务器的 CPU 占用率（百分比）和剩余可用内存（字节与 MB）。"
             + "当用户询问服务器健康状态、CPU 使用率、内存剩余等运维问题时调用此工具。")

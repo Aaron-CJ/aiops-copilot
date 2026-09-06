@@ -11,7 +11,7 @@ import org.springframework.stereotype.Component;
  * <p>
  * 当前实现：控制台 ERROR 级日志输出 ASCII 框线格式告警报告。
  * 这套替代了传统 Alertmanager 的"无脑阈值告警 + 无上下文短信"——
- * 我们的告警已经包含根因分析和处置建议（由 deepseek-r1 生成）。
+ * 我们的告警已经包含根因分析和处置建议（由运维 Agent 模型 qwen3:8b 生成）。
  * <p>
  * 后续替换为钉钉/飞书 Webhook 时，只需修改 {@link #report} 方法体，
  * 把 StringBuilder 拼好的内容改成 HTTP POST 即可，调用方无需改动。

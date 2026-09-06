@@ -19,34 +19,41 @@ import tools.jackson.databind.ObjectMapper;
  * 核心架构：
  * <ol>
  *   <li>主动巡检（{@link Scheduled}）：每分钟拉 Prometheus 核心指标</li>
- *   <li>智能判断（deepseek-r1）：把指标快照塞 Prompt，让模型判断是否异常 + 给出根因</li>
+ *   <li>智能判断（qwen3:8b，关闭思考链）：把指标快照塞 Prompt，让模型判断是否异常 + 给出根因</li>
  *   <li>分级响应：normal → INFO 静默；warning/critical → 结构化告警报告</li>
  * </ol>
  * <p>
  * 与 Alertmanager 的本质差异：Alertmanager 是"硬编码阈值 + 无上下文短信"，
  * 我们是"AI 理解业务语义 + 自带根因分析 + 自带处置建议"。
+ * <p>
+ * 为什么巡检用 qwen3:8b（关闭思考链）而不是 deepseek-r1：
+ * 巡检每分钟跑一次，单次延迟必须远小于 60 秒。deepseek-r1:8b 在 CPU 上推理 + 长思考链
+ * 单次需 5-8 分钟，会导致巡检任务堆积、永远赶不上调度周期。巡检场景只需"看指标→判异常→
+ * 输出 JSON"，不需要深度推理，qwen3:8b 关闭思考链后直出结论、速度快数倍且足够胜任。
+ * 交互问答（/api/agent/ops）同样统一用 qwen3:8b（opsAgentClient）：
+ * 巡检与交互共用同一模型，避免 Ollama 单模型驻留下两模型交替触发反复换载（每次 10-30 秒）。
  */
 @Component
 public class OpsScheduler {
 
     private static final Logger log = LoggerFactory.getLogger(OpsScheduler.class);
 
-    private final ChatClient opsAgentClient;
+    private final ChatClient inspectorChatClient;
     private final PrometheusTool prometheusTool;
     private final OpsAlertReporter reporter;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public OpsScheduler(@Qualifier("opsAgentClient") ChatClient opsAgentClient,
+    public OpsScheduler(@Qualifier("qwenChatClient") ChatClient inspectorChatClient,
                         PrometheusTool prometheusTool,
                         OpsAlertReporter reporter) {
-        this.opsAgentClient = opsAgentClient;
+        this.inspectorChatClient = inspectorChatClient;
         this.prometheusTool = prometheusTool;
         this.reporter = reporter;
     }
 
     /**
      * 每 60 秒主动巡检一次，应用启动 30 秒后首次执行（给 Prometheus 留够抓取周期）。
-     * 用 fixedDelay 而非 fixedRate：巡检本身可能耗时 5-10 秒（deepseek-r1 推理），
+     * 用 fixedDelay 而非 fixedRate：巡检本身可能耗时 5-15 秒（qwen3 推理），
      * fixedDelay 保证两次巡检"结束→开始"间隔恰好 60 秒，不会任务堆积。
      */
     @Scheduled(fixedDelay = 60_000, initialDelay = 30_000)
@@ -58,7 +65,7 @@ public class OpsScheduler {
 
             // 2. 构造结构化 Prompt 让模型判断
             String prompt = buildInspectionPrompt(snapshot);
-            String reply = opsAgentClient.prompt()
+            String reply = inspectorChatClient.prompt()
                     .user(prompt)
                     .call()
                     .content();
@@ -128,7 +135,7 @@ public class OpsScheduler {
     private String extractJson(String reply) {
         if (reply == null) return "";
         String s = reply.trim();
-        // 去除 deepseek-r1 思考过程（即使配置关闭了，加这层兜底更稳）
+        // 去除模型思考过程（r1/qwen3 的 <think> 段；即使配置关闭思考，加这层兜底更稳）
         int thinkEnd = s.indexOf("</think>");
         if (thinkEnd >= 0) {
             s = s.substring(thinkEnd + "</think>".length()).trim();
