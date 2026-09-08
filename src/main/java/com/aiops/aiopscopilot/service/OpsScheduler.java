@@ -10,6 +10,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import com.aiops.aiopscopilot.tool.PrometheusTool;
+import com.aiops.aiopscopilot.tool.SystemHealthTools;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -40,14 +41,17 @@ public class OpsScheduler {
 
     private final ChatClient inspectorChatClient;
     private final PrometheusTool prometheusTool;
+    private final SystemHealthTools systemHealthTools;
     private final OpsAlertReporter reporter;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public OpsScheduler(@Qualifier("qwenChatClient") ChatClient inspectorChatClient,
                         PrometheusTool prometheusTool,
+                        SystemHealthTools systemHealthTools,
                         OpsAlertReporter reporter) {
         this.inspectorChatClient = inspectorChatClient;
         this.prometheusTool = prometheusTool;
+        this.systemHealthTools = systemHealthTools;
         this.reporter = reporter;
     }
 
@@ -63,14 +67,23 @@ public class OpsScheduler {
             // 1. 预拉指标快照（不让模型自主查，省 token + 时延）
             Map<String, Object> snapshot = prometheusTool.queryFixedMetrics();
 
-            // 2. 构造结构化 Prompt 让模型判断
+            // 2. 二级诊断：当 Prometheus 显示 BLOCKED 线程数 > 0 时，主动调用 ThreadMXBean 检测死锁。
+            //    Prometheus 只能告诉我们"有几个阻塞线程"，ThreadMXBean 才能告诉我们
+            //    "是否真死锁 + 谁在等谁的锁 + 阻塞在哪个方法"——
+            //    这套组合 = Prometheus 是触角，ThreadMXBean 是显微镜。
+            Object blocked = snapshot.get("blockedThreads");
+            if (blocked instanceof Double && (Double) blocked > 0) {
+                snapshot.put("deadlockDiagnosis", systemHealthTools.detectDeadlock());
+            }
+
+            // 3. 构造结构化 Prompt 让模型判断
             String prompt = buildInspectionPrompt(snapshot);
             String reply = inspectorChatClient.prompt()
                     .user(prompt)
                     .call()
                     .content();
 
-            // 3. 解析模型输出，分级响应
+            // 4. 解析模型输出，分级响应
             handleInspectionResult(reply, snapshot);
         } catch (Exception e) {
             // 巡检自身失败不能让调度器崩——下个周期继续跑
@@ -90,7 +103,10 @@ public class OpsScheduler {
                 + "1) CPU 使用率过高（>0.8 警告，>0.95 严重）\n"
                 + "2) 堆内存是否接近 OOM（注意持续增长比绝对值更重要）\n"
                 + "3) QPS 是否异常下跌（端口还在但 QPS=0 是应用假死信号）\n"
-                + "4) BLOCKED 线程数 > 0 是死锁的强信号\n"
+                + "4) BLOCKED 线程数 > 0 是死锁的强信号；若快照含 deadlockDiagnosis 字段，"
+                + "deadlockDetected=true 即确认为死锁，应明确在 rootCause 中写出'存在死锁'，"
+                + "deadlockedThreads 列出了死锁线程的名称、状态、等待的锁、锁持有者和栈帧，"
+                + "应据此定位到具体方法并给出处置建议（如重启应用、修复某 Controller 的锁顺序）\n"
                 + "5) 5 分钟内 GC 次数过频（>10 次可能是内存泄漏）\n"
                 + "6) 指标值 = -1 表示查询失败，不应判为异常\n\n"
                 + "仅输出严格的 JSON（不要 markdown 代码块、不要任何解释文字），格式：\n"
