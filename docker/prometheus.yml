@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+  # 1. 监控 Spring Boot 应用
+  - job_name: 'aiops-copilot'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+  # 2. 监控 Milvus 3.0
+  - job_name: 'milvus'
+    static_configs:
+      - targets: ['standalone:9091']

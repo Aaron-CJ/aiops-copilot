@@ -43,16 +43,19 @@ public class OpsScheduler {
     private final PrometheusTool prometheusTool;
     private final SystemHealthTools systemHealthTools;
     private final OpsAlertReporter reporter;
+    private final MetricsService metricsService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public OpsScheduler(@Qualifier("qwenChatClient") ChatClient inspectorChatClient,
                         PrometheusTool prometheusTool,
                         SystemHealthTools systemHealthTools,
-                        OpsAlertReporter reporter) {
+                        OpsAlertReporter reporter,
+                        MetricsService metricsService) {
         this.inspectorChatClient = inspectorChatClient;
         this.prometheusTool = prometheusTool;
         this.systemHealthTools = systemHealthTools;
         this.reporter = reporter;
+        this.metricsService = metricsService;
     }
 
     /**
@@ -63,6 +66,7 @@ public class OpsScheduler {
     @Scheduled(fixedDelay = 60_000, initialDelay = 30_000)
     public void runInspection() {
         log.info("[OpsScheduler] 开始巡检...");
+        long start = System.currentTimeMillis();
         try {
             // 1. 预拉指标快照（不让模型自主查，省 token + 时延）
             Map<String, Object> snapshot = prometheusTool.queryFixedMetrics();
@@ -84,9 +88,10 @@ public class OpsScheduler {
                     .content();
 
             // 4. 解析模型输出，分级响应
-            handleInspectionResult(reply, snapshot);
+            handleInspectionResult(reply, snapshot, start);
         } catch (Exception e) {
             // 巡检自身失败不能让调度器崩——下个周期继续跑
+            metricsService.recordInspection("error", System.currentTimeMillis() - start);
             log.error("[OpsScheduler] 巡检失败: {}", e.getMessage(), e);
         }
         log.info("[OpsScheduler] 巡检周期结束");
@@ -126,7 +131,8 @@ public class OpsScheduler {
      *   <li>JSON 解析失败时原文走 ERROR 日志，不让模型胡言乱语搞崩巡检链路</li>
      * </ul>
      */
-    private void handleInspectionResult(String reply, Map<String, Object> snapshot) {
+    private void handleInspectionResult(String reply, Map<String, Object> snapshot, long start) {
+        long durationMs = System.currentTimeMillis() - start;
         String json = extractJson(reply);
         try {
             JsonNode node = objectMapper.readTree(json);
@@ -134,6 +140,8 @@ public class OpsScheduler {
             String summary = node.path("summary").asText("无摘要");
             String rootCause = node.path("rootCause").asText("N/A");
             String suggestion = node.path("suggestion").asText("N/A");
+
+            metricsService.recordInspection(status, durationMs);
 
             if ("normal".equalsIgnoreCase(status)) {
                 reporter.logNormal(snapshot);
@@ -143,6 +151,7 @@ public class OpsScheduler {
         } catch (Exception e) {
             // 模型输出不是合法 JSON：原文走 ERROR 日志，便于后续调 prompt
             // 不抛异常——巡检调度器必须比模型更稳定
+            metricsService.recordInspection("parse_error", durationMs);
             log.error("[OpsScheduler] 巡检结果解析失败，模型原始输出：\n{}", reply);
         }
     }

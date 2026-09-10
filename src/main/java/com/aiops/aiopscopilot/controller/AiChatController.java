@@ -10,6 +10,7 @@ import java.util.stream.Collectors;
 import jakarta.servlet.http.HttpServletResponse;
 import com.aiops.aiopscopilot.common.result.Result;
 import com.aiops.aiopscopilot.service.KnowledgeIngester;
+import com.aiops.aiopscopilot.service.MetricsService;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.ollama.api.OllamaChatOptions;
@@ -30,13 +31,16 @@ public class AiChatController {
     private final ChatClient deepseekChatClient;
     private final VectorStore vectorStore;
     private final KnowledgeIngester knowledgeIngester;
+    private final MetricsService metricsService;
 
     public AiChatController(@Qualifier("deepseekChatClient") ChatClient deepseekChatClient,
                            VectorStore vectorStore,
-                           KnowledgeIngester knowledgeIngester) {
+                           KnowledgeIngester knowledgeIngester,
+                           MetricsService metricsService) {
         this.deepseekChatClient = deepseekChatClient;
         this.vectorStore = vectorStore;
         this.knowledgeIngester = knowledgeIngester;
+        this.metricsService = metricsService;
     }
 
     /**
@@ -132,10 +136,15 @@ public class AiChatController {
     public Flux<String> ragStream(@RequestParam String message, HttpServletResponse response) {
         // 提前声明响应编码，让 Tomcat 提交响应头时追加 charset=UTF-8，避免浏览器中文乱码
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
+        long ragStart = System.currentTimeMillis();
         String context = retrieveContext(message);
+        long ragDuration = System.currentTimeMillis() - ragStart;
         if (context == null) {
+            metricsService.recordRAGRetrieval(false, 0, ragDuration);
             return Flux.just("知识库中未找到相关信息");
         }
+        int chunkCount = context.split("【来源:").length - 1;
+        metricsService.recordRAGRetrieval(true, chunkCount, ragDuration);
         return deepseekChatClient.prompt()
                 .system(RAG_SYSTEM_PROMPT)
                 .user(ragUserPrompt(context, message))

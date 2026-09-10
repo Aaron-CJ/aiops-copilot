@@ -1,6 +1,7 @@
 package com.aiops.aiopscopilot.controller;
 
 import com.aiops.aiopscopilot.common.result.Result;
+import com.aiops.aiopscopilot.service.MetricsService;
 import com.aiops.aiopscopilot.tool.PrometheusTool;
 import com.aiops.aiopscopilot.tool.SystemHealthTools;
 import org.springframework.ai.chat.client.ChatClient;
@@ -26,9 +27,12 @@ import org.springframework.web.bind.annotation.RestController;
 public class AgentController {
 
     private final ChatClient opsAgentClient;
+    private final MetricsService metricsService;
 
-    public AgentController(@Qualifier("opsAgentClient") ChatClient opsAgentClient) {
+    public AgentController(@Qualifier("opsAgentClient") ChatClient opsAgentClient,
+                           MetricsService metricsService) {
         this.opsAgentClient = opsAgentClient;
+        this.metricsService = metricsService;
     }
 
     /**
@@ -47,10 +51,12 @@ public class AgentController {
     @GetMapping("/ops")
     public Result<String> ops(@RequestParam(defaultValue = "请检查当前服务器健康状态，包括 CPU 占用率和内存剩余，并给出简短评估。") String message) {
         // opsAgentClient 已通过 defaultSystem 注入 AIOps 人设，这里不再重复 .system()
+        long start = System.currentTimeMillis();
         String reply = opsAgentClient.prompt()
                 .user(message)
                 .call()
                 .content();
+        metricsService.recordAIRequest("qwen3:8b", "/api/agent/ops", System.currentTimeMillis() - start);
         return Result.success(reply);
     }
 }
