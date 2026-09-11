@@ -35,3 +35,9 @@ out/
 
 ### VS Code ###
 .vscode/
+
+### Trae IDE 工作目录（本地会话/缓存，不入库；正式文档放 docs/） ###
+.trae/
+
+### Docker Compose 数据卷（Milvus etcd/minio/数据文件，GB 级，勿入库） ###
+docker/volumes/

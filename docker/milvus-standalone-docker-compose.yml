@@ -18,7 +18,7 @@ services:
 
   minio:
     container_name: milvus-minio
-    image: minio/minio:RELEASE.2024-05-28T17-19-04Z
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
@@ -29,23 +29,23 @@ services:
       - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
       timeout: 20s
       retries: 3
 
   standalone:
     container_name: milvus-standalone
-    image: milvusdb/milvus:v3.0.0
+    image: milvusdb/milvus:v3.0.1
     command: ["milvus", "run", "standalone"]
     security_opt:
       - seccomp:unconfined
     environment:
-      MINIO_REGION: us-east-1
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
+      MQ_TYPE: woodpecker
     volumes:
-      - ./volumes/milvus:/var/lib/milvus
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
@@ -70,6 +70,16 @@ services:
       - default
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  attu:
+    image: zilliz/attu:latest
+    container_name: attu
+    ports:
+      - "8000:3000"
+    environment:
+      - MILVUS_URL=standalone:19530
+    depends_on:
+      - standalone
 
 networks:
   default:

@@ -28,13 +28,22 @@ import org.springframework.web.client.RestClient;
 @RequestMapping("/api/health")
 public class HealthCheckController {
 
+    /** Milvus standalone 的健康检查端口固定为 9091（与 gRPC 数据端口 19530 不同） */
+    private static final int MILVUS_HEALTH_PORT = 9091;
+
     private final RestClient restClient;
+    private final String ollamaBaseUrl;
+    private final String milvusHealthUrl;
+    private final String prometheusBaseUrl;
 
-    @Value("${aiops.prometheus.base-url:http://localhost:9090}")
-    private String prometheusBaseUrl;
-
-    public HealthCheckController() {
+    public HealthCheckController(
+            @Value("${spring.ai.ollama.base-url:http://localhost:11434}") String ollamaBaseUrl,
+            @Value("${spring.ai.vectorstore.milvus.client.host:localhost}") String milvusHost,
+            @Value("${aiops.prometheus.base-url:http://localhost:9090}") String prometheusBaseUrl) {
         this.restClient = RestClient.create();
+        this.ollamaBaseUrl = ollamaBaseUrl;
+        this.milvusHealthUrl = "http://" + milvusHost + ":" + MILVUS_HEALTH_PORT;
+        this.prometheusBaseUrl = prometheusBaseUrl;
     }
 
     @GetMapping("/check")
@@ -62,7 +71,7 @@ public class HealthCheckController {
     private Map<String, Object> checkOllama() {
         Map<String, Object> info = new LinkedHashMap<>();
         try {
-            restClient.get().uri("http://localhost:11434/api/tags").retrieve().body(String.class);
+            restClient.get().uri(ollamaBaseUrl + "/api/tags").retrieve().body(String.class);
             info.put("status", "UP");
         } catch (Exception e) {
             info.put("status", "DOWN");
@@ -74,7 +83,7 @@ public class HealthCheckController {
     private Map<String, Object> checkMilvus() {
         Map<String, Object> info = new LinkedHashMap<>();
         try {
-            restClient.get().uri("http://localhost:9091/healthz").retrieve().body(String.class);
+            restClient.get().uri(milvusHealthUrl + "/healthz").retrieve().body(String.class);
             info.put("status", "UP");
         } catch (Exception e) {
             info.put("status", "DOWN");

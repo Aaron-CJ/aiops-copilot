@@ -17,30 +17,44 @@ import org.springframework.ai.ollama.api.OllamaChatOptions;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 
 @RestController
 @RequestMapping("/api/ai")
 public class AiChatController {
 
+    private static final Logger log = LoggerFactory.getLogger(AiChatController.class);
+
+    /** RAG 检索召回条数：先放宽召回数量，再由相似度阈值卡质量 */
+    private static final int RAG_TOP_K = 5;
+    /** RAG 相似度质量闸门：COSINE 分数低于该值的片段丢弃，保证无关问题正确走"未找到"分支。
+     *  0.50 为 bge-m3 中文语料的经验起点，需结合 [RAG] 命中日志中的实际分数断层校准 */
+    private static final double RAG_SIMILARITY_THRESHOLD = 0.50;
+
     private final ChatClient deepseekChatClient;
     private final VectorStore vectorStore;
     private final KnowledgeIngester knowledgeIngester;
     private final MetricsService metricsService;
+    private final String reasoningModel;
 
     public AiChatController(@Qualifier("deepseekChatClient") ChatClient deepseekChatClient,
                            VectorStore vectorStore,
                            KnowledgeIngester knowledgeIngester,
-                           MetricsService metricsService) {
+                           MetricsService metricsService,
+                           @Value("${spring.ai.ollama.chat.model}") String reasoningModel) {
         this.deepseekChatClient = deepseekChatClient;
         this.vectorStore = vectorStore;
         this.knowledgeIngester = knowledgeIngester;
         this.metricsService = metricsService;
+        this.reasoningModel = reasoningModel;
     }
 
     /**
@@ -93,7 +107,7 @@ public class AiChatController {
 
     /**
      * 知识库初始化接口：读取 knowledge.txt → 文本切片 → 调用 Embedding 模型 → 写入 Milvus。
-     * 需先在本地启动 Milvus（docker）并拉取 Ollama embedding 模型（ollama pull nomic-embed-text）。
+     * 需先在本地启动 Milvus（docker）并拉取 Ollama embedding 模型（ollama pull bge-m3）。
      *
      * @return 写入 Milvus 的文本片段数量
      */
@@ -104,30 +118,34 @@ public class AiChatController {
     }
 
     /**
-     * RAG 问答接口：先从 Milvus 检索最相关的 3 个文本片段，
-     * 拼装 Prompt 后调用 deepseekChatClient 输出精准答案，避免大模型幻觉。
+     * RAG 问答接口：先从 Milvus 经"topK={@value #RAG_TOP_K} 召回 + 相似度阈值
+     * {@value #RAG_SIMILARITY_THRESHOLD} 过滤"拿到相关片段，
+     * 拼装 Prompt 后调用推理模型输出精准答案，避免大模型幻觉。
      *
      * @param message 用户提问
      * @return 基于知识库内容的精准答案
      */
     @GetMapping("/rag")
     public Result<String> rag(@RequestParam String message) {
-        String context = retrieveContext(message);
+        RAGContext context = retrieveContext(message);
         // 检索无结果时直接短路返回，不浪费一次模型调用
         if (context == null) {
             return Result.success("知识库中未找到相关信息");
         }
+        metricsService.recordRAGRetrieval(true, context.chunkCount(), context.retrievalMs());
+        long aiStart = System.currentTimeMillis();
         String answer = deepseekChatClient.prompt()
                 .system(RAG_SYSTEM_PROMPT)
-                .user(ragUserPrompt(context, message))
+                .user(ragUserPrompt(context.text(), message))
                 .call()
                 .content();
+        metricsService.recordAIRequest(reasoningModel, "/api/ai/rag", System.currentTimeMillis() - aiStart);
         return Result.success(answer);
     }
 
     /**
      * RAG 流式问答接口：检索逻辑与 {@link #rag} 一致，但以 SSE 逐段推送模型输出，
-     * 避免用户在 deepseek-r1 生成期间长时间等待空白页面。
+     * 避免用户在推理模型生成期间长时间等待空白页面。
      *
      * @param message 用户提问
      * @return SSE 事件流（最终回答，按序拼接即为完整回复）
@@ -136,20 +154,20 @@ public class AiChatController {
     public Flux<String> ragStream(@RequestParam String message, HttpServletResponse response) {
         // 提前声明响应编码，让 Tomcat 提交响应头时追加 charset=UTF-8，避免浏览器中文乱码
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
-        long ragStart = System.currentTimeMillis();
-        String context = retrieveContext(message);
-        long ragDuration = System.currentTimeMillis() - ragStart;
+        RAGContext context = retrieveContext(message);
         if (context == null) {
-            metricsService.recordRAGRetrieval(false, 0, ragDuration);
             return Flux.just("知识库中未找到相关信息");
         }
-        int chunkCount = context.split("【来源:").length - 1;
-        metricsService.recordRAGRetrieval(true, chunkCount, ragDuration);
+        metricsService.recordRAGRetrieval(true, context.chunkCount(), context.retrievalMs());
+        long aiStart = System.currentTimeMillis();
         return deepseekChatClient.prompt()
                 .system(RAG_SYSTEM_PROMPT)
-                .user(ragUserPrompt(context, message))
+                .user(ragUserPrompt(context.text(), message))
                 .stream()
                 .content()
+                // 流式输出成功完成时补记一次 AI 调用耗时（取消/错误不计）
+                .doOnComplete(() -> metricsService.recordAIRequest(reasoningModel,
+                        "/api/ai/rag/stream", System.currentTimeMillis() - aiStart))
                 .onErrorResume(e -> Flux.just("[ERROR] " + e.getMessage()));
     }
 
@@ -161,22 +179,41 @@ public class AiChatController {
             + "4) 回答要简洁准确。";
 
     /**
-     * 从 Milvus 检索与问题最相关的 3 个文本片段并拼装上下文（每片携带来源标注）。
+     * 从 Milvus 检索与问题相关的文本片段并拼装上下文（每片携带来源标注）。
+     * 两道闸门串联：先取 COSINE 排序后的前 {@value #RAG_TOP_K} 个候选，
+     * 再丢弃相似度低于 {@value #RAG_SIMILARITY_THRESHOLD} 的片段。
+     * 未命中时直接记录 miss 指标，命中时由调用方记录 hit（需区分同步/流式端点）。
      *
-     * @return 上下文文本；检索无结果时返回 null，交由调用方短路处理
+     * @return 检索结果（上下文文本、片段数、检索耗时）；无片段通过阈值时返回 null
      */
-    private String retrieveContext(String message) {
+    private RAGContext retrieveContext(String message) {
+        long start = System.currentTimeMillis();
         List<Document> docs = vectorStore.similaritySearch(
-                SearchRequest.builder().query(message).topK(3).build());
-        if (docs.isEmpty()) {
+                SearchRequest.builder()
+                        .query(message)
+                        .topK(RAG_TOP_K)
+                        .similarityThreshold(RAG_SIMILARITY_THRESHOLD)
+                        .build());
+        long retrievalMs = System.currentTimeMillis() - start;
+        if (docs == null || docs.isEmpty()) {
+            log.info("[RAG] 无高于阈值 {} 的片段，问题：{}", RAG_SIMILARITY_THRESHOLD, message);
+            metricsService.recordRAGRetrieval(false, 0, retrievalMs);
             return null;
         }
-        return docs.stream()
+        // 打印每条命中的 COSINE 分数，用于观察"该命中/不该命中"问题的分数断层以校准阈值
+        docs.forEach(doc -> log.info("[RAG] 命中片段 score={} source={}",
+                doc.getScore(), doc.getMetadata().getOrDefault("source", "unknown")));
+        String text = docs.stream()
                 .map(doc -> {
                     String source = String.valueOf(doc.getMetadata().getOrDefault("source", "unknown"));
                     return "【来源: " + source + "】\n" + doc.getText();
                 })
                 .collect(Collectors.joining("\n\n---\n\n"));
+        return new RAGContext(text, docs.size(), retrievalMs);
+    }
+
+    /** RAG 检索结果：拼装好的上下文文本、通过阈值的片段数、检索耗时（毫秒） */
+    private record RAGContext(String text, int chunkCount, long retrievalMs) {
     }
 
     /** 拼装 RAG 用户 Prompt：知识库上下文 + 用户问题。 */

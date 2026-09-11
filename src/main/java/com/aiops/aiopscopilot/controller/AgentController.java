@@ -6,6 +6,7 @@ import com.aiops.aiopscopilot.tool.PrometheusTool;
 import com.aiops.aiopscopilot.tool.SystemHealthTools;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -28,11 +29,14 @@ public class AgentController {
 
     private final ChatClient opsAgentClient;
     private final MetricsService metricsService;
+    private final String fastModel;
 
     public AgentController(@Qualifier("opsAgentClient") ChatClient opsAgentClient,
-                           MetricsService metricsService) {
+                           MetricsService metricsService,
+                           @Value("${aiops.models.fast}") String fastModel) {
         this.opsAgentClient = opsAgentClient;
         this.metricsService = metricsService;
+        this.fastModel = fastModel;
     }
 
     /**
@@ -56,7 +60,7 @@ public class AgentController {
                 .user(message)
                 .call()
                 .content();
-        metricsService.recordAIRequest("qwen3:8b", "/api/agent/ops", System.currentTimeMillis() - start);
+        metricsService.recordAIRequest(fastModel, "/api/agent/ops", System.currentTimeMillis() - start);
         return Result.success(reply);
     }
 }

@@ -3,6 +3,7 @@ package com.aiops.aiopscopilot.controller;
 import com.aiops.aiopscopilot.common.result.Result;
 import com.aiops.aiopscopilot.service.MetricsService;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -18,17 +19,21 @@ public class ChatController {
 
     private final ChatClient deepseekChatClient;
     private final MetricsService metricsService;
+    private final String reasoningModel;
 
-    public ChatController(ChatClient deepseekChatClient, MetricsService metricsService) {
+    public ChatController(ChatClient deepseekChatClient,
+                          MetricsService metricsService,
+                          @Value("${spring.ai.ollama.chat.model}") String reasoningModel) {
         this.deepseekChatClient = deepseekChatClient;
         this.metricsService = metricsService;
+        this.reasoningModel = reasoningModel;
     }
 
     @GetMapping
     public Result<String> chat(@RequestParam String message) {
         long start = System.currentTimeMillis();
         String reply = deepseekChatClient.prompt().user(message).call().content();
-        metricsService.recordAIRequest("deepseek-r1:8b", "/api/chat", System.currentTimeMillis() - start);
+        metricsService.recordAIRequest(reasoningModel, "/api/chat", System.currentTimeMillis() - start);
         return Result.success(reply);
     }
 }

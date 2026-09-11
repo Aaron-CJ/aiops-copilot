@@ -3,6 +3,7 @@ package com.aiops.aiopscopilot.config;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.ollama.api.OllamaChatOptions;
 import org.springframework.ai.tool.annotation.Tool;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -39,11 +40,12 @@ public class AiConfig {
      *    工具能力只挂在 {@link #opsAgentClient}（交互问答需要模型自主查数）上。
      */
     @Bean
-    public ChatClient qwenChatClient(ChatClient.Builder builder) {
+    public ChatClient qwenChatClient(ChatClient.Builder builder,
+                                     @Value("${aiops.models.fast}") String fastModel) {
         return builder
-                // qwen3:8b 为混合思考模型，默认开启思考链；巡检场景追求快，显式关闭
+                // qwen3 为混合思考模型，默认开启思考链；巡检场景追求快，显式关闭
                 .defaultOptions(OllamaChatOptions.builder()
-                        .model("qwen3:8b")
+                        .model(fastModel)
                         .disableThinking())
                 .build();
     }
@@ -70,12 +72,13 @@ public class AiConfig {
      */
     @Bean
     public ChatClient opsAgentClient(ChatClient.Builder builder,
+                                     @Value("${aiops.models.fast}") String fastModel,
                                      PrometheusTool prometheusTool,
                                      SystemHealthTools systemHealthTools) {
         return builder
-                // qwen3:8b 关闭思考链：工具调用/解读场景无需深度推理，直出答案更快
+                // 快速通道模型关闭思考链：工具调用/解读场景无需深度推理，直出答案更快
                 .defaultOptions(OllamaChatOptions.builder()
-                        .model("qwen3:8b")
+                        .model(fastModel)
                         .disableThinking())
                 .defaultTools(prometheusTool, systemHealthTools)
                 .defaultSystem("你是一名 AIOps 智能运维 Agent。面对运维问题，"
