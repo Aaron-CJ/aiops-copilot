@@ -16,9 +16,6 @@ import com.sun.management.OperatingSystemMXBean;
 /**
  * 服务器健康检查工具：通过 Spring AI 的 Function Calling 机制
  * 暴露给大模型，由模型在对话中自主决定何时调用。
- * <p>
- * 注意：Spring AI 1.0 早期使用的 {@code @Description} 注解
- * 在 2.0 GA 中已移除，统一改为 {@link Tool @Tool(description = "...")}。
  */
 @Component
 public class SystemHealthTools {
@@ -76,8 +73,7 @@ public class SystemHealthTools {
             + "返回死锁检测结果：deadlockDetected (boolean)、deadlockedThreadCount (int)、deadlockedThreads (列表，含线程名/状态/等待的锁/锁持有者/栈帧)。")
     public Map<String, Object> detectDeadlock() {
         ThreadMXBean tmb = ManagementFactory.getThreadMXBean();
-        // findDeadlockedThreads() Java 6+ 引入，覆盖 synchronized + ReentrantLock；
-        // 返回 null 表示无死锁检测能力（极少见），空数组表示无死锁
+        // 返回 null 表示 JVM 不支持死锁检测（极少见），空数组表示无死锁
         long[] ids = tmb.findDeadlockedThreads();
 
         Map<String, Object> result = new LinkedHashMap<>();

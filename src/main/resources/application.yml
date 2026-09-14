@@ -54,7 +54,8 @@ spring:
         # 必须与 Ollama embedding 模型维度保持一致（bge-m3 = 1024），
         # 不一致会导致写入/检索时报维度不匹配
         embedding-dimension: 1024
-        # 向量索引类型：IVF_FLAT 是中小规模数据的常用取舍（内存占用小，召回精度略降）
+        # 向量索引类型：IVF_FLAT 先按聚类中心粗筛、再对候选向量精确计算余弦，
+        # 是中小规模数据的常用取舍——查询快、内存省；聚类数/nprobe 会影响召回率（当前用默认值）
         index-type: IVF_FLAT
         # 相似度度量方式：COSINE 余弦相似度，语义检索场景最常用
         metric-type: COSINE
@@ -71,5 +72,5 @@ management:
         include: health,info,prometheus
   metrics:
     tags:
-      # 给所有指标打上应用名标签，Prometheus/Grafana 可按 application 维度聚合
+      # 给所有指标打上应用名标签，可在 Prometheus 中按 application 维度聚合查询
       application: ${spring.application.name}

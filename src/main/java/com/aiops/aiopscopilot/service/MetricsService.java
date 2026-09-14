@@ -25,7 +25,7 @@ public class MetricsService {
     /**
      * 记录一次智能巡检结果。
      *
-     * @param status     巡检状态：normal / warning / critical / unknown
+     * @param status     巡检状态：normal / warning / critical / unknown / error / parse_error
      * @param durationMs 巡检耗时（毫秒）
      */
     public void recordInspection(String status, long durationMs) {
@@ -38,7 +38,7 @@ public class MetricsService {
      * 记录一次 AI 模型调用。
      *
      * @param model      模型名（如 qwen3:8b、deepseek-r1:8b）
-     * @param endpoint   调用来源（如 /api/agent/ops、/api/chat、/rag）
+     * @param endpoint   调用来源（如 /api/agent/ops、/api/chat、/api/ai/rag、/api/ai/rag/stream）
      * @param durationMs 调用耗时（毫秒）
      */
     public void recordAIRequest(String model, String endpoint, long durationMs) {

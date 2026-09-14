@@ -24,8 +24,8 @@ import tools.jackson.databind.ObjectMapper;
  *   <li>分级响应：normal → INFO 静默；warning/critical → 结构化告警报告</li>
  * </ol>
  * <p>
- * 与 Alertmanager 的本质差异：Alertmanager 是"硬编码阈值 + 无上下文短信"，
- * 我们是"AI 理解业务语义 + 自带根因分析 + 自带处置建议"。
+ * 与 Alertmanager 的本质差异：阈值只能回答"超没超"，这里输出的是
+ * "AI 理解业务语义 + 根因分析 + 处置建议"。
  * <p>
  * 为什么巡检用 qwen3:8b（关闭思考链）而不是 deepseek-r1：
  * 巡检每分钟跑一次，单次延迟必须远小于 60 秒。deepseek-r1:8b 在 CPU 上推理 + 长思考链
@@ -97,10 +97,7 @@ public class OpsScheduler {
         log.info("[OpsScheduler] 巡检周期结束");
     }
 
-    /**
-     * 构造巡检 Prompt：把指标快照塞进去，要求模型严格输出 JSON。
-     * 判断维度对应 6 条核心指标的异常模式，让模型有据可依。
-     */
+    /** 把指标快照与 6 条判断维度、死锁诊断要求、严格 JSON 输出格式组装成巡检 Prompt。 */
     private String buildInspectionPrompt(Map<String, Object> snapshot) {
         return "以下是当前系统的核心指标快照（JSON 格式）：\n"
                 + toJson(snapshot) + "\n\n"
@@ -122,24 +119,18 @@ public class OpsScheduler {
     }
 
     /**
-     * 解析模型输出并路由到 reporter。
-     * <p>
-     * 健壮性处理：
-     * <ul>
-     *   <li>剥离 deepseek-r1 可能的 {@code <think>...</think>} 包裹（即使开启思考也能容错）</li>
-     *   <li>剥离 markdown 代码块包裹</li>
-     *   <li>JSON 解析失败时原文走 ERROR 日志，不让模型胡言乱语搞崩巡检链路</li>
-     * </ul>
+     * 解析模型输出（先经 {@link #extractJson} 剥离思考段/markdown 包裹）并按级别路由。
+     * JSON 非法时不抛异常——巡检调度器必须比模型更稳定，原文落 ERROR 日志便于调 prompt。
      */
     private void handleInspectionResult(String reply, Map<String, Object> snapshot, long start) {
         long durationMs = System.currentTimeMillis() - start;
         String json = extractJson(reply);
         try {
             JsonNode node = objectMapper.readTree(json);
-            String status = node.path("status").asText("unknown");
-            String summary = node.path("summary").asText("无摘要");
-            String rootCause = node.path("rootCause").asText("N/A");
-            String suggestion = node.path("suggestion").asText("N/A");
+            String status = node.path("status").asString("unknown");
+            String summary = node.path("summary").asString("无摘要");
+            String rootCause = node.path("rootCause").asString("N/A");
+            String suggestion = node.path("suggestion").asString("N/A");
 
             metricsService.recordInspection(status, durationMs);
 
@@ -149,8 +140,6 @@ public class OpsScheduler {
                 reporter.report(status, summary, rootCause, suggestion, snapshot, reply);
             }
         } catch (Exception e) {
-            // 模型输出不是合法 JSON：原文走 ERROR 日志，便于后续调 prompt
-            // 不抛异常——巡检调度器必须比模型更稳定
             metricsService.recordInspection("parse_error", durationMs);
             log.error("[OpsScheduler] 巡检结果解析失败，模型原始输出：\n{}", reply);
         }
@@ -160,12 +149,10 @@ public class OpsScheduler {
     private String extractJson(String reply) {
         if (reply == null) return "";
         String s = reply.trim();
-        // 去除模型思考过程（r1/qwen3 的 <think> 段；即使配置关闭思考，加这层兜底更稳）
         int thinkEnd = s.indexOf("</think>");
         if (thinkEnd >= 0) {
             s = s.substring(thinkEnd + "</think>".length()).trim();
         }
-        // 去除 markdown 代码块包裹
         if (s.startsWith("```")) {
             int firstNewline = s.indexOf('\n');
             if (firstNewline > 0) {

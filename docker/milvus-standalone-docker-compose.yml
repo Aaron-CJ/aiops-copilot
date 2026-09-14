@@ -2,6 +2,7 @@ services:
   etcd:
     container_name: milvus-etcd
     image: quay.io/coreos/etcd:v3.5.25
+    restart: unless-stopped
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
       - ETCD_AUTO_COMPACTION_RETENTION=1000
@@ -19,6 +20,7 @@ services:
   minio:
     container_name: milvus-minio
     image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    restart: unless-stopped
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
@@ -37,6 +39,7 @@ services:
   standalone:
     container_name: milvus-standalone
     image: milvusdb/milvus:v3.0.1
+    restart: unless-stopped
     command: ["milvus", "run", "standalone"]
     security_opt:
       - seccomp:unconfined
@@ -60,8 +63,10 @@ services:
       - "minio"
 
   prometheus:
-    image: prom/prometheus:latest
+    # 固定精确版本而非 latest，避免容器重建时被静默升级；v3.13 为 Prometheus 官方 LTS 线（享一年补丁支持）
+    image: prom/prometheus:v3.13.3
     container_name: prometheus
+    restart: unless-stopped
     ports:
       - "9090:9090"
     volumes:
@@ -72,8 +77,10 @@ services:
       - "host.docker.internal:host-gateway"
 
   attu:
-    image: zilliz/attu:latest
+    # 固定精确版本而非 latest，避免容器重建时被静默升级；v3 与下方 Milvus v3.0.1 配套
+    image: zilliz/attu:v3.0.0
     container_name: attu
+    restart: unless-stopped
     ports:
       - "8000:3000"
     environment:

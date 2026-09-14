@@ -9,7 +9,17 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 故障注入调试接口：故意制造一个经典的"双锁交叉持有"死锁，用于练习 Arthas 线程诊断。
+ * 故障注入调试接口：故意制造一个经典的"双锁交叉持有"死锁。
+ * <p>
+ * 定位：本接口是 AIOps <b>自治诊断链路</b>的故障注入测试夹具（注意：当前只做到
+ * "自动发现 → 自动诊断 → 给处置建议"，<b>不包含</b>自动修复/自动重启——
+ * 重启等写操作按治理层设计必须人工审批执行）。
+ * <p>
+ * 调用后，OpsScheduler 下一轮巡检会发现 BLOCKED 线程数 &gt; 0，随即触发
+ * SystemHealthTools.detectDeadlock()（ThreadMXBean）二级诊断，由 AI 完成
+ * "确认为死锁 → 定位具体方法/行号 → 给出处置建议"的验证闭环。
+ * 死锁线程不会自行消失、{@link #deadlockCreated} 标记也不会复位，
+ * 想再次注入需重启应用。
  * <p>
  * 死锁原理（教科书级 Case）：
  * <pre>
@@ -18,7 +28,7 @@ import org.springframework.web.bind.annotation.RestController;
  * </pre>
  * 两线程互相等待对方释放锁，形成循环等待（Circular Wait），永远阻塞。
  * <p>
- * 诊断方式：Arthas 挂载后执行 thread 命令，输出末尾会自动列出
+ * 若需人工复核，也可用 jstack/Arthas thread 命令查看，输出末尾会列出
  * "Found one Java-level deadlock" 及互相等待的线程对。
  */
 @RestController
@@ -36,12 +46,12 @@ public class DebugController {
 
     /**
      * GET /api/debug/deadlock：触发后立即返回，
-     * 两个后台线程（deadlock-thread-1/2）进入死锁状态，可随时用 Arthas 诊断。
+     * 两个后台线程（deadlock-thread-1/2）进入死锁状态，等待下一轮巡检自动发现并诊断。
      */
     @GetMapping("/deadlock")
     public String createDeadlock() throws InterruptedException {
         if (deadlockCreated) {
-            return "死锁已存在，无需重复触发，直接用 Arthas thread 命令诊断。";
+            return "死锁已存在，无需重复触发，等待下一轮巡检（最长 60 秒）自动诊断即可。";
         }
         deadlockCreated = true;
 
@@ -85,6 +95,6 @@ public class DebugController {
         thread2.join(1500);
 
         return "已制造 2 个死锁线程：deadlock-thread-1 与 deadlock-thread-2，"
-                + "现在可以用 Arthas 的 thread 命令抓取。";
+                + "下一轮巡检（最长 60 秒）将自动检测并输出根因分析。";
     }
 }

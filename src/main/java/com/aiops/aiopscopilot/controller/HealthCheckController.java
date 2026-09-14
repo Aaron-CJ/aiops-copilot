@@ -22,7 +22,7 @@ import org.springframework.web.client.RestClient;
  *   <li>JVM 堆内存——Runtime.freeMemory / maxMemory</li>
  *   <li>磁盘空间——File.usableSpace</li>
  * </ol>
- * 每项返回 UP / DOWN + 详情，调用方据此判断环境是否就绪。
+ * 每项返回 UP / DOWN / WARN + 详情，调用方据此判断环境是否就绪。
  */
 @RestController
 @RequestMapping("/api/health")
@@ -49,20 +49,10 @@ public class HealthCheckController {
     @GetMapping("/check")
     public Result<Map<String, Object>> check() {
         Map<String, Object> result = new LinkedHashMap<>();
-
-        // 1. Ollama
         result.put("ollama", checkOllama());
-
-        // 2. Milvus
         result.put("milvus", checkMilvus());
-
-        // 3. Prometheus
         result.put("prometheus", checkPrometheus());
-
-        // 4. JVM 内存
         result.put("jvmMemory", checkJvmMemory());
-
-        // 5. 磁盘空间
         result.put("diskSpace", checkDiskSpace());
 
         return Result.success(result);
@@ -111,6 +101,7 @@ public class HealthCheckController {
         long free = max - used;
 
         Map<String, Object> info = new LinkedHashMap<>();
+        // 可用堆内存不足 15% 时告警：本项目 LLM 推理在 Ollama 进程，JVM 堆压力小，15% 是偏宽松的预警线
         info.put("status", free > max * 0.15 ? "UP" : "WARN");
         info.put("usedMB", used / 1024 / 1024);
         info.put("maxMB", max / 1024 / 1024);
@@ -120,12 +111,15 @@ public class HealthCheckController {
     }
 
     private Map<String, Object> checkDiskSpace() {
+        // 注意：new File(".") 取的是应用工作目录所在盘（IDE 启动时即项目目录所在盘），
+        // 不是主机全部磁盘；容器化部署后反映的是挂载该工作目录的卷
         File root = new File(".");
         long total = root.getTotalSpace();
         long free = root.getUsableSpace();
 
         Map<String, Object> info = new LinkedHashMap<>();
-        info.put("status", free > 5L * 1024 * 1024 * 1024 ? "UP" : "WARN"); // 5GB 阈值
+        // 可用空间低于 5GB 告警：Milvus 数据卷在 compose 中独立挂载，这里只反映应用盘
+        info.put("status", free > 5L * 1024 * 1024 * 1024 ? "UP" : "WARN");
         info.put("totalGB", Math.round(total / 1024.0 / 1024 / 1024 * 10) / 10.0);
         info.put("freeGB", Math.round(free / 1024.0 / 1024 / 1024 * 10) / 10.0);
         return info;

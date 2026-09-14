@@ -19,73 +19,77 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
-	private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
-	/**
-	 * 处理自定义业务异常
-	 */
-	@ExceptionHandler(BusinessException.class)
-	@ResponseStatus(HttpStatus.OK)
-	public Result<Void> handleBusinessException(BusinessException e) {
-		log.warn("业务异常: code={}, message={}", e.getCode(), e.getMessage());
-		return Result.fail(e.getCode(), e.getMessage());
-	}
+    /**
+     * 处理自定义业务异常。
+     * <p>
+     * HTTP 状态码刻意返回 200：业务失败不是协议/服务故障，错误语义由响应体中的
+     * 业务 code（ResultCode.BUSINESS_ERROR=1000）表达，前端按 body.code 分支即可，
+     * 避免 HTTP 4xx/5xx 被浏览器/网关拦截后拿不到结构化错误信息。
+     */
+    @ExceptionHandler(BusinessException.class)
+    @ResponseStatus(HttpStatus.OK)
+    public Result<Void> handleBusinessException(BusinessException e) {
+        log.warn("业务异常: code={}, message={}", e.getCode(), e.getMessage());
+        return Result.fail(e.getCode(), e.getMessage());
+    }
 
-	/**
-	 * 处理参数校验异常（@Valid / @Validated）
-	 */
-	@ExceptionHandler({ MethodArgumentNotValidException.class, BindException.class })
-	@ResponseStatus(HttpStatus.BAD_REQUEST)
-	public Result<Void> handleValidationException(Exception e) {
-		String message = extractValidationMessage(e);
-		log.warn("参数校验失败: {}", message);
-		return Result.fail(ResultCode.BAD_REQUEST, message);
-	}
+    /**
+     * 处理参数校验异常（@Valid / @Validated）
+     */
+    @ExceptionHandler({ MethodArgumentNotValidException.class, BindException.class })
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Result<Void> handleValidationException(Exception e) {
+        String message = extractValidationMessage(e);
+        log.warn("参数校验失败: {}", message);
+        return Result.fail(ResultCode.BAD_REQUEST, message);
+    }
 
-	/**
-	 * 处理缺少请求参数异常（@RequestParam 必填参数缺失）
-	 */
-	@ExceptionHandler(MissingServletRequestParameterException.class)
-	@ResponseStatus(HttpStatus.BAD_REQUEST)
-	public Result<Void> handleMissingParameterException(MissingServletRequestParameterException e) {
-		log.warn("缺少请求参数: {}", e.getParameterName());
-		return Result.fail(ResultCode.BAD_REQUEST, "缺少必需的请求参数: " + e.getParameterName());
-	}
+    /**
+     * 处理缺少请求参数异常（@RequestParam 必填参数缺失）
+     */
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Result<Void> handleMissingParameterException(MissingServletRequestParameterException e) {
+        log.warn("缺少请求参数: {}", e.getParameterName());
+        return Result.fail(ResultCode.BAD_REQUEST, "缺少必需的请求参数: " + e.getParameterName());
+    }
 
-	/**
-	 * 处理静态资源不存在异常（如浏览器自动请求 favicon.ico）
-	 */
-	@ExceptionHandler(NoResourceFoundException.class)
-	@ResponseStatus(HttpStatus.NOT_FOUND)
-	public Result<Void> handleNoResourceFoundException(NoResourceFoundException e) {
-		log.debug("静态资源不存在: {}", e.getResourcePath());
-		return Result.fail(ResultCode.NOT_FOUND);
-	}
+    /**
+     * 处理静态资源不存在异常（如浏览器自动请求 favicon.ico）
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public Result<Void> handleNoResourceFoundException(NoResourceFoundException e) {
+        log.debug("静态资源不存在: {}", e.getResourcePath());
+        return Result.fail(ResultCode.NOT_FOUND);
+    }
 
-	/**
-	 * 处理未知异常
-	 */
-	@ExceptionHandler(Exception.class)
-	@ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
-	public Result<Void> handleException(Exception e) {
-		log.error("系统未知异常", e);
-		return Result.fail(ResultCode.INTERNAL_ERROR);
-	}
+    /**
+     * 处理未知异常
+     */
+    @ExceptionHandler(Exception.class)
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public Result<Void> handleException(Exception e) {
+        log.error("系统未知异常", e);
+        return Result.fail(ResultCode.INTERNAL_ERROR);
+    }
 
-	private String extractValidationMessage(Exception e) {
-		if (e instanceof MethodArgumentNotValidException ex) {
-			return ex.getBindingResult().getFieldErrors().stream()
-					.findFirst()
-					.map(error -> error.getField() + ": " + error.getDefaultMessage())
-					.orElse(ResultCode.BAD_REQUEST.getMessage());
-		}
-		if (e instanceof BindException ex) {
-			return ex.getBindingResult().getFieldErrors().stream()
-					.findFirst()
-					.map(error -> error.getField() + ": " + error.getDefaultMessage())
-					.orElse(ResultCode.BAD_REQUEST.getMessage());
-		}
-		return ResultCode.BAD_REQUEST.getMessage();
-	}
+    private String extractValidationMessage(Exception e) {
+        if (e instanceof MethodArgumentNotValidException ex) {
+            return ex.getBindingResult().getFieldErrors().stream()
+                    .findFirst()
+                    .map(error -> error.getField() + ": " + error.getDefaultMessage())
+                    .orElse(ResultCode.BAD_REQUEST.getMessage());
+        }
+        if (e instanceof BindException ex) {
+            return ex.getBindingResult().getFieldErrors().stream()
+                    .findFirst()
+                    .map(error -> error.getField() + ": " + error.getDefaultMessage())
+                    .orElse(ResultCode.BAD_REQUEST.getMessage());
+        }
+        return ResultCode.BAD_REQUEST.getMessage();
+    }
 
 }

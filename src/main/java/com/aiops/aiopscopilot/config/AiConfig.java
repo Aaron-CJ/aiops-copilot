@@ -17,10 +17,8 @@ import com.aiops.aiopscopilot.tool.SystemHealthTools;
 public class AiConfig {
 
     /**
-     * 构建 ChatClient：Builder 已按 application.yml 的 ollama 配置自动装配
-     * （chat 模型 deepseek-r1:8b、base-url 等）。
-     * 显式命名为 deepseekChatClient，将来出现多个 ChatClient Bean 时
-     * 可用 @Qualifier 精确注入（见 AiChatController / ChatService 的用法）。
+     * 构建 ChatClient：Builder 已按 application.yml 的 ollama 配置自动装配（模型、base-url 等）。
+     * 显式命名 Bean，多 ChatClient 并存时用 @Qualifier 精确注入。
      */
     @Bean
     public ChatClient deepseekChatClient(ChatClient.Builder builder) {
@@ -28,22 +26,20 @@ public class AiConfig {
     }
 
     /**
-     * 第二个 ChatClient Bean：连接本地 Ollama 的 qwen3 模型（供 OpsScheduler 定时巡检使用）。
+     * 巡检专用 ChatClient（供 OpsScheduler）。
      * <p>
-     * 实现要点：
-     * 1) {@code defaultOptions} 覆盖默认模型为 qwen3:8b 并 disableThinking()
-     *    （qwen3 默认开思考链，巡检只要结构化结论，关闭后响应快数倍）；
-     * 2) <b>刻意不注册任何工具</b>：巡检场景下指标由调度器通过
+     * 1) {@code defaultOptions} 覆盖为配置的快速模型并 disableThinking()（混合思考模型默认开思考链，
+     *    巡检只要结构化结论，关闭后响应快数倍）；
+     * 2) <b>刻意不注册任何工具</b>：巡检指标由调度器通过
      *    {@code PrometheusTool.queryFixedMetrics()} 预拉后直接塞进 Prompt，
      *    模型只负责"看快照→判异常→输出 JSON"。挂工具 schema 会让每次巡检平白多带
-     *    几百 token 的工具描述，还可能诱导模型在巡检中发起多余的工具调用往返。
-     *    工具能力只挂在 {@link #opsAgentClient}（交互问答需要模型自主查数）上。
+     *    几百 token 的工具描述，还可能诱导模型发起多余的工具调用往返。
+     *    工具能力只挂在 {@link #opsAgentClient} 上。
      */
     @Bean
     public ChatClient qwenChatClient(ChatClient.Builder builder,
                                      @Value("${aiops.models.fast}") String fastModel) {
         return builder
-                // qwen3 为混合思考模型，默认开启思考链；巡检场景追求快，显式关闭
                 .defaultOptions(OllamaChatOptions.builder()
                         .model(fastModel)
                         .disableThinking())
@@ -51,24 +47,17 @@ public class AiConfig {
     }
 
     /**
-     * 第三个 ChatClient Bean：智能运维交互问答 Agent（/api/agent/ops 专用）。
+     * 智能运维交互问答 Agent（/api/agent/ops 专用）。
      * <p>
-     * 设计要点：
-     * 1) 模型选 qwen3:8b（关闭思考）而非 deepseek-r1:8b——r1 在纯 CPU 推理下思考链过长，
-     *    单次工具调用链路实测 2 分钟以上（curl 120 秒超时），同步 HTTP 接口无法接受；
-     *    qwen3 同样是混合思考模型，但通过 disableThinking() 关闭思考链后直出答案，
-     *    Function Calling 成熟可靠；巡检与交互统一用同一模型还能避免
-     *    Ollama 单模型驻留时两模型反复"卸载→重载"（每次换载 10-30 秒）；
-     * 2) 注册 {@link PrometheusTool}（时序数据眼睛）+ {@link SystemHealthTools}（瞬时本地状态）双引擎，
-     *    交互场景模型需要自主决定调用哪个工具，工具 schema 必须挂在本 Bean 上；
-     * 3) defaultSystem 强调"必须调工具拿真实数据"——这是防幻觉的关键：
-     *    曾经模型没有 PrometheusTool 可用时，把 QPS 凭空编造成了 450；
-     * 4) 输出自然语言而非严格 JSON：旧版要求 JSON 是因为调度器要程序化解析，
-     *    现在巡检已改走 qwenChatClient（数据由调度器预拉塞 Prompt），本 Bean 只服务交互问答。
-     * <p>
-     * 巡检为什么不用本 Bean：巡检每分钟一次且不需要模型自主查数据
-     * （{@link PrometheusTool#queryFixedMetrics} 由调度器直调），无需工具 schema，
-     * 注入轻量的 qwenChatClient 更省 token、延迟更低。
+     * 1) 模型用配置的快速模型并关闭思考：深度模型在纯 CPU 下思考链过长，
+     *    同步工具调用链路实测 2 分钟以上（HTTP 120 秒超时），交互式接口无法接受；
+     *    巡检与交互统一同一模型还能避免 Ollama 单模型驻留时两模型反复"卸载→重载"（每次 10-30 秒）；
+     * 2) 注册 {@link PrometheusTool}（时序数据）+ {@link SystemHealthTools}（瞬时本地状态），
+     *    交互场景模型需要自主决定调用哪个工具；
+     * 3) defaultSystem 强调"必须调工具拿真实数据"——防幻觉的关键：
+     *    曾出现模型无工具可用时把 QPS 凭空编造成 450；内置真实指标名速查表，
+     *    禁止模型使用本系统不存在的指标名（如 http_requests_total）；
+     *    输出自然语言而非 JSON（本 Bean 只服务交互问答，程序化解析只在巡检链路）。
      */
     @Bean
     public ChatClient opsAgentClient(ChatClient.Builder builder,
@@ -76,7 +65,6 @@ public class AiConfig {
                                      PrometheusTool prometheusTool,
                                      SystemHealthTools systemHealthTools) {
         return builder
-                // 快速通道模型关闭思考链：工具调用/解读场景无需深度推理，直出答案更快
                 .defaultOptions(OllamaChatOptions.builder()
                         .model(fastModel)
                         .disableThinking())

@@ -64,7 +64,7 @@ public class PrometheusTool {
                     JsonNode value = item.path("value");
                     if (value.isArray() && value.size() >= 2) {
                         sample.put("timestamp", value.get(0).asDouble());
-                        sample.put("value", value.get(1).asText());
+                        sample.put("value", value.get(1).asString());
                     }
                     samples.add(sample);
                 }
@@ -80,10 +80,7 @@ public class PrometheusTool {
 
     /**
      * 巡检调度器专用：一次性批量查询 6 条核心指标返回结构化快照。
-     * <p>
-     * 设计意图：巡检每分钟跑一次，让模型通过 Function Calling 自主查 6 个指标
-     * 会产生 5-10 次工具调用往返、消耗大量 token 且时延高。改为调度器预拉数据塞 Prompt，
-     * 模型只负责"判断"——这正是用户描述的"让模型当判断工，不是查询工"。
+     * 预拉塞 Prompt 的原因见类注释"主动模式"。
      */
     public Map<String, Object> queryFixedMetrics() {
         Map<String, Object> snapshot = new LinkedHashMap<>();
@@ -108,7 +105,7 @@ public class PrometheusTool {
             if (dataResult.isArray() && !dataResult.isEmpty()) {
                 JsonNode value = dataResult.get(0).path("value");
                 if (value.isArray() && value.size() >= 2) {
-                    return parseValue(value.get(1).asText());
+                    return parseValue(value.get(1).asString());
                 }
             }
         } catch (Exception ignored) {
@@ -124,10 +121,10 @@ public class PrometheusTool {
             JsonNode dataResult = queryRaw(promql);
             if (dataResult.isArray()) {
                 for (JsonNode item : dataResult) {
-                    String labelValue = item.path("metric").path(labelKey).asText("unknown");
+                    String labelValue = item.path("metric").path(labelKey).asString("unknown");
                     JsonNode value = item.path("value");
                     if (value.isArray() && value.size() >= 2) {
-                        result.put(labelValue, parseValue(value.get(1).asText()));
+                        result.put(labelValue, parseValue(value.get(1).asString()));
                     }
                 }
             }

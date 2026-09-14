@@ -106,8 +106,7 @@ public class AiChatController {
     }
 
     /**
-     * 知识库初始化接口：读取 knowledge.txt → 文本切片 → 调用 Embedding 模型 → 写入 Milvus。
-     * 需先在本地启动 Milvus（docker）并拉取 Ollama embedding 模型（ollama pull bge-m3）。
+     * 知识库初始化接口：需先启动 Milvus 并本地拉取 embedding 模型（ollama pull bge-m3）。
      *
      * @return 写入 Milvus 的文本片段数量
      */
@@ -118,17 +117,15 @@ public class AiChatController {
     }
 
     /**
-     * RAG 问答接口：先从 Milvus 经"topK={@value #RAG_TOP_K} 召回 + 相似度阈值
-     * {@value #RAG_SIMILARITY_THRESHOLD} 过滤"拿到相关片段，
-     * 拼装 Prompt 后调用推理模型输出精准答案，避免大模型幻觉。
+     * RAG 问答接口（非流式）：先检索知识库片段，无命中直接回复"未找到"以节省一次模型调用，
+     * 命中则把片段与问题拼装 Prompt 交推理模型作答，抑制幻觉。
      *
      * @param message 用户提问
-     * @return 基于知识库内容的精准答案
+     * @return 基于知识库内容的答案
      */
     @GetMapping("/rag")
     public Result<String> rag(@RequestParam String message) {
         RAGContext context = retrieveContext(message);
-        // 检索无结果时直接短路返回，不浪费一次模型调用
         if (context == null) {
             return Result.success("知识库中未找到相关信息");
         }
@@ -152,7 +149,7 @@ public class AiChatController {
      */
     @GetMapping(value = "/rag/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<String> ragStream(@RequestParam String message, HttpServletResponse response) {
-        // 提前声明响应编码，让 Tomcat 提交响应头时追加 charset=UTF-8，避免浏览器中文乱码
+        // 同 /chat：提前声明编码，让响应头携带 charset=UTF-8，避免浏览器中文乱码
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
         RAGContext context = retrieveContext(message);
         if (context == null) {
@@ -213,11 +210,10 @@ public class AiChatController {
         return new RAGContext(text, docs.size(), retrievalMs);
     }
 
-    /** RAG 检索结果：拼装好的上下文文本、通过阈值的片段数、检索耗时（毫秒） */
+    /** RAG 检索结果：拼装好的上下文、通过阈值的片段数、检索耗时（毫秒） */
     private record RAGContext(String text, int chunkCount, long retrievalMs) {
     }
 
-    /** 拼装 RAG 用户 Prompt：知识库上下文 + 用户问题。 */
     private String ragUserPrompt(String context, String message) {
         return "知识库内容：\n" + context + "\n\n请根据以上知识库内容回答问题：" + message;
     }

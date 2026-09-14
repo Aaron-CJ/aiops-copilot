@@ -7,11 +7,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
- * 巡检告警报告输出器。
- * <p>
- * 当前实现：控制台 ERROR 级日志输出 ASCII 框线格式告警报告。
- * 这套替代了传统 Alertmanager 的"无脑阈值告警 + 无上下文短信"——
- * 我们的告警已经包含根因分析和处置建议（由运维 Agent 模型 qwen3:8b 生成）。
+ * 巡检告警报告输出器：当前以控制台 ERROR 级日志输出 ASCII 框线格式报告
+ * （含根因分析与处置建议，由巡检模型生成）。
  * <p>
  * 后续替换为钉钉/飞书 Webhook 时，只需修改 {@link #report} 方法体，
  * 把 StringBuilder 拼好的内容改成 HTTP POST 即可，调用方无需改动。
@@ -47,8 +44,6 @@ public class OpsAlertReporter {
         sb.append("\n处置建议: ").append(suggestion);
         sb.append("\n==================================================");
         log.error(sb.toString());
-
-        // 模型原始输出保留在 DEBUG 级，便于后续调 prompt
         log.debug("[AIOps] 模型原始输出:\n{}", modelRawOutput);
     }
 

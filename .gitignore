@@ -41,3 +41,7 @@ out/
 
 ### Docker Compose 数据卷（Milvus etcd/minio/数据文件，GB 级，勿入库） ###
 docker/volumes/
+
+### Python 字节码缓存（scripts/ 运维脚本） ###
+__pycache__/
+*.py[cod]

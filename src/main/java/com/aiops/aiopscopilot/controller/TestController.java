@@ -7,25 +7,26 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+/**
+ * 虚拟线程验证接口：配合 application.yml 的 spring.threads.virtual.enabled=true 使用。
+ * 访问 /api/test 后根据返回的 isVirtual 字段确认 Tomcat 请求线程是否已切换为虚拟线程。
+ */
 @RestController
 @RequestMapping("/api")
 public class TestController {
 
-	/**
-	 * 测试接口：返回当前请求线程是否为虚拟线程
-	 */
-	@GetMapping("/test")
-	public Map<String, Object> test() {
-		Thread currentThread = Thread.currentThread();
-		String threadName = currentThread.getName();
-		boolean isVirtual = currentThread.isVirtual();
+    @GetMapping("/test")
+    public Map<String, Object> test() {
+        Thread currentThread = Thread.currentThread();
+        String threadName = currentThread.getName();
+        boolean isVirtual = currentThread.isVirtual();
 
-		System.out.println("当前线程名称: " + threadName);
+        System.out.println("当前线程名称: " + threadName);
 
-		Map<String, Object> result = new LinkedHashMap<>();
-		result.put("threadName", threadName);
-		result.put("isVirtual", isVirtual);
-		return result;
-	}
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("threadName", threadName);
+        result.put("isVirtual", isVirtual);
+        return result;
+    }
 
 }
