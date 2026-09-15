@@ -1,6 +1,10 @@
 package com.aiops.aiopscopilot.service;
 
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -9,6 +13,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import com.aiops.aiopscopilot.service.IncidentStore.Incident;
 import com.aiops.aiopscopilot.tool.PrometheusTool;
 import com.aiops.aiopscopilot.tool.SystemHealthTools;
 import tools.jackson.databind.JsonNode;
@@ -36,29 +41,49 @@ import tools.jackson.databind.ObjectMapper;
  * 直出结论、速度快数倍且足够胜任。交互问答（/api/agent/ops）同样统一用 qwen3:8b
  * （opsAgentClient）：巡检与交互共用同一模型，避免 Ollama 单模型驻留下两模型
  * 交替触发反复换载（Ollama 经验值每次约 10-30 秒，本项目未单独测）。
+ * <p>
+ * 第二批可靠性增强：
+ * <ul>
+ *   <li>事件状态机（{@link IncidentStore}）：同一故障指纹未 RESOLVED 前不再走 log.error
+ *       全量报告，改走 INFO 级心跳，避免告警风暴</li>
+ *   <li>Ollama 降级：LLM 调用加 {@value #LLM_TIMEOUT_SECONDS} 秒超时，超时/异常走
+ *       {@link #fallbackByThreshold} 硬阈值兜底，巡检不会因 Ollama 卡死而完全失效</li>
+ *   <li>AI 漏报兜底：AI 判 normal 但 CPU&gt;90% 或 BLOCKED&gt;0 时强改 warning/critical，
+ *       防止模型误判导致漏报</li>
+ * </ul>
  */
 @Component
 public class OpsScheduler {
 
     private static final Logger log = LoggerFactory.getLogger(OpsScheduler.class);
 
+    /** LLM 调用最大等待秒数：fixedDelay 60s 的 75%，留余量给指标拉取与解析 */
+    static final long LLM_TIMEOUT_SECONDS = 45;
+
+    /** 阈值兜底阈值（与 memory 中约束一致） */
+    private static final double CPU_WARN_THRESHOLD = 0.90;
+    private static final double HEAP_CRITICAL_THRESHOLD = 0.95;
+
     private final ChatClient inspectorChatClient;
     private final PrometheusTool prometheusTool;
     private final SystemHealthTools systemHealthTools;
     private final OpsAlertReporter reporter;
     private final MetricsService metricsService;
+    private final IncidentStore incidentStore;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public OpsScheduler(@Qualifier("qwenChatClient") ChatClient inspectorChatClient,
                         PrometheusTool prometheusTool,
                         SystemHealthTools systemHealthTools,
                         OpsAlertReporter reporter,
-                        MetricsService metricsService) {
+                        MetricsService metricsService,
+                        IncidentStore incidentStore) {
         this.inspectorChatClient = inspectorChatClient;
         this.prometheusTool = prometheusTool;
         this.systemHealthTools = systemHealthTools;
         this.reporter = reporter;
         this.metricsService = metricsService;
+        this.incidentStore = incidentStore;
     }
 
     /**
@@ -70,9 +95,10 @@ public class OpsScheduler {
     public void runInspection() {
         log.info("[OpsScheduler] 开始巡检...");
         long start = System.currentTimeMillis();
+        Map<String, Object> snapshot = null;
         try {
             // 1. 预拉指标快照（不让模型自主查，省 token + 时延）
-            Map<String, Object> snapshot = prometheusTool.queryFixedMetrics();
+            snapshot = prometheusTool.queryFixedMetrics();
 
             // 2. 二级诊断：当 Prometheus 显示 BLOCKED 线程数 > 0 时，主动调用 ThreadMXBean 检测死锁。
             //    Prometheus 只能告诉我们"有几个阻塞线程"，ThreadMXBean 才能告诉我们
@@ -83,21 +109,140 @@ public class OpsScheduler {
                 snapshot.put("deadlockDiagnosis", systemHealthTools.detectDeadlock());
             }
 
-            // 3. 构造结构化 Prompt 让模型判断
+            // 3. 构造结构化 Prompt 让模型判断，加超时保护避免 Ollama 卡死拖垮巡检
             String prompt = buildInspectionPrompt(snapshot);
-            String reply = inspectorChatClient.prompt()
-                    .user(prompt)
-                    .call()
-                    .content();
+            String reply = callLlmWithTimeout(prompt);
 
             // 4. 解析模型输出，分级响应
-            handleInspectionResult(reply, snapshot, start);
+            handleInspectionResult(reply, snapshot, start, false);
+        } catch (TimeoutException te) {
+            // LLM 超时：Ollama 卡死或推理过慢，启用阈值兜底
+            log.warn("[OpsScheduler] LLM 推理超过 {}s 未返回，启用阈值兜底", LLM_TIMEOUT_SECONDS);
+            if (snapshot != null) {
+                handleDegraded(snapshot, start);
+            } else {
+                metricsService.recordInspection("error", System.currentTimeMillis() - start);
+            }
         } catch (Exception e) {
-            // 巡检自身失败不能让调度器崩——下个周期继续跑
-            metricsService.recordInspection("error", System.currentTimeMillis() - start);
-            log.error("[OpsScheduler] 巡检失败: {}", e.getMessage(), e);
+            // Ollama 进程不可用 / 网络异常 / 指标拉取失败等：不能让调度器崩——下个周期继续跑
+            log.warn("[OpsScheduler] 巡检异常，尝试阈值兜底: {}", e.getMessage());
+            if (snapshot != null) {
+                handleDegraded(snapshot, start);
+            } else {
+                metricsService.recordInspection("error", System.currentTimeMillis() - start);
+                log.error("[OpsScheduler] 指标拉取也失败，本轮巡检完全失败", e);
+            }
         }
         log.info("[OpsScheduler] 巡检周期结束");
+    }
+
+    /**
+     * 调用 LLM 并强制超时。CompletableFuture.supplyAsync 在公共 ForkJoinPool 上跑，
+     * LLM 调用是阻塞 IO 不会占用 CPU，对调度器无影响。超时后任务仍会继续完成
+     * （Ollama 推理不会真停），但本巡检周期不再等待。
+     */
+    private String callLlmWithTimeout(String prompt) throws TimeoutException, ExecutionException, InterruptedException {
+        CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
+                inspectorChatClient.prompt()
+                        .user(prompt)
+                        .call()
+                        .content());
+        try {
+            return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException te) {
+            // 取消任务（mayInterruptIfRunning=true，但 Ollama 客户端可能不响应中断，至少释放等待线程）
+            future.cancel(true);
+            throw te;
+        }
+    }
+
+    /**
+     * 降级路径：Ollama 不可用时，直接基于指标快照做硬阈值判断。
+     * 不走 LLM，不消耗 Token，输出与 LLM 等价的 JSON，仍接入状态机去重。
+     */
+    private void handleDegraded(Map<String, Object> snapshot, long start) {
+        try {
+            String degradedReply = fallbackByThreshold(snapshot);
+            handleInspectionResult(degradedReply, snapshot, start, true);
+        } catch (Exception ex) {
+            metricsService.recordInspection("error", System.currentTimeMillis() - start);
+            log.error("[OpsScheduler] 阈值兜底也失败: {}", ex.getMessage(), ex);
+        }
+    }
+
+    /**
+     * 纯阈值兜底判断：构造与 LLM 等价的 JSON 输出。
+     * <p>
+     * 规则（与 memory 约束一致）：
+     * <ul>
+     *   <li>CPU &gt; {@value #CPU_WARN_THRESHOLD} → warning</li>
+     *   <li>BLOCKED &gt; 0 → critical（死锁强信号）</li>
+     *   <li>堆内存 &gt; {@value #HEAP_CRITICAL_THRESHOLD} → critical</li>
+     *   <li>QPS=0 但端口在 → critical（应用假死信号）</li>
+     *   <li>5min GC &gt; 10 → warning（疑似内存泄漏）</li>
+     * </ul>
+     * 同时这是"Ollama 不可用时的兜底"，不是首选路径。
+     */
+    private String fallbackByThreshold(Map<String, Object> snapshot) {
+        double cpu = asDouble(snapshot.get("cpuUsage"));
+        double blocked = asDouble(snapshot.get("blockedThreads"));
+        double heap = asDouble(snapshot.get("heapUsage"));
+        double qps = asDouble(snapshot.get("qpsLast1m"));
+        double gc5m = asDouble(snapshot.get("gcCountLast5m"));
+
+        StringBuilder rootCause = new StringBuilder();
+        String status = "normal";
+
+        // 优先级：死锁 > OOM > 假死 > GC > CPU
+        if (blocked > 0) {
+            status = "critical";
+            rootCause.append("代码级兜底：存在 BLOCKED 线程（").append(blocked).append("），疑似死锁; ");
+            Object dd = snapshot.get("deadlockDiagnosis");
+            if (dd != null) rootCause.append("ThreadMXBean 诊断=").append(dd).append("; ");
+        }
+        if (heap > HEAP_CRITICAL_THRESHOLD) {
+            status = "critical";
+            rootCause.append("代码级兜底：堆内存使用率 ").append(heap).append(" > ").append(HEAP_CRITICAL_THRESHOLD).append("; ");
+        }
+        if (qps == 0 && cpu >= 0) {
+            // cpu>=0 表示指标拉取正常（不是 -1），但 QPS=0 → 应用假死
+            status = "critical";
+            rootCause.append("代码级兜底：QPS=0 但端口在，应用可能假死; ");
+        }
+        if (gc5m > 10) {
+            if (!"critical".equals(status)) status = "warning";
+            rootCause.append("代码级兜底：5min GC 次数 ").append(gc5m).append(" > 10，疑似内存泄漏; ");
+        }
+        if (cpu > CPU_WARN_THRESHOLD) {
+            if ("normal".equals(status)) status = "warning";
+            rootCause.append("代码级兜底：CPU 使用率 ").append(cpu).append(" > ").append(CPU_WARN_THRESHOLD).append("; ");
+        }
+
+        String summary = "normal".equals(status) ? "各项指标正常" : "阈值兜底：" + rootCause;
+        String rc = rootCause.length() == 0 ? "N/A" : rootCause.toString().trim();
+        String suggestion = "normal".equals(status)
+                ? "N/A"
+                : "Ollama 不可用，建议人工介入或重启 Ollama 服务后让 AI 重新诊断";
+
+        return "{\"status\":\"" + status + "\","
+                + "\"summary\":\"" + escapeJson(summary) + "\","
+                + "\"rootCause\":\"" + escapeJson(rc) + "\","
+                + "\"suggestion\":\"" + escapeJson(suggestion) + "\"}";
+    }
+
+    /** 把指标值安全转为 double；非数字或 null 返回 -1（与指标拉取失败的哨兵值一致） */
+    private double asDouble(Object v) {
+        if (v instanceof Number) return ((Number) v).doubleValue();
+        return -1;
+    }
+
+    /** 简易 JSON 字符串转义（避免中文标点破坏 JSON 结构） */
+    private String escapeJson(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r");
     }
 
     /** 把指标快照与 6 条判断维度、死锁诊断要求、严格 JSON 输出格式组装成巡检 Prompt。 */
@@ -123,9 +268,20 @@ public class OpsScheduler {
 
     /**
      * 解析模型输出（先经 {@link #extractJson} 剥离思考段/markdown 包裹）并按级别路由。
+     * <p>
+     * 第二批可靠性改造后的流程：
+     * <ol>
+     *   <li>解析 JSON 得到 status/summary/rootCause/suggestion</li>
+     *   <li>AI 漏报兜底：normal 但 CPU&gt;90% 或 BLOCKED&gt;0 → 强改 warning/critical</li>
+     *   <li>状态机去重：normal → bumpNormalAndResolve（输出 RESOLVED 事件）；
+     *       warning/critical → IncidentStore.recordOrUpdate（首次 NEW 全量报告，后续 ACTIVE 心跳）</li>
+     * </ol>
      * JSON 非法时不抛异常——巡检调度器必须比模型更稳定，原文落 ERROR 日志便于调 prompt。
+     *
+     * @param degraded true 表示这是降级路径（fallbackByThreshold）产生的输出，
+     *                 记录指标时用 "degraded" 标记，便于运维区分正常路径与兜底路径
      */
-    private void handleInspectionResult(String reply, Map<String, Object> snapshot, long start) {
+    private void handleInspectionResult(String reply, Map<String, Object> snapshot, long start, boolean degraded) {
         long durationMs = System.currentTimeMillis() - start;
         String json = extractJson(reply);
         try {
@@ -135,20 +291,66 @@ public class OpsScheduler {
             String rootCause = node.path("rootCause").asString("N/A");
             String suggestion = node.path("suggestion").asString("N/A");
 
-            metricsService.recordInspection(status, durationMs);
+            // AI 漏报兜底：normal 但指标严重超阈值时强改 warning/critical
+            String finalStatus = applyThresholdBackstop(status, snapshot, rootCause);
+            String finalRootCause = finalStatus.equals(status) ? rootCause
+                    : rootCause + " [代码级兜底已介入：" + finalStatus + "]";
+            status = finalStatus;
+
+            metricsService.recordInspection(degraded ? "degraded_" + status : status, durationMs);
 
             if ("normal".equalsIgnoreCase(status)) {
                 reporter.logNormal(snapshot);
+                // 通知所有 ACTIVE 事件递增 normal 计数，达到阈值自动 RESOLVED
+                java.util.List<Incident> resolved = incidentStore.bumpNormalAndResolve();
+                for (Incident inc : resolved) {
+                    reporter.logResolved(inc);
+                }
             } else {
-                reporter.report(status, summary, rootCause, suggestion, snapshot, reply);
+                // 状态机去重：首次 NEW 走全量报告，后续 ACTIVE 走心跳
+                // 指纹基于指标快照（稳定），不基于 LLM rootCause 文本（每次描述会不同）
+                String fp = IncidentStore.fingerprintOf(status, snapshot);
+                Incident incident = incidentStore.recordOrUpdate(fp, status, summary, finalRootCause, suggestion);
+                if (incident.isNew()) {
+                    reporter.report(status, summary, finalRootCause, suggestion, snapshot, reply);
+                } else {
+                    reporter.logHeartbeat(incident);
+                }
             }
         } catch (Exception e) {
-            metricsService.recordInspection("parse_error", durationMs);
+            metricsService.recordInspection(degraded ? "degraded_parse_error" : "parse_error", durationMs);
             log.error("[OpsScheduler] 巡检结果解析失败，模型原始输出：\n{}", reply);
         }
     }
 
-    /** 剥离 {@code <think>} 思考段和 markdown 代码块包裹，提取纯 JSON */
+    /**
+     * AI 漏报兜底：AI 判 normal 但指标严重超阈值时强改。
+     * 落实 memory 约束："if AI判定normal但CPU使用率>90%，强制改判为warning并标注原因"。
+     */
+    private String applyThresholdBackstop(String status, Map<String, Object> snapshot, String rootCause) {
+        if (!"normal".equalsIgnoreCase(status)) {
+            return status;
+        }
+        double cpu = asDouble(snapshot.get("cpuUsage"));
+        double blocked = asDouble(snapshot.get("blockedThreads"));
+        double heap = asDouble(snapshot.get("heapUsage"));
+
+        // BLOCKED > 0 比 CPU 更严重，直接 critical
+        if (blocked > 0) {
+            return "critical";
+        }
+        // 堆内存 > 95% 也直接 critical
+        if (heap > HEAP_CRITICAL_THRESHOLD) {
+            return "critical";
+        }
+        // CPU > 90% 强改 warning
+        if (cpu > CPU_WARN_THRESHOLD) {
+            return "warning";
+        }
+        return status;
+    }
+
+    /** 剥离 {@code </think>} 思考段和 markdown 代码块包裹，提取纯 JSON */
     private String extractJson(String reply) {
         if (reply == null) return "";
         String s = reply.trim();

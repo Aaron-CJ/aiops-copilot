@@ -84,6 +84,11 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 
 > 用真实故障换来的约束：qwen2.5:14b 因 16G 内存门槛加载失败；r1 因思考链过长拖垮同步链路。任何模型上生产前必须先过延迟与内存预算。
 
+**可靠性增强（已实现）**：
+- **LLM 超时保护**：[OpsScheduler.callLlmWithTimeout](file:///d:/IdeaProjects/aiops-copilot/src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L139) 用 `CompletableFuture.get(45s)` 包裹 LLM 调用，Ollama 卡死时不会拖垮巡检调度
+- **阈值降级路径**：[OpsScheduler.fallbackByThreshold](file:///d:/IdeaProjects/aiops-copilot/src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L170) 在 LLM 超时/异常时基于硬阈值（CPU>0.90 / BLOCKED>0 / 堆>0.95 / QPS=0 / GC>10）做兜底判断，仍接入状态机去重
+- **AI 漏报兜底**：[OpsScheduler.applyThresholdBackstop](file:///d:/IdeaProjects/aiops-copilot/src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L326) 在 AI 判 normal 但 CPU>90% 或 BLOCKED>0 时强改 warning/critical，rootCause 标注"代码级兜底"
+
 #### 4.2 深度推理通道：异步任务架构 📋
 
 深度根因分析（RCA）、链式故障推演、SOP 生成不能走同步请求，采用**诊断任务队列**：
@@ -105,21 +110,23 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 
 ### 5. 治理与反馈层（Governance & Feedback Loop）
 
-#### 5.1 事件生命周期管理（上线第一优先级）📋
+#### 5.1 事件生命周期管理（上线第一优先级）✅
 
 **问题**：每分钟巡检一次，同一持续性故障会被重复"发现"和报告 60 次/小时——告警风暴与 Token 浪费的根源。
 
-**机制**：故障指纹（fingerprint = 异常类型 + 根因特征，如 `DEADLOCK+DebugController`）+ 事件状态机：
+**已实现机制**（[IncidentStore](file:///d:/IdeaProjects/aiops-copilot/src/main/java/com/aiops/aiopscopilot/service/IncidentStore.java) + [OpsScheduler.handleInspectionResult](file:///d:/IdeaProjects/aiops-copilot/src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L260)）：
+
+故障指纹基于**指标快照特征**（`fingerprint = 异常级别 + "|" + 指标特征串`，如 `CRITICAL|DEADLOCK;BLOCKED=2;`）+ 内存级状态机：
 
 ```
-NEW（首次发现）→ CONFIRMED（第二周期复核，过滤瞬时尖峰）
-   → DIAGNOSING（深度通道/工具取证中）
-   → AWAITING_APPROVAL（方案已生成，待人工审批写操作）
-   → RESOLVED（指标恢复，闭环归档）
-同一指纹未关闭前：降级为"持续中"心跳日志，不重复推理、不重复推送
+NEW（首次发现）→ ACTIVE（持续中，第二周期起改走 INFO 心跳日志）
+   → RESOLVED（连续 3 轮 normal 后自动归档）
+同一指纹未关闭前：不重复走 log.error 全量报告，改由 OpsAlertReporter.logHeartbeat 输出 INFO 一行
 ```
 
-这同时是 Token 成本控制的根本手段：绝大多数巡检周期应是无事件的静默 INFO。
+> 指纹不基于 LLM rootCause 文本——LLM 对同一故障的描述每次会略有不同，会导致同故障被反复识别为 NEW、去重失效。指标特征是稳定的：同一类指标异常（如 BLOCKED>0）无论 LLM 怎么描述都会合并到同一指纹。详见 [事件状态机与降级设计](aiops-reliability-design.md)。
+
+存储选型：内存级 `ConcurrentHashMap`，重启丢失——与"自治诊断"边界一致（死锁等故障应用重启后也会消失，持久化反而是噪音）。
 
 #### 5.2 Human-in-the-Loop ✅ 原则 / 📋 推送渠道
 
@@ -175,7 +182,7 @@ AIOps 系统也必须可被观测，且零新增组件——全部走 Micrometer
 3. qwen3:8b 输出 critical 报告，根因从"可能死锁"升级为"确认为死锁 + 具体代码位置 + 锁顺序修复建议"；
 4. **人工**重启应用清除死锁后，巡检自动恢复 INFO 静默。
 
-**这验证了"感知（API）→ 取证（Tool）→ 思考（模型）→ 报告（Reporter）"闭环可行**；当前边界是"诊断 + 建议"，自动修复/重启不在系统能力内（写操作须经 5.2 人工审批）。尚待闭环的是事件去重（5.1）、异步深度诊断（4.2）、审批卡片（5.2）。
+**这验证了"感知（API）→ 取证（Tool）→ 思考（模型）→ 报告（Reporter）"闭环可行；当前边界是"诊断 + 建议"，自动修复/重启不在系统能力内（写操作须经 5.2 人工审批）。事件去重（5.1 ✅ 已实现）、AI 漏报阈值兜底与 Ollama 降级（4.1 ✅ 已实现）已落地；尚待闭环的是异步深度诊断（4.2）、审批卡片（5.2）。
 
 ---
 
@@ -183,7 +190,7 @@ AIOps 系统也必须可被观测，且零新增组件——全部走 Micrometer
 
 | 优先级 | 事项 | 对应章节 | 状态 |
 |--------|------|----------|------|
-| P0 | **事件状态机 + 故障指纹去重**——不做则上线首日告警风暴 | 5.1 | 📋 |
+| P0 | **事件状态机 + 故障指纹去重**——不做则上线首日告警风暴 | 5.1 | ✅ |
 | P0 | **审计日志 + 工具白名单 + 提示注入防御**——生产前置 | 2.2 | 📋 |
 | P1 | **故障注入测试集 + 评估指标**——让后续优化可度量 | 三 | 🔧（死锁 case 已有） |
 | P1 | **报告输出对接飞书互动卡片 + 审批回调** | 5.2 | 🔧（控制台版本已有） |
