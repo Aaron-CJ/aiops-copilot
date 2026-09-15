@@ -63,7 +63,7 @@ services:
       - "minio"
 
   prometheus:
-    # 固定精确版本而非 latest，避免容器重建时被静默升级；v3.13 为 Prometheus 官方 LTS 线（享一年补丁支持）
+    # 固定精确版本而非 latest，避免容器重建时被静默升级；v3.13 为 Prometheus 官方 LTS 线（补丁支持至 2027-07-31）
     image: prom/prometheus:v3.13.3
     container_name: prometheus
     restart: unless-stopped
@@ -77,7 +77,7 @@ services:
       - "host.docker.internal:host-gateway"
 
   attu:
-    # 固定精确版本而非 latest，避免容器重建时被静默升级；v3 与下方 Milvus v3.0.1 配套
+    # 固定精确版本而非 latest，避免容器重建时被静默升级；v3.0.0 GA，兼容 Milvus 2.5.x-3.x（项目与 Milvus v3.0.1 同步运行 OK）
     image: zilliz/attu:v3.0.0
     container_name: attu
     restart: unless-stopped

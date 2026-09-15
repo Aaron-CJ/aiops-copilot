@@ -34,7 +34,7 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 #### 1.2 主动巡检引擎：语义判断替代静态阈值 ✅
 
 - **做法**：废弃 Alertmanager。Spring `@Scheduled(fixedDelay=60_000, initialDelay=30_000)` 每分钟触发一次巡检。
-  - 用 `fixedDelay` 而非 `fixedRate`：巡检本身含 LLM 推理（5-15 秒），fixedDelay 保证"结束→开始"间隔 60 秒，任务不堆积；
+  - 用 `fixedDelay` 而非 `fixedRate`：巡检含 qwen3:8b 关闭思考链的 LLM 推理，fixedDelay 保证"结束→开始"间隔 60 秒，任务不堆积；
   - 巡检模型输出**严格 JSON**（status/summary/rootCause/suggestion），调度器程序化解析；解析失败时原文落 ERROR 日志，**调度器必须比模型更稳定**。
 - **二级诊断（证据链增强）** ✅：当快照中 `blockedThreads > 0`，调度器主动调用 `SystemHealthTools.detectDeadlock()`（基于 `ThreadMXBean.findDeadlockedThreads()`，微秒级、零外部进程、同时覆盖 synchronized 与 ReentrantLock），把死锁线程名、等待锁、锁持有者、栈顶 8 帧注入快照。
   - 实战效果：根因分析从泛泛的"可能是死锁或资源竞争"升级为"确认为死锁，由 DebugController 两个线程互相持有对方需要的锁"，精确定位到具体代码行号。
@@ -79,8 +79,8 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 
 | 通道 | 模型 | 场景 | 实测结论 |
 |------|------|------|----------|
-| 快速通道 | **qwen3:8b + `disableThinking()`** | 每分钟巡检（`qwenChatClient`，不挂工具）、交互问答（`opsAgentClient`，挂双工具） | 关闭思考链后直出结论，延迟低、Function Calling 成熟；巡检与交互共用同一模型，避免 Ollama 单模型驻留下两模型反复换载（每次 10-30 秒） |
-| 深度通道 | deepseek-r1:8b | RAG 复杂意图理解（同步可接受场景） | **纯 CPU 推理 + 长思考链单次 5-8 分钟，同步 HTTP 链路 120 秒超时**；不能用于巡检与交互式诊断 |
+| 快速通道 | **qwen3:8b + `disableThinking()`** | 每分钟巡检（`qwenChatClient`，不挂工具）、交互问答（`opsAgentClient`，挂双工具） | 关闭思考链后直出结论，延迟低、Function Calling 成熟；巡检与交互共用同一模型，避免 Ollama 单模型驻留下两模型反复换载（Ollama 经验值每次约 10-30 秒） |
+| 深度通道 | deepseek-r1:8b | RAG 复杂意图理解（同步可接受场景） | **纯 CPU 推理 + 长思考链单次实测 1.7-6.6 分钟**（4 个场景实测：简单 RAG 问答约 1.7 分钟、中等 RAG 综合约 6.3 分钟、复杂故障诊断约 2.5 分钟、超复杂 SOP 决策约 6.6 分钟，随 prompt 复杂度大幅波动），**同步 HTTP 链路 120 秒超时无法稳定承载**；不能用于巡检与交互式诊断 |
 
 > 用真实故障换来的约束：qwen2.5:14b 因 16G 内存门槛加载失败；r1 因思考链过长拖垮同步链路。任何模型上生产前必须先过延迟与内存预算。
 
@@ -90,7 +90,7 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 
 ```
 巡检/交互触发深度诊断 → 提交任务返回 taskId（立即响应）
-                     → 后台 worker 调用推理模型（可思考 5-10 分钟）
+                     → 后台 worker 调用推理模型（实测可思考 1.7-6.6 分钟）
                      → 完成后推送结构化报告（飞书卡片/Webhook）
 ```
 

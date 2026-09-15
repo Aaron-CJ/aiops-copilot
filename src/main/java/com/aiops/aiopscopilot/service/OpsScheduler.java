@@ -29,10 +29,13 @@ import tools.jackson.databind.ObjectMapper;
  * <p>
  * 为什么巡检用 qwen3:8b（关闭思考链）而不是 deepseek-r1：
  * 巡检每分钟跑一次，单次延迟必须远小于 60 秒。deepseek-r1:8b 在 CPU 上推理 + 长思考链
- * 单次需 5-8 分钟，会导致巡检任务堆积、永远赶不上调度周期。巡检场景只需"看指标→判异常→
- * 输出 JSON"，不需要深度推理，qwen3:8b 关闭思考链后直出结论、速度快数倍且足够胜任。
- * 交互问答（/api/agent/ops）同样统一用 qwen3:8b（opsAgentClient）：
- * 巡检与交互共用同一模型，避免 Ollama 单模型驻留下两模型交替触发反复换载（每次 10-30 秒）。
+ * 单次实测耗时 1.7-6.6 分钟（简单 RAG 问答约 1.7 分钟、中等 RAG 综合约 6.3 分钟、
+ * 复杂故障诊断约 2.5 分钟、超复杂 SOP 决策约 6.6 分钟，随 prompt 复杂度大幅波动），
+ * 远超 60 秒预算，会导致巡检任务堆积、永远赶不上调度周期。
+ * 巡检场景只需"看指标→判异常→输出 JSON"，不需要深度推理，qwen3:8b 关闭思考链后
+ * 直出结论、速度快数倍且足够胜任。交互问答（/api/agent/ops）同样统一用 qwen3:8b
+ * （opsAgentClient）：巡检与交互共用同一模型，避免 Ollama 单模型驻留下两模型
+ * 交替触发反复换载（Ollama 经验值每次约 10-30 秒，本项目未单独测）。
  */
 @Component
 public class OpsScheduler {
@@ -60,7 +63,7 @@ public class OpsScheduler {
 
     /**
      * 每 60 秒主动巡检一次，应用启动 30 秒后首次执行（给 Prometheus 留够抓取周期）。
-     * 用 fixedDelay 而非 fixedRate：巡检本身可能耗时 5-15 秒（qwen3 推理），
+     * 用 fixedDelay 而非 fixedRate：巡检含 qwen3:8b 关闭思考链的推理耗时，
      * fixedDelay 保证两次巡检"结束→开始"间隔恰好 60 秒，不会任务堆积。
      */
     @Scheduled(fixedDelay = 60_000, initialDelay = 30_000)

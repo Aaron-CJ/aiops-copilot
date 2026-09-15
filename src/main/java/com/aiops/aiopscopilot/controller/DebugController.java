@@ -4,6 +4,7 @@ import java.util.concurrent.CountDownLatch;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Profile;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -30,8 +31,12 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>
  * 若需人工复核，也可用 jstack/Arthas thread 命令查看，输出末尾会列出
  * "Found one Java-level deadlock" 及互相等待的线程对。
+ * <p>
+ * 安全隔离：带 {@link Profile @Profile("dev")}，仅 dev profile 装配此 Bean；
+ * 生产（prod）启动时 /api/debug/deadlock 直接 404，杜绝生产环境被注入死锁。
  */
 @RestController
+@Profile("dev")
 @RequestMapping("/api/debug")
 public class DebugController {
 

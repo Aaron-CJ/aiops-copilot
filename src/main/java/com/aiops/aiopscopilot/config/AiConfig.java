@@ -2,7 +2,6 @@ package com.aiops.aiopscopilot.config;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.ollama.api.OllamaChatOptions;
-import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -49,9 +48,10 @@ public class AiConfig {
     /**
      * 智能运维交互问答 Agent（/api/agent/ops 专用）。
      * <p>
-     * 1) 模型用配置的快速模型并关闭思考：深度模型在纯 CPU 下思考链过长，
-     *    同步工具调用链路实测 2 分钟以上（HTTP 120 秒超时），交互式接口无法接受；
-     *    巡检与交互统一同一模型还能避免 Ollama 单模型驻留时两模型反复"卸载→重载"（每次 10-30 秒）；
+     * 1) 模型用配置的快速模型并关闭思考：深度模型（deepseek-r1:8b）在纯 CPU 下思考链过长，
+     *    同步链路实测 1.7-6.6 分钟（简单 RAG 问答约 1.7 分钟、中等 RAG 综合约 6.3 分钟、
+     *    复杂故障诊断约 2.5 分钟、超复杂 SOP 决策约 6.6 分钟），远超同步 HTTP 120 秒超时，交互式接口无法接受；
+     *    巡检与交互统一同一模型还能避免 Ollama 单模型驻留时两模型反复"卸载→重载"（Ollama 经验值每次约 10-30 秒，本项目未单独测）；
      * 2) 注册 {@link PrometheusTool}（时序数据）+ {@link SystemHealthTools}（瞬时本地状态），
      *    交互场景模型需要自主决定调用哪个工具；
      * 3) defaultSystem 强调"必须调工具拿真实数据"——防幻觉的关键：

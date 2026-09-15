@@ -38,8 +38,8 @@ public class KnowledgeIngester {
 
     public KnowledgeIngester(VectorStore vectorStore) {
         this.vectorStore = vectorStore;
-        // 基于 Token 的文本切片器：400 token/片段，比默认 800 更细粒度，
-        // 语义检索更精准，也远离 Embedding 模型的上下文上限（2.0 版不支持 chunkOverlap）
+        // 基于 Token 的文本切片器：400 token/片段，比默认 800 更细粒度，语义检索更精准
+        // 注：Spring AI 2.0 的 Builder API 未提供 chunkOverlap 配置项
         this.textSplitter = TokenTextSplitter.builder()
                 .withChunkSize(400)
                 .build();

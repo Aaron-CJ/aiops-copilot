@@ -45,3 +45,6 @@ docker/volumes/
 ### Python 字节码缓存（scripts/ 运维脚本） ###
 __pycache__/
 *.py[cod]
+
+### JVM crash 日志（hs_err_pid*.log） ###
+hs_err_pid*.log

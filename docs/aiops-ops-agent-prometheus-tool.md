@@ -24,7 +24,7 @@
 同一个工具类的查询能力被两条路径复用，避免重复实现：
 
 - **路径 A（被动）**：`@Tool` 注解的 `queryMetric(String promql)` 方法暴露给 `opsAgentClient`，用户提问时模型自主决定查什么 PromQL
-- **路径 B（主动）**：巡检调度器直接调用 `PrometheusTool` 的普通 public 方法 `queryFixedMetrics()`，**预拉固定指标塞进 Prompt**，不让模型自己反复试错查（每分钟跑一次，模型自主查会浪费 5-10 次 token）
+- **路径 B（主动）**：巡检调度器直接调用 `PrometheusTool` 的普通 public 方法 `queryFixedMetrics()`，**预拉固定指标塞进 Prompt**，不让模型自己反复试错查（每分钟跑一次，模型自主查可能产生 5-10 次无效工具往返）
 
 这个分工对应"Agent 主动出击"——巡检不是让模型当查询工，而是让模型当"判断工"。
 

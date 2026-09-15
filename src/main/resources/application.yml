@@ -3,6 +3,11 @@ server:
 
 # AIOps Agent 自定义配置
 aiops:
+  security:
+    # API 访问令牌：非空时 /api/** 全部需要鉴权（Authorization: Bearer <token>
+    # 或 X-API-Key 头；SSE 接口可用 ?token= 传参）；留空则不鉴权（本地开发默认）。
+    # 生产通过环境变量注入：AIOPS_API_TOKEN=你的强随机令牌
+    token: ${AIOPS_API_TOKEN:}
   prometheus:
     # Prometheus HTTP API 地址，供 PrometheusTool 调用 /api/v1/query
     # Agent 把这里当"时序数据的眼睛"——不通过 Grafana 看图，直接读 API
@@ -15,6 +20,10 @@ aiops:
 spring:
   application:
     name: aiops-copilot
+  # 未显式指定时默认 dev 环境（DebugController 等故障注入夹具仅 dev 装配）；
+  # 生产通过环境变量切换：SPRING_PROFILES_ACTIVE=prod
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
   # 启用 JDK 21 虚拟线程：Tomcat 每个请求改由轻量虚拟线程处理，
   # 等待 LLM 生成这类长时间阻塞 IO 时不再占满平台线程池
   threads:

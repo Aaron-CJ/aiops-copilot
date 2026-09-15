@@ -85,7 +85,8 @@ public class AiChatController {
                     List<String> chunks = new ArrayList<>();
                     var result = chatResponse.getResult();
                     if (result != null) {
-                        String thinking = (String) result.getOutput().getMetadata().get("thinking");
+                        Object raw = result.getOutput().getMetadata().get("thinking");
+                        String thinking = raw != null ? String.valueOf(raw) : null;
                         if (thinking != null && !thinking.isEmpty()) {
                             if (thinkingOpened.compareAndSet(false, true)) {
                                 chunks.add("<think>");
@@ -193,7 +194,7 @@ public class AiChatController {
                         .similarityThreshold(RAG_SIMILARITY_THRESHOLD)
                         .build());
         long retrievalMs = System.currentTimeMillis() - start;
-        if (docs == null || docs.isEmpty()) {
+        if (docs.isEmpty()) {
             log.info("[RAG] 无高于阈值 {} 的片段，问题：{}", RAG_SIMILARITY_THRESHOLD, message);
             metricsService.recordRAGRetrieval(false, 0, retrievalMs);
             return null;
