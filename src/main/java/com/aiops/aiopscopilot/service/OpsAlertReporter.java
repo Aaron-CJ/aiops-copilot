@@ -7,6 +7,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import com.aiops.aiopscopilot.common.audit.AuditLogger;
 import com.aiops.aiopscopilot.service.IncidentStore.Incident;
 
 /**
@@ -21,6 +22,9 @@ import com.aiops.aiopscopilot.service.IncidentStore.Incident;
  *   <li>{@link #logNormal} — 巡检正常：INFO 级一行摘要</li>
  * </ul>
  * <p>
+ * 所有决策点同时写入审计日志（{@link AuditLogger}），落盘到 logs/aiops-audit.log，
+ * 容器重启不丢证据。
+ * <p>
  * 后续替换为钉钉/飞书 Webhook 时，只需修改各方法体内的输出实现，
  * 调用方（{@link OpsScheduler}）无需改动。
  */
@@ -28,10 +32,16 @@ import com.aiops.aiopscopilot.service.IncidentStore.Incident;
 public class OpsAlertReporter {
 
     private static final Logger log = LoggerFactory.getLogger(OpsAlertReporter.class);
+    private final AuditLogger audit;
+
+    public OpsAlertReporter(AuditLogger audit) {
+        this.audit = audit;
+    }
 
     /**
      * 输出结构化告警报告（首次发现 NEW 时调用）。
      *
+     * @param fingerprint     事件指纹（基于指标快照，用于审计日志关联）
      * @param status          异常级别：warning / critical
      * @param summary         一句话异常摘要（模型生成）
      * @param rootCause       根因分析（模型生成）
@@ -39,7 +49,7 @@ public class OpsAlertReporter {
      * @param metricsSnapshot 巡检时的指标快照
      * @param modelRawOutput  模型原始输出（DEBUG 级保留，便于调优 prompt）
      */
-    public void report(String status, String summary, String rootCause, String suggestion,
+    public void report(String fingerprint, String status, String summary, String rootCause, String suggestion,
                        Map<String, Object> metricsSnapshot, String modelRawOutput) {
         StringBuilder sb = new StringBuilder(512);
         sb.append("\n==================================================");
@@ -56,6 +66,7 @@ public class OpsAlertReporter {
         sb.append("\n==================================================");
         log.error(sb.toString());
         log.debug("[AIOps] 模型原始输出:\n{}", modelRawOutput);
+        audit.incidentNew(fingerprint, status, summary);
     }
 
     /**
@@ -69,6 +80,7 @@ public class OpsAlertReporter {
                 dur.toMinutes(),
                 incident.summary(),
                 incident.rootCause());
+        audit.incidentActive(incident.fingerprint(), dur);
     }
 
     /**
@@ -80,6 +92,7 @@ public class OpsAlertReporter {
                 incident.fingerprint(),
                 dur.toMinutes(),
                 incident.rootCause());
+        audit.incidentResolved(incident.fingerprint(), dur);
     }
 
     /**

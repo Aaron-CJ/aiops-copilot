@@ -24,8 +24,9 @@ import org.springframework.stereotype.Component;
  * 去重规则：同一 fingerprint 未关闭前，后续巡检周期不再走 log.error 全量报告，
  * 改由 {@link OpsAlertReporter#logHeartbeat} 输出 INFO 级心跳。
  * <p>
- * Fingerprint 构造：{@code status + "|" + rootCause 前 40 字符}。
- * 粗粒度——避免把"CPU 高 + 不同根因描述"合并为同一事件；
+ * Fingerprint 构造见 {@link #fingerprintOf}：{@code status + "|" + 指标特征串}
+ * （如 {@code CRITICAL|DEADLOCK;BLOCKED=2;}），基于指标快照而非 LLM 文本，
+ * 粒度既不会把"CPU 高 + 不同根因描述"合并为同一事件，
  * 也不细到用完整指标快照 hash（会过度去重、漏报同类故障）。
  */
 @Component

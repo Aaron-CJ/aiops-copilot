@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Logback 配置：控制台 + 审计日志分离。
+     - 控制台：保留 Spring Boot 默认格式，开发期便于观察
+     - 审计文件：AI 决策证据链落盘，按天轮转保留 30 天，容器重启不丢证据
+     审计 logger 名约定：com.aiops.aiopscopilot.audit（additive=false 防止控制台重复输出） -->
+<configuration>
+
+    <!-- 控制台输出：开发期友好格式，含时间/级别/logger/消息 -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 审计日志文件：AI 巡检/Agent 决策证据链。
+         按天轮转、保留 30 天、单文件上限 200MB、总大小上限 5GB、历史文件 gzip 压缩 -->
+    <appender name="AUDIT_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>logs/aiops-audit.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>logs/aiops-audit.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+            <maxFileSize>200MB</maxFileSize>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>5GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS}|%-5level|%logger|%msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 审计 logger：仅写文件，不冒泡到控制台（additive=false）。
+         约定：所有审计决策日志走 LoggerFactory.getLogger("com.aiops.aiopscopilot.audit") -->
+    <logger name="com.aiops.aiopscopilot.audit" level="INFO" additivity="false">
+        <appender-ref ref="AUDIT_FILE"/>
+    </logger>
+
+    <!-- 应用包级别调试：dev 环境可临时调 DEBUG 排查 -->
+    <springProfile name="dev">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+        <logger name="com.aiops.aiopscopilot" level="DEBUG"/>
+    </springProfile>
+
+    <!-- 生产环境：降低噪音，只保留 WARN+ 控制台输出，审计走文件 -->
+    <springProfile name="prod">
+        <root level="WARN">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+        <logger name="com.aiops.aiopscopilot" level="INFO"/>
+    </springProfile>
+
+</configuration>

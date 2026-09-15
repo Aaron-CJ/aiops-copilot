@@ -23,9 +23,9 @@ NEW（首次发现）→ ACTIVE（持续中，第二周期起改走 INFO 心跳�
 
 | 状态 | 触发条件 | 输出 |
 |------|----------|------|
-| NEW | 当前轮 fingerprint 在 store 中不存在或上次已 RESOLVED | [OpsAlertReporter.report](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L42) — ERROR + ASCII 框线全量报告 |
-| ACTIVE | 同 fingerprint 仍在（未 RESOLVED） | [OpsAlertReporter.logHeartbeat](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L65) — INFO 一行心跳 |
-| RESOLVED | 连续 3 轮巡检 normal 后自动标记 | [OpsAlertReporter.logResolved](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L77) — INFO 一行恢复 |
+| NEW | 当前轮 fingerprint 在 store 中不存在或上次已 RESOLVED | [OpsAlertReporter.report](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L52) — ERROR + ASCII 框线全量报告 |
+| ACTIVE | 同 fingerprint 仍在（未 RESOLVED） | [OpsAlertReporter.logHeartbeat](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L76) — INFO 一行心跳 |
+| RESOLVED | 连续 3 轮巡检 normal 后自动标记 | [OpsAlertReporter.logResolved](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L89) — INFO 一行恢复 |
 
 ### 2.2 Fingerprint 构造（基于指标快照，不基于 LLM 文本）
 
@@ -35,7 +35,7 @@ NEW（首次发现）→ ACTIVE（持续中，第二周期起改走 INFO 心跳�
 >
 > 指标特征是稳定的：只要同一类指标异常（如 BLOCKED>0），无论 LLM 怎么描述都会合并到同一指纹。
 
-实现：[IncidentStore.fingerprintOf](../src/main/java/com/aiops/aiopscopilot/service/IncidentStore.java#L113)
+实现：[IncidentStore.fingerprintOf](../src/main/java/com/aiops/aiopscopilot/service/IncidentStore.java#L127)
 
 ```
 fingerprint = 异常级别 + "|" + 指标特征串
@@ -68,7 +68,7 @@ fingerprint = 异常级别 + "|" + 指标特征串
 
 ### 3.1 LLM 超时保护
 
-[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L139)：
+[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L151)：
 
 ```java
 CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
@@ -81,7 +81,7 @@ return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);  // 45 秒
 
 ### 3.2 降级路径
 
-[OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L162)：
+[OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L170)：
 
 ```
 catch (TimeoutException | Exception):
@@ -91,13 +91,13 @@ catch (TimeoutException | Exception):
     recordInspection("error", ...)   // 指标拉取也失败，本轮完全失败
 ```
 
-降级路径调用 [fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L170) 构造与 LLM 等价的 JSON，再走 `handleInspectionResult(..., degraded=true)`：
+降级路径调用 [fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L194) 构造与 LLM 等价的 JSON，再走 `handleInspectionResult(..., degraded=true)`：
 - 仍接入 IncidentStore 状态机去重（同一指纹的 NEW→ACTIVE 流转不变）
 - `metricsService.recordInspection("degraded_" + status, ...)` 标记降级路径，便于运维区分
 
 ### 3.3 阈值兜底规则
 
-[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L170) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
+[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L194) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
 
 | 条件 | 级别 | rootCause 标注 |
 |------|------|---------------|
@@ -109,7 +109,7 @@ catch (TimeoutException | Exception):
 
 ### 3.4 AI 漏报兜底（applyThresholdBackstop）
 
-[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L326) 在 LLM 路径（非降级）中额外加一道兜底：
+[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L342) 在 LLM 路径（非降级）中额外加一道兜底：
 
 - **仅当 AI 判 normal 时介入**（warning/critical 不改判，避免覆盖 AI 的更细致判断）
 - normal 但 `blockedThreads > 0` → 强改 critical
@@ -151,3 +151,28 @@ catch (TimeoutException | Exception):
 ```
 
 降级路径与 LLM 路径生成同一指纹（`CRITICAL|DEADLOCK;BLOCKED=2;`），正确合并到同一事件，输出 INFO 心跳而非 ERROR 全量报告。
+
+## 5. 审计日志
+
+### 5.1 设计原则
+
+[AuditLogger](../src/main/java/com/aiops/aiopscopilot/common/audit/AuditLogger.java) 独立于业务日志，落盘到 `logs/aiops-audit.log`（[logback-spring.xml](../src/main/resources/logback-spring.xml) 配置按天轮转、保留 30 天、200MB/文件、5GB 总上限、gzip 压缩）。
+
+三条原则：
+1. **不可被 Agent 篡改**——AuditLogger 不暴露任何写接口给 `@Tool` 层，Agent 无法读写审计记录
+2. **独立 appender**——Logger 名 `com.aiops.aiopscopilot.audit`，`additivity=false` 不冒泡控制台，避免运维噪音
+3. **结构化文本**——管道分隔格式 `时间|级别|类别|字段1=值1|字段2=值2`，便于 grep 与后续转 JSON
+
+### 5.2 记录的决策点
+
+| 方法 | 触发时机 | 示例输出 |
+|------|----------|----------|
+| `inspectionStarted()` | 每轮巡检开始 | `巡检\|START` |
+| `inspectionFinished()` | 巡检结束 | `巡检\|END\|status=critical\|elapsedMs=3500\|fingerprint=CRITICAL\|DEADLOCK;BLOCKED=2;` |
+| `degradedPathTriggered()` | LLM 超时/异常降级 | `巡检\|DEGRADED\|reason=llm_timeout\|elapsedMs=45000` |
+| `backstopTriggered()` | AI 漏报兜底介入 | `巡检\|BACKSTOP\|aiStatus=normal\|forcedStatus=warning\|metric=cpuUsage\|value=0.92` |
+| `incidentNew()` | 事件首次发现 | `事件\|NEW\|fingerprint=...\|status=critical\|summary=...` |
+| `incidentActive()` | 事件持续中心跳 | `事件\|ACTIVE\|fingerprint=...\|durationMin=3` |
+| `incidentResolved()` | 事件恢复归档 | `事件\|RESOLVED\|fingerprint=...\|totalDurationMin=5` |
+| `fallbackResult()` | 降级路径阈值判断结果 | `巡检\|FALLBACK_RESULT\|status=degraded\|rootCause=...\|snapshot=...` |
+

@@ -1,0 +1,28 @@
+# Docker 构建上下文排除项：避免把不必要的大文件/缓存打进镜像
+
+# IDE 工作目录
+.idea/
+.vscode/
+.trae/
+
+# 构建产物
+build/
+.gradle/
+
+# Docker 数据卷
+docker/volumes/
+
+# Python 字节码
+__pycache__/
+*.py[cod]
+
+# 运行时日志
+logs/
+
+# 临时文件
+*.log
+*.tmp
+
+# 文档（不需要打进运行镜像）
+docs/
+*.md

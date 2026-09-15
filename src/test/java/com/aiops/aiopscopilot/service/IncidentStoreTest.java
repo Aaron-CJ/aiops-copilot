@@ -1,5 +1,6 @@
 package com.aiops.aiopscopilot.service;
 
+import com.aiops.aiopscopilot.common.audit.AuditLogger;
 import com.aiops.aiopscopilot.service.IncidentStore.Incident;
 import com.aiops.aiopscopilot.service.IncidentStore.IncidentStatus;
 import org.junit.jupiter.api.Test;
@@ -258,11 +259,11 @@ class IncidentStoreTest {
     // ==================== 辅助方法 ====================
 
     /**
-     * 创建一个依赖全为 null 的 OpsScheduler——只用于测试纯逻辑的私有方法
-     * （applyThresholdBackstop / fallbackByThreshold 不访问任何实例字段）。
+     * 创建一个依赖基本为 null 的 OpsScheduler——只用于测试纯逻辑的私有方法。
+     * audit 传真实实例（AuditLogger 无 Spring 依赖，可直接 new），避免 NPE。
      */
     private OpsScheduler newSchedulerWithNulls() {
-        return new OpsScheduler(null, null, null, null, null, null);
+        return new OpsScheduler(null, null, null, null, null, null, new AuditLogger());
     }
 
     private String invokeBackstop(OpsScheduler sched, String status, Map<String, Object> snap) throws Exception {

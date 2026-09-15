@@ -11,7 +11,8 @@ aiops:
   prometheus:
     # Prometheus HTTP API 地址，供 PrometheusTool 调用 /api/v1/query
     # Agent 把这里当"时序数据的眼睛"——不通过 Grafana 看图，直接读 API
-    base-url: http://localhost:9090
+    # Docker 部署时改为宿主机/独立机：PROMETHEUS_BASE_URL=http://host.docker.internal:9090
+    base-url: ${PROMETHEUS_BASE_URL:http://localhost:9090}
   models:
     # 快速通道模型：定时巡检 + 交互 Agent（关闭思考链，追求低延迟）
     # 深度推理/RAG 模型直接复用下方 spring.ai.ollama.chat.model（deepseek-r1:8b）
@@ -36,8 +37,9 @@ spring:
       chat: ollama
       embedding: ollama
     ollama:
-      # Ollama 后台服务地址（Windows 服务默认监听 11434）
-      base-url: http://localhost:11434
+      # Ollama 后台服务地址
+      # Docker 部署时改为宿主机/独立机：OLLAMA_BASE_URL=http://host.docker.internal:11434
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
       init:
         # 启动时不自动 pull 缺失的模型，由开发者手动 ollama pull，
         # 避免应用启动时因静默下载大模型而长时间卡住
@@ -52,10 +54,12 @@ spring:
       milvus:
         client:
           # Milvus standalone（Docker）的 gRPC 地址与默认凭据
-          host: localhost
-          port: 19530
-          username: root
-          password: milvus
+          # Docker 部署时改为宿主机/独立机：MILVUS_HOST=host.docker.internal
+          host: ${MILVUS_HOST:localhost}
+          port: ${MILVUS_PORT:19530}
+          # 生产凭据通过环境变量注入：MILVUS_PASSWORD=你的强密码
+          username: ${MILVUS_USERNAME:root}
+          password: ${MILVUS_PASSWORD:milvus}
         # Milvus 的 database（类似关系库的"库"），下方的 collection 类似"表"
         database-name: default
         # 存放知识片段的 collection 名，含向量与文本字段

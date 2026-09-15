@@ -1,5 +1,7 @@
 package com.aiops.aiopscopilot.controller;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -15,13 +17,15 @@ import java.util.Map;
 @RequestMapping("/api")
 public class TestController {
 
+    private static final Logger log = LoggerFactory.getLogger(TestController.class);
+
     @GetMapping("/test")
     public Map<String, Object> test() {
         Thread currentThread = Thread.currentThread();
         String threadName = currentThread.getName();
         boolean isVirtual = currentThread.isVirtual();
 
-        System.out.println("当前线程名称: " + threadName);
+        log.info("当前线程名称: {}", threadName);
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("threadName", threadName);
