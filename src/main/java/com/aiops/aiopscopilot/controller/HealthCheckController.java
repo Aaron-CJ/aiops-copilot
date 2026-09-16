@@ -1,11 +1,14 @@
 package com.aiops.aiopscopilot.controller;
 
 import java.io.File;
+import java.net.http.HttpClient;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
 import com.aiops.aiopscopilot.common.result.Result;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -31,6 +34,10 @@ public class HealthCheckController {
     /** Milvus standalone 的健康检查端口固定为 9091（与 gRPC 数据端口 19530 不同） */
     private static final int MILVUS_HEALTH_PORT = 9091;
 
+    /** 依赖连通性探测超时：连接 2s / 读取 3s——健康检查不能因单个依赖挂起而永久阻塞请求 */
+    private static final Duration PROBE_CONNECT_TIMEOUT = Duration.ofSeconds(2);
+    private static final Duration PROBE_READ_TIMEOUT = Duration.ofSeconds(3);
+
     private final RestClient restClient;
     private final String ollamaBaseUrl;
     private final String milvusHealthUrl;
@@ -40,7 +47,11 @@ public class HealthCheckController {
             @Value("${spring.ai.ollama.base-url:http://localhost:11434}") String ollamaBaseUrl,
             @Value("${spring.ai.vectorstore.milvus.client.host:localhost}") String milvusHost,
             @Value("${aiops.prometheus.base-url:http://localhost:9090}") String prometheusBaseUrl) {
-        this.restClient = RestClient.create();
+        // 显式超时：RestClient 默认请求工厂不设连接/读取超时，依赖挂起会拖死健康检查本身
+        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(
+                HttpClient.newBuilder().connectTimeout(PROBE_CONNECT_TIMEOUT).build());
+        factory.setReadTimeout(PROBE_READ_TIMEOUT);
+        this.restClient = RestClient.builder().requestFactory(factory).build();
         this.ollamaBaseUrl = ollamaBaseUrl;
         this.milvusHealthUrl = "http://" + milvusHost + ":" + MILVUS_HEALTH_PORT;
         this.prometheusBaseUrl = prometheusBaseUrl;

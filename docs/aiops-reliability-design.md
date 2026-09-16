@@ -1,7 +1,7 @@
 # 事件状态机与降级设计
 
 > 配套白皮书 §4.1（双模型路由 + 可靠性增强）与 §5.1（事件生命周期管理）的详细设计文档。
-> 本文档的实现已通过 17 个单元测试 + 端到端死锁/降级路径验证。
+> 本文档的实现已通过 20 个单元测试（IncidentStoreTest 15 + 故障注入确定性回归 FaultInjectionEvaluationTest 5）+ 端到端死锁/降级路径验证。
 
 ## 1. 设计背景
 
@@ -31,7 +31,7 @@ NEW（首次发现）→ ACTIVE（持续中，第二周期起改走 INFO 心跳�
 
 **关键设计决策**：fingerprint 基于**指标快照特征**，**不基于 LLM rootCause 文本**。
 
-> 原因：LLM 对同一故障的描述每次会略有不同（实测：死锁的 rootCause 第一轮是"存在死锁，死锁线程为 deadlock-thread-1 和..."，第二轮变成"存在死锁，deadlockedThreads 列出了..."）。用文本前缀做指纹会导致同故障被反复识别为 NEW、去重失效。
+> 原因：LLM 对同一故障的描述每次会略有不同（2026-09-15 实测：死锁 NEW 轮的 rootCause 是"存在死锁，死锁线程为 deadlock-worker-1 和 deadlock-worker-2，分别在等待对方持有的锁..."，后续 ACTIVE 轮变成"存在死锁，deadlockedThreads 列出的线程 deadlock-worker-1 和 deadlock-worker-2 因锁顺序问题相互等待..."）。用文本前缀做指纹会导致同故障被反复识别为 NEW、去重失效。
 >
 > 指标特征是稳定的：只要同一类指标异常（如 BLOCKED>0），无论 LLM 怎么描述都会合并到同一指纹。
 
@@ -68,7 +68,7 @@ fingerprint = 异常级别 + "|" + 指标特征串
 
 ### 3.1 LLM 超时保护
 
-[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L151)：
+[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L153)：
 
 ```java
 CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
@@ -81,7 +81,7 @@ return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);  // 45 秒
 
 ### 3.2 降级路径
 
-[OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L170)：
+[OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L172)：
 
 ```
 catch (TimeoutException | Exception):
@@ -91,13 +91,13 @@ catch (TimeoutException | Exception):
     recordInspection("error", ...)   // 指标拉取也失败，本轮完全失败
 ```
 
-降级路径调用 [fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L194) 构造与 LLM 等价的 JSON，再走 `handleInspectionResult(..., degraded=true)`：
+降级路径调用 [fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L197) 构造与 LLM 等价的 JSON，再走 `handleInspectionResult(..., degraded=true)`：
 - 仍接入 IncidentStore 状态机去重（同一指纹的 NEW→ACTIVE 流转不变）
 - `metricsService.recordInspection("degraded_" + status, ...)` 标记降级路径，便于运维区分
 
 ### 3.3 阈值兜底规则
 
-[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L194) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
+[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L197) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
 
 | 条件 | 级别 | rootCause 标注 |
 |------|------|---------------|
@@ -109,7 +109,7 @@ catch (TimeoutException | Exception):
 
 ### 3.4 AI 漏报兜底（applyThresholdBackstop）
 
-[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L342) 在 LLM 路径（非降级）中额外加一道兜底：
+[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L349) 在 LLM 路径（非降级）中额外加一道兜底：
 
 - **仅当 AI 判 normal 时介入**（warning/critical 不改判，避免覆盖 AI 的更细致判断）
 - normal 但 `blockedThreads > 0` → 强改 critical
@@ -128,6 +128,8 @@ catch (TimeoutException | Exception):
 | IncidentStore 状态机 | 5 | NEW→ACTIVE→RESOLVED 流转、复发重新置 NEW、normal 重置计数 |
 | AI 漏报兜底 | 5 | normal+CPU>90→warning、normal+BLOCKED>0→critical、normal+堆>95→critical、warning 不变、全正常不变 |
 | Ollama 降级路径 | 5 | BLOCKED>0→critical、CPU>90→warning、QPS=0→critical、GC>10→warning、全正常→normal |
+
+另见 [故障注入评估手册](aiops-fault-injection-eval.md)：F1-F5 五类故障场景（死锁/内存泄漏/假死/慢接口/瞬时尖峰）的确定性回归由 [FaultInjectionEvaluationTest](../src/test/java/com/aiops/aiopscopilot/service/FaultInjectionEvaluationTest.java) 覆盖，验证指纹构造、阈值兜底与尖峰抑制的状态机行为。
 
 ### 4.2 端到端验证
 
@@ -175,4 +177,6 @@ catch (TimeoutException | Exception):
 | `incidentActive()` | 事件持续中心跳 | `事件\|ACTIVE\|fingerprint=...\|durationMin=3` |
 | `incidentResolved()` | 事件恢复归档 | `事件\|RESOLVED\|fingerprint=...\|totalDurationMin=5` |
 | `fallbackResult()` | 降级路径阈值判断结果 | `巡检\|FALLBACK_RESULT\|status=degraded\|rootCause=...\|snapshot=...` |
+
+审计链闭合保证：每条 `巡检|START` 都有对应的 `巡检|END`——解析失败记 `status=parse_error`（降级路径为 `degraded_parse_error`）、指标拉取/兜底全失败记 `status=error`，不会出现只有 START 的悬空轮次。
 

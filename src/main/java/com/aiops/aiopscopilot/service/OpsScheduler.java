@@ -128,6 +128,7 @@ public class OpsScheduler {
                 handleDegraded(snapshot, start);
             } else {
                 metricsService.recordInspection("error", System.currentTimeMillis() - start);
+                audit.inspectionFinished("error", System.currentTimeMillis() - start, "none");
             }
         } catch (Exception e) {
             // Ollama 进程不可用 / 网络异常 / 指标拉取失败等：不能让调度器崩——下个周期继续跑
@@ -137,6 +138,7 @@ public class OpsScheduler {
                 handleDegraded(snapshot, start);
             } else {
                 metricsService.recordInspection("error", System.currentTimeMillis() - start);
+                audit.inspectionFinished("error", System.currentTimeMillis() - start, "none");
                 log.error("[OpsScheduler] 指标拉取也失败，本轮巡检完全失败", e);
             }
         }
@@ -174,6 +176,7 @@ public class OpsScheduler {
             handleInspectionResult(degradedReply, snapshot, start, true);
         } catch (Exception ex) {
             metricsService.recordInspection("error", System.currentTimeMillis() - start);
+            audit.inspectionFinished("error", System.currentTimeMillis() - start, "none");
             log.error("[OpsScheduler] 阈值兜底也失败: {}", ex.getMessage(), ex);
         }
     }
@@ -253,7 +256,7 @@ public class OpsScheduler {
                 .replace("\r", "\\r");
     }
 
-    /** 把指标快照与 6 条判断维度、死锁诊断要求、严格 JSON 输出格式组装成巡检 Prompt。 */
+    /** 把指标快照与 7 条判断维度、死锁诊断要求、严格 JSON 输出格式组装成巡检 Prompt。 */
     private String buildInspectionPrompt(Map<String, Object> snapshot) {
         return "以下是当前系统的核心指标快照（JSON 格式）：\n"
                 + toJson(snapshot) + "\n\n"
@@ -267,7 +270,9 @@ public class OpsScheduler {
                 + "deadlockedThreads 列出了死锁线程的名称、状态、等待的锁、锁持有者和栈帧，"
                 + "应据此定位到具体方法并给出处置建议（如重启应用、修复某 Controller 的锁顺序）\n"
                 + "5) 5 分钟内 GC 次数过频（>10 次可能是内存泄漏）\n"
-                + "6) 指标值 = -1 表示查询失败，不应判为异常\n\n"
+                + "6) maxRequestSeconds（请求最大延迟，秒）显著偏高（如 >5 秒）说明存在慢接口，"
+                + "应结合 QPS 下跌趋势判断是否拖垮整体吞吐\n"
+                + "7) 指标值 = -1 表示查询失败，不应判为异常\n\n"
                 + "仅输出严格的 JSON（不要 markdown 代码块、不要任何解释文字），格式：\n"
                 + "{\"status\":\"normal|warning|critical\","
                 + "\"summary\":\"一句话异常摘要（正常时填'各项指标正常'）\","
@@ -331,6 +336,8 @@ public class OpsScheduler {
             }
         } catch (Exception e) {
             metricsService.recordInspection(degraded ? "degraded_parse_error" : "parse_error", durationMs);
+            // 审计链闭合：解析失败也要写 END，避免审计日志里出现只有 START 的悬空轮次
+            audit.inspectionFinished((degraded ? "degraded_" : "") + "parse_error", durationMs, "none");
             log.error("[OpsScheduler] 巡检结果解析失败，模型原始输出：\n{}", reply);
         }
     }

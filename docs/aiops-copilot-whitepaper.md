@@ -27,7 +27,7 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 - **做法**：不部署 Grafana 可视化面板。Agent 通过 Prometheus 原生 HTTP API（`/api/v1/query`）按需抓取指标。
 - **落地实现**（`PrometheusTool`）：一份查询能力，两条路径复用——
   - **被动模式**：`queryMetric(promql)` 带 `@Tool` 注解，交互问答时模型自主构造 PromQL；
-  - **主动模式**：`queryFixedMetrics()` 由调度器每分钟预拉 6 条核心指标（CPU、堆内存分代、QPS、最大请求延迟、BLOCKED 线程数、5 分钟 GC 次数）直接塞 Prompt，**不让模型在巡检中反复试错查询**（每分钟一次的场景，模型自主查会产生 5-10 次无效工具往返）。
+  - **主动模式**：`queryFixedMetrics()` 由调度器每分钟预拉 7 条核心指标（CPU、堆总使用率、堆内存分代、QPS、最大请求延迟、BLOCKED 线程数、5 分钟 GC 次数）直接塞 Prompt，**不让模型在巡检中反复试错查询**（每分钟一次的场景，模型自主查会产生 5-10 次无效工具往返）。
 - **工程细节**：PromQL 含双引号（如 `{state="blocked"}`）必须 `URLEncoder.encode` 后以 `java.net.URI` 对象发起请求，绕过 RestClient 的二次编码；查询失败返回 `-1` 而非 `0`，让模型区分"无数据"与"值为零"。
 - **生产意义**：减少系统组件、降低资源消耗，为大模型腾出算力。
 
@@ -37,7 +37,8 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
   - 用 `fixedDelay` 而非 `fixedRate`：巡检含 qwen3:8b 关闭思考链的 LLM 推理，fixedDelay 保证"结束→开始"间隔 60 秒，任务不堆积；
   - 巡检模型输出**严格 JSON**（status/summary/rootCause/suggestion），调度器程序化解析；解析失败时原文落 ERROR 日志，**调度器必须比模型更稳定**。
 - **二级诊断（证据链增强）** ✅：当快照中 `blockedThreads > 0`，调度器主动调用 `SystemHealthTools.detectDeadlock()`（基于 `ThreadMXBean.findDeadlockedThreads()`，微秒级、零外部进程、同时覆盖 synchronized 与 ReentrantLock），把死锁线程名、等待锁、锁持有者、栈顶 8 帧注入快照。
-  - 实战效果：根因分析从泛泛的"可能是死锁或资源竞争"升级为"确认为死锁，由 DebugController 两个线程互相持有对方需要的锁"，精确定位到具体代码行号。
+  - 实战效果：根因分析从泛泛的"可能是死锁或资源竞争"升级为"确认为死锁，由 DebugController 两个接口以相反锁序互相持锁所致（lockOrderA/lockOrderB）"，精确定位到具体代码行号。
+  - 已知边界（JDK 21.0.12 实测）：虚拟线程等待 monitor/ReentrantLock 时，`findDeadlockedThreads()` 不检出、`Thread.getAllStackTraces()`（Micrometer 线程状态指标数据源）也不包含虚拟线程——虚拟请求线程上的死锁对 blockedThreads 指标与二级诊断均不可观测，需依赖业务信号（活跃请求数持续不落）识别，已列入路线图。
 - **语义级推理的价值**：Agent 结合多维指标（CPU + GC + QPS + 线程状态）交叉推理，可从源头过滤瞬时尖峰误报；该过滤能力依赖快照维度设计，并通过第三章的评估体系持续度量。
 
 ### 2. 执行层（Execution Layer）：工具是 AI 的"手脚"，也是安全边界
@@ -85,9 +86,9 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 > 用真实故障换来的约束：qwen2.5:14b 因 16G 内存门槛加载失败；r1 因思考链过长拖垮同步链路。任何模型上生产前必须先过延迟与内存预算。
 
 **可靠性增强（已实现）**：
-- **LLM 超时保护**：[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L151) 用 `CompletableFuture.get(45s)` 包裹 LLM 调用，Ollama 卡死时不会拖垮巡检调度
-- **阈值降级路径**：[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L194) 在 LLM 超时/异常时基于硬阈值（CPU>0.90 / BLOCKED>0 / 堆>0.95 / QPS=0 / GC>10）做兜底判断，仍接入状态机去重
-- **AI 漏报兜底**：[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L342) 在 AI 判 normal 但 CPU>90% 或 BLOCKED>0 时强改 warning/critical，rootCause 标注"代码级兜底"
+- **LLM 超时保护**：[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L153) 用 `CompletableFuture.get(45s)` 包裹 LLM 调用，Ollama 卡死时不会拖垮巡检调度
+- **阈值降级路径**：[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L197) 在 LLM 超时/异常时基于硬阈值（CPU>0.90 / BLOCKED>0 / 堆>0.95 / QPS=0 / GC>10）做兜底判断，仍接入状态机去重
+- **AI 漏报兜底**：[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L349) 在 AI 判 normal 但 BLOCKED>0 / 堆>0.95 / CPU>90% 时强改 critical/critical/warning，rootCause 标注"代码级兜底"（刻意不覆盖 QPS=0：空闲系统 QPS 天然为 0，强改会每轮误报假死）
 
 #### 4.2 深度推理通道：异步任务架构 📋
 
@@ -114,7 +115,7 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 
 **问题**：每分钟巡检一次，同一持续性故障会被重复"发现"和报告 60 次/小时——告警风暴与 Token 浪费的根源。
 
-**已实现机制**（[IncidentStore](file:///d:/IdeaProjects/aiops-copilot/src/main/java/com/aiops/aiopscopilot/service/IncidentStore.java) + [OpsScheduler.handleInspectionResult](file:///d:/IdeaProjects/aiops-copilot/src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L260)）：
+**已实现机制**（[IncidentStore](../src/main/java/com/aiops/aiopscopilot/service/IncidentStore.java) + [OpsScheduler.handleInspectionResult](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L298)）：
 
 故障指纹基于**指标快照特征**（`fingerprint = 异常级别 + "|" + 指标特征串`，如 `CRITICAL|DEADLOCK;BLOCKED=2;`）+ 内存级状态机：
 
@@ -140,7 +141,7 @@ NEW（首次发现）→ ACTIVE（持续中，第二周期起改走 INFO 心跳�
 
 ```
 [故障现象]   一句话摘要 + 级别
-[AI 诊断根因] 模型结论（如：死锁，DebugController#createDeadlock 中两线程交叉持锁）
+[AI 诊断根因] 模型结论（如：死锁，DebugController#lockOrderA 与 #lockOrderB 两接口相反锁序交叉持锁）
 [证据链]     指标快照 + 线程栈/日志关键帧
 [知识库参考] 历史相似故障与 SOP（附来源、适用版本）
 [修复方案]   只读建议直接展示；写操作 → [一键执行] 按钮
@@ -160,28 +161,29 @@ AIOps 系统也必须可被观测，且零新增组件——全部走 Micrometer
 
 ### 故障注入评估体系
 
-"过滤误报""根因准确"不能停留在宣言。本项目已有 `/api/debug/deadlock` 故障注入接口（确定性复现双锁交叉死锁），在此基础上建设**故障注入测试集**：
+"过滤误报""根因准确"不能停留在宣言。故障注入测试集已落地：`/api/debug/*`（仅 dev profile 装配，生产 404）提供 5 类注入端点，配套[故障注入评估手册](aiops-fault-injection-eval.md)；确定性层回归（指纹构造、阈值兜底、状态机流转）由 `FaultInjectionEvaluationTest` 自动化，LLM 根因层按手册半自动执行：
 
 | 故障类型 | 注入方式 | 期望 Agent 行为 |
 |----------|----------|----------------|
-| 死锁 | `/api/debug/deadlock`（已有）✅ | 检出 BLOCKED>0 → 二级诊断 → 定位线程与栈帧 |
-| OOM/内存泄漏 | 持续分配不释放 📋 | 识别 Old 区持续增长 + GC 频繁趋势 |
-| 慢查询/接口拖垮 | 接口内 sleep 📋 | 关联 maxRequestSeconds 与 QPS 下跌 |
-| 依赖超时/假死 | 外部依赖 mock 超时 📋 | 识别 QPS=0 但进程存活的假死信号 |
-| 瞬时尖峰 | 短时 CPU 毛刺 📋 | CONFIRMED 复核后自动抑制，不升级告警 |
+| 死锁 | 并发调用 `/api/debug/deadlock/a` + `/b`（相反锁序业务接口）✅ | 检出 BLOCKED>0 → 二级诊断 → 定位线程与栈帧 |
+| OOM/内存泄漏 | `GET /api/debug/memory-leak`（可 release 释放）✅ | 识别 Old 区持续增长 + GC 频繁趋势，堆>0.95 兜底 critical |
+| 慢查询/接口拖垮 | `GET /api/debug/slow-request?seconds=N` ✅ | LLM 关联 maxRequestSeconds 升高与 QPS 趋势（纯延迟无硬阈值，语义层用例） |
+| 依赖超时/假死 | 并发挂起 `/api/debug/slow-request`（模拟依赖卡死）✅ | 识别 QPS 归零（挂起请求无完成，actuator 抓取不计入 QPS）+ 延迟飙升的假死前兆；ZERO_QPS 指纹与降级兜底 |
+| 瞬时尖峰 | `GET /api/debug/cpu-spike?seconds=5` ✅ | 毛刺落在巡检间隔内则不告警；被单轮捕获则 NEW 后 3 轮 normal 自动 RESOLVED，不产生持续告警 |
 
-**每次变更 prompt / 模型 / 工具后跑全量回归**，度量：根因定位准确率、误报率（尖峰抑制率）、漏报率、平均诊断时长、单巡检 Token 消耗。没有这套基线，模型升级时无法回答"变好了还是变坏了"。
+**每次变更 prompt / 模型 / 工具后跑全量回归**——确定性层 `gradlew test` 即跑；LLM 根因层按评估手册注入并记录。度量：根因定位准确率、误报率（尖峰抑制率）、漏报率、平均诊断时长、单巡检 Token 消耗。没有这套基线，模型升级时无法回答"变好了还是变坏了"。
 
 ---
 
 ## 四、已验证的实战证据
 
-死锁自治诊断闭环（实测，不含自动修复）：
+死锁自治诊断闭环（2026-09-15 平台 worker 注入器实测复验，不含自动修复）：
 
-1. `/api/debug/deadlock` 注入死锁 → 下一巡检周期 Prometheus 快照 `blockedThreads=2`；
-2. 调度器触发 `ThreadMXBean` 二级诊断，获取 `deadlock-thread-1/2`、锁持有关系、栈帧（DebugController#createDeadlock，当前阻塞点约 L67/L81）；
-3. qwen3:8b 输出 critical 报告，根因从"可能死锁"升级为"确认为死锁 + 具体代码位置 + 锁顺序修复建议"；
-4. **人工**重启应用清除死锁后，巡检自动恢复 INFO 静默。
+1. 并发调用 `/api/debug/deadlock/a` + `/b`（相反锁序的一对业务接口）→ 两个平台 worker 交叉持锁死锁、对应请求永久挂起，下一巡检周期 Prometheus 快照 `blockedThreads=2`；
+2. 调度器触发 `ThreadMXBean` 二级诊断，获取 `deadlock-worker-1/2`、锁持有关系（互相等待对方持有的 Object 锁）、栈帧（阻塞点 lockOrderA/lockOrderB）；
+3. qwen3:8b 输出 critical 报告，根因原文："存在死锁，死锁线程为 deadlock-worker-1 和 deadlock-worker-2，分别在等待对方持有的锁，具体阻塞位置为 DebugController 中的 lockOrderA 和 lockOrderB 方法"，处置建议直接指向修复锁顺序；
+4. 后续轮次同一指纹（`CRITICAL|DEADLOCK;BLOCKED=2;`）降级为 INFO 心跳（"已持续 Nmin"），审计日志完整记录 NEW→ACTIVE 流转；
+5. **人工**重启应用清除死锁后，巡检自动恢复 INFO 静默。
 
 **这验证了"感知（API）→ 取证（Tool）→ 思考（模型）→ 报告（Reporter）"闭环可行；当前边界是"诊断 + 建议"，自动修复/重启不在系统能力内（写操作须经 5.2 人工审批）。事件去重（5.1 ✅ 已实现）、AI 漏报阈值兜底与 Ollama 降级（4.1 ✅ 已实现）、审计日志落盘与提示注入防御（2.2 🔧 三条护栏均已落地）已落地；尚待闭环的是异步深度诊断（4.2）、审批卡片（5.2）。
 
@@ -193,9 +195,10 @@ AIOps 系统也必须可被观测，且零新增组件——全部走 Micrometer
 |--------|------|----------|------|
 | P0 | **事件状态机 + 故障指纹去重**——不做则上线首日告警风暴 | 5.1 | ✅ |
 | P0 | **审计日志 + 工具白名单 + 提示注入防御**——生产前置 | 2.2 | 🔧（三条护栏均已落地，写操作审批流仍规划中） |
-| P1 | **故障注入测试集 + 评估指标**——让后续优化可度量 | 三 | 🔧（死锁 case 已有） |
+| P1 | **故障注入测试集 + 评估指标**——让后续优化可度量 | 三 | ✅（注入端点 + 确定性回归用例 + 评估手册已落地，LLM 根因评估按手册人工执行） |
 | P1 | **报告输出对接飞书互动卡片 + 审批回调** | 5.2 | 🔧（控制台版本已有） |
 | P2 | **深度诊断异步任务队列 + 升级路由规则** | 4.2/4.3 | 📋 |
+| P2 | **虚拟线程挂起/死锁的可观测性**——JDK 21 ThreadMXBean 与线程状态指标不覆盖虚拟线程，需引入活跃请求数等业务信号 | 1.2 | 📋 |
 | P2 | **BM25 混合检索 + 知识条目版本/有效期治理** | 3.2 | 📋 |
 | P3 | 故障处置经验自动反哺知识库 | 3.2 | 📋 |
 

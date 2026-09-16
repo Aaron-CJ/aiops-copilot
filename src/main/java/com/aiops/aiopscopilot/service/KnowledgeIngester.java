@@ -1,6 +1,7 @@
 package com.aiops.aiopscopilot.service;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -52,7 +53,11 @@ public class KnowledgeIngester {
      */
     public int ingest() throws IOException {
         Resource resource = new ClassPathResource(FALLBACK_SOURCE);
-        String rawContent = StreamUtils.copyToString(resource.getInputStream(), StandardCharsets.UTF_8);
+        String rawContent;
+        // StreamUtils.copyToString 不会关闭流，必须 try-with-resources，否则每次摄入泄漏一个文件句柄
+        try (InputStream in = resource.getInputStream()) {
+            rawContent = StreamUtils.copyToString(in, StandardCharsets.UTF_8);
+        }
 
         // —— 标题提取状态机：只检查"首个非空行"，避免正文中偶然出现的"知识库：xxx"被误判为标题 ——
         String source = FALLBACK_SOURCE;   // 来源名，先假设文档无标题（兜底文件名）
@@ -62,8 +67,13 @@ public class KnowledgeIngester {
             if (!titleResolved) {
                 Matcher matcher = TITLE_LINE.matcher(line);
                 if (matcher.matches()) {
-                    // 命中标题约定：冒号后内容作为 source，continue 将标题行丢弃、不进入切片正文
-                    source = matcher.group(1).trim();
+                    // 命中标题约定：冒号后内容作为 source，continue 将标题行丢弃、不进入切片正文。
+                    // source 会拼进 Milvus 删除表达式的字符串字面量，含引号会破坏表达式——拒绝而不是静默转义
+                    String title = matcher.group(1).trim();
+                    if (title.contains("'") || title.contains("\"")) {
+                        throw new IOException("知识库标题含引号（\" 或 '），无法安全构建 Milvus 过滤表达式，请修改标题: " + title);
+                    }
+                    source = title;
                     titleResolved = true;
                     continue;
                 }

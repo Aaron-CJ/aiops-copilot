@@ -100,10 +100,11 @@ public class OpsAlertReporter {
      * 设计原则：正常情况应该静默，运维同学不该被无意义日志打扰。
      */
     public void logNormal(Map<String, Object> metricsSnapshot) {
-        log.info("[OpsScheduler] 巡检完成: 正常 | CPU={} | 堆内存={} | QPS={} | BLOCKED={} | GC(5m)={}",
+        log.info("[OpsScheduler] 巡检完成: 正常 | CPU={} | 堆使用率={} | QPS={} | 最大延迟={} | BLOCKED={} | GC(5m)={}",
                 metricsSnapshot.get("cpuUsage"),
-                metricsSnapshot.get("heapMemoryByGen"),
+                metricsSnapshot.get("heapUsage"),
                 metricsSnapshot.get("qpsLast1m"),
+                metricsSnapshot.get("maxRequestSeconds"),
                 metricsSnapshot.get("blockedThreads"),
                 metricsSnapshot.get("gcCountLast5m"));
     }

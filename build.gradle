@@ -16,9 +16,9 @@ java {
 
 repositories {
 	mavenLocal {
-		url 'file:///D:/m2/repository'
+		url = 'file:///D:/m2/repository'
 	}
-	maven { url 'https://maven.aliyun.com/repository/public' }
+	maven { url = 'https://maven.aliyun.com/repository/public' }
 	mavenCentral()
 }
 
@@ -44,8 +44,12 @@ dependencies {
 	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
+// 编译期暴露弃用 API 警告（主代码与测试代码），避免升级依赖后悄悄使用了将被移除的方法
 tasks.named('compileJava') {
-	// 编译期暴露弃用 API 警告，避免升级依赖后悄悄使用了将被移除的方法
+	options.compilerArgs += ['-Xlint:deprecation']
+}
+
+tasks.named('compileTestJava') {
 	options.compilerArgs += ['-Xlint:deprecation']
 }
 

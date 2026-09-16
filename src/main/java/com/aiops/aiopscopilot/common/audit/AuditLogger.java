@@ -7,8 +7,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import com.aiops.aiopscopilot.service.IncidentStore.Incident;
-
 /**
  * AI 决策审计日志：独立于业务日志，落盘到 logs/aiops-audit.log（见 logback-spring.xml）。
  * <p>

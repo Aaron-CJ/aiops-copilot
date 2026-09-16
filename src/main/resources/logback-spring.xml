@@ -33,8 +33,9 @@
         <appender-ref ref="AUDIT_FILE"/>
     </logger>
 
-    <!-- 应用包级别调试：dev 环境可临时调 DEBUG 排查 -->
-    <springProfile name="dev">
+    <!-- 开发期配置：dev 及任何非 prod 环境（含未激活自定义 profile）都走控制台 INFO；
+         用 !prod 表达式而非枚举 dev，避免出现"两个 profile 块都不命中 → 零日志输出"的边界 -->
+    <springProfile name="!prod">
         <root level="INFO">
             <appender-ref ref="CONSOLE"/>
         </root>

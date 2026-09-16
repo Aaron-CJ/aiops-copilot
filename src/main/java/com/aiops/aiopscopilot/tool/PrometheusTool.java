@@ -23,7 +23,7 @@ import tools.jackson.databind.ObjectMapper;
  * 双重身份（同一份查询能力被两条路径复用，避免重复实现）：
  * <ul>
  *   <li>被动模式：{@link #queryMetric(String)} 带 {@code @Tool} 注解，模型自主决定查什么 PromQL（用户提问时）</li>
- *   <li>主动模式：{@link #queryFixedMetrics()} 是普通 public 方法，巡检调度器预拉 6 条核心指标塞 Prompt，
+ *   <li>主动模式：{@link #queryFixedMetrics()} 是普通 public 方法，巡检调度器预拉 7 条核心指标塞 Prompt，
  *       不让模型反复试错查（每分钟跑一次，模型自主查会浪费 5-10 次 token）</li>
  * </ul>
  * 这正是"AIOps = 监控给 AI 看"理念的核心落地——Prometheus API 是 Agent 的传感器，不是展示板。
@@ -79,13 +79,18 @@ public class PrometheusTool {
     }
 
     /**
-     * 巡检调度器专用：一次性批量查询 6 条核心指标返回结构化快照。
+     * 巡检调度器专用：一次性批量查询 7 条核心指标返回结构化快照。
      * 预拉塞 Prompt 的原因见类注释"主动模式"。
      */
     public Map<String, Object> queryFixedMetrics() {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("queryTimestamp", LocalDateTime.now().toString());
         snapshot.put("cpuUsage", queryScalar("process_cpu_usage"));
+        // 堆总使用率 = 已用堆 / 有上限的堆池之和（>0 过滤掉未定义上限的 -1 哨兵池）。
+        // heapUsage 是 fallbackByThreshold/applyThresholdBackstop/fingerprintOf 的堆类信号源，
+        // 缺失该键会让所有堆阈值判断静默失效（读到 null → -1 → 永不触发）
+        snapshot.put("heapUsage", queryScalar(
+                "sum(jvm_memory_used_bytes{area=\"heap\"}) / sum(jvm_memory_max_bytes{area=\"heap\"} > 0)"));
         snapshot.put("heapMemoryByGen", querySeriesByLabel(
                 "jvm_memory_used_bytes{area=\"heap\"}", "id"));
         snapshot.put("qpsLast1m", queryScalar(

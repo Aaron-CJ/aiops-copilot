@@ -11,6 +11,7 @@ import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
@@ -54,6 +55,17 @@ public class GlobalExceptionHandler {
     public Result<Void> handleMissingParameterException(MissingServletRequestParameterException e) {
         log.warn("缺少请求参数: {}", e.getParameterName());
         return Result.fail(ResultCode.BAD_REQUEST, "缺少必需的请求参数: " + e.getParameterName());
+    }
+
+    /**
+     * 处理参数类型不匹配异常（如 /api/debug/memory-leak?mb=abc 传给 int 参数）。
+     * 不单独处理会落进兜底 Exception handler 误报 500。
+     */
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Result<Void> handleTypeMismatchException(MethodArgumentTypeMismatchException e) {
+        log.warn("请求参数类型错误: {}={}", e.getName(), e.getValue());
+        return Result.fail(ResultCode.BAD_REQUEST, "参数类型错误: " + e.getName());
     }
 
     /**

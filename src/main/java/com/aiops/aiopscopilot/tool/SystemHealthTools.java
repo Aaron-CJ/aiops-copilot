@@ -59,8 +59,15 @@ public class SystemHealthTools {
      *   <li>{@code findDeadlockedThreads()} 同时覆盖 {@code synchronized} 块死锁和
      *       {@link java.util.concurrent.locks.ReentrantLock} 死锁，
      *       比 {@code findMonitorDeadlockedThreads()}（仅 synchronized）覆盖更广</li>
-     *   <li>项目自身的死锁测试（{@code /api/debug/deadlock}）使用 synchronized 块，本方法完美命中</li>
+     *   <li>项目自身的死锁注入（{@code /api/debug/deadlock/a} + {@code /b}）使用 synchronized 块，本方法完美命中</li>
      * </ul>
+     * <p>
+     * <b>已知边界（JDK 21.0.12 实测）</b>：虚拟线程等待 monitor/ReentrantLock 时，
+     * {@code findDeadlockedThreads()} 不检出，{@code Thread.getAllStackTraces()}
+     * （Micrometer 线程状态指标的数据源）也不包含虚拟线程——即本方法与 blockedThreads
+     * 指标均无法观测虚拟线程上的死锁。因此死锁注入夹具把锁竞争放在平台 worker 线程上
+     * （对应真实系统 @Async/批处理 worker 池形态）；虚拟请求线程挂起的检测需依赖业务信号
+     * （活跃请求数持续不落、QPS 下跌），是后续演进方向。
      * <p>
      * 双重身份：
      * <ul>

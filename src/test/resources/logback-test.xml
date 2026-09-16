@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 测试专用 logback 配置（logback-test.xml 在测试 classpath 上优先于 logback-spring.xml）。
+     关键作用：单元测试（如 IncidentStoreTest）会 new AuditLogger() 以避免 NPE，
+     其内部 SLF4J logger 若走主配置会写入 logs/aiops-audit.log——
+     测试的合成指标数据（heapUsage=0.97 等）会污染生产审计证据链。
+     因此这里把审计 logger 级别设为 OFF，测试只保留控制台输出。 -->
+<configuration>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 审计 logger 关闭：测试绝不落审计文件 -->
+    <logger name="com.aiops.aiopscopilot.audit" level="OFF"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+</configuration>

@@ -25,7 +25,10 @@ public class MetricsService {
     /**
      * 记录一次智能巡检结果。
      *
-     * @param status     巡检状态：normal / warning / critical / unknown / error / parse_error
+     * @param status     巡检状态：normal / warning / critical / unknown / error / parse_error；
+     *                   降级路径（fallbackByThreshold）产出时带 degraded_ 前缀
+     *                   （degraded_normal / degraded_warning / degraded_parse_error 等），
+     *                   便于在 Prometheus 中按前缀聚合降级率
      * @param durationMs 巡检耗时（毫秒）
      */
     public void recordInspection(String status, long durationMs) {

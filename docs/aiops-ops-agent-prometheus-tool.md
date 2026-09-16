@@ -37,5 +37,5 @@
 0. **编译通过**：`.\gradlew.bat compileJava`
 1. **首次巡检日志**：启动应用 30 秒后应看到 `[OpsScheduler] 开始巡检...` + `[OpsScheduler] 巡检完成: 正常` INFO 日志
 2. **被动 Agent 查 Prometheus**：访问 `http://localhost:8080/api/agent/ops?message=过去1分钟QPS是多少` → 模型应调 `queryMetric` 拿到真实数据后回答
-3. **故障触发告警**：访问 `http://localhost:8080/api/debug/deadlock` 制造死锁 → 等待最多 1 分钟巡检 → 应看到 ERROR 级告警报告，含"BLOCKED 线程数: 2"+ 根因分析 + 处置建议
+3. **故障触发告警**：并发访问 `http://localhost:8080/api/debug/deadlock/a` 与 `http://localhost:8080/api/debug/deadlock/b`（相反锁序的两个接口，并发即双锁交叉死锁）→ 等待最多 1 分钟巡检 → 应看到 ERROR 级告警报告，含"BLOCKED 线程数: 2"+ 根因分析 + 处置建议
 4. **恢复正常验证（人工操作）**：人工重启应用清除死锁（当前系统不含自动修复）→ 下次巡检恢复 INFO 正常日志
