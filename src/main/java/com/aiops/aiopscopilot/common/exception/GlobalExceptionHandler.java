@@ -15,7 +15,10 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
- * 全局异常处理器，统一返回 Result 结构
+ * 全局异常处理器：任何 Controller 抛出的异常都在这里收敛为统一 {@link Result} 结构，
+ * 前端不会收到裸 HTML 错误页。HTTP 状态码策略是刻意分裂的：
+ * 业务异常回 200（错误语义放 body.code），参数类问题回 400，资源不存在回 404，
+ * 未知异常才回 500——各 handler 上的注释说明了各自的理由。
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {

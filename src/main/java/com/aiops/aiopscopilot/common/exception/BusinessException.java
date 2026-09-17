@@ -5,7 +5,8 @@ import com.aiops.aiopscopilot.common.result.ResultCode;
 import java.io.Serial;
 
 /**
- * 自定义业务异常
+ * 业务异常：由 GlobalExceptionHandler 捕获后包装成 {@code Result.fail(code, msg)}，
+ * HTTP 状态码仍为 200（业务失败不是协议故障，约定见 Result 类注释）。
  */
 public class BusinessException extends RuntimeException {
 

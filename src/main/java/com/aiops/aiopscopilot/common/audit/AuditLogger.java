@@ -64,4 +64,21 @@ public class AuditLogger {
     public void fallbackResult(String status, String rootCause, Map<String, Object> snapshot) {
         audit.info("巡检|FALLBACK_RESULT|status={}|rootCause={}|snapshot={}", status, rootCause, snapshot);
     }
+
+    /** 深度诊断任务已入队（手动或 4.3 自动升级） */
+    public void deepDiagnosisSubmitted(String taskId, String trigger, String fingerprint) {
+        audit.info("深度诊断|SUBMITTED|taskId={}|trigger={}|fingerprint={}", taskId, trigger, fingerprint);
+    }
+
+    /** 深度诊断任务终态（succeeded/failed） */
+    public void deepDiagnosisFinished(String taskId, String trigger, String fingerprint,
+                                      String result, long elapsedMs) {
+        audit.info("深度诊断|END|taskId={}|trigger={}|fingerprint={}|result={}|elapsedMs={}",
+                taskId, trigger, fingerprint, result, elapsedMs);
+    }
+
+    /** 深度诊断任务被拒绝（防抖窗口内重复触发 / 队列已满） */
+    public void deepDiagnosisRejected(String trigger, String fingerprint, String reason) {
+        audit.info("深度诊断|REJECTED|trigger={}|fingerprint={}|reason={}", trigger, fingerprint, reason);
+    }
 }

@@ -15,8 +15,6 @@ import org.springframework.stereotype.Component;
 
 import com.aiops.aiopscopilot.common.audit.AuditLogger;
 import com.aiops.aiopscopilot.service.IncidentStore.Incident;
-import com.aiops.aiopscopilot.tool.PrometheusTool;
-import com.aiops.aiopscopilot.tool.SystemHealthTools;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -43,14 +41,18 @@ import tools.jackson.databind.ObjectMapper;
  * （opsAgentClient）：巡检与交互共用同一模型，避免 Ollama 单模型驻留下两模型
  * 交替触发反复换载（Ollama 经验值每次约 10-30 秒，本项目未单独测）。
  * <p>
- * 第二批可靠性增强：
+ * 可靠性增强：
  * <ul>
  *   <li>事件状态机（{@link IncidentStore}）：同一故障指纹未 RESOLVED 前不再走 log.error
  *       全量报告，改走 INFO 级心跳，避免告警风暴</li>
  *   <li>Ollama 降级：LLM 调用加 {@value #LLM_TIMEOUT_SECONDS} 秒超时，超时/异常走
  *       {@link #fallbackByThreshold} 硬阈值兜底，巡检不会因 Ollama 卡死而完全失效</li>
- *   <li>AI 漏报兜底：AI 判 normal 但 CPU&gt;90% 或 BLOCKED&gt;0 时强改 warning/critical，
- *       防止模型误判导致漏报</li>
+ *   <li>AI 漏报兜底：AI 判 normal 但 CPU&gt;90%、堆&gt;95% 或 BLOCKED&gt;0 时强改
+ *       warning/critical，防止模型误判导致漏报</li>
+ *   <li>升级路由（{@link com.aiops.aiopscopilot.service.diagnosis.DiagnosisService}）：
+ *       低置信度/连续解析失败、持续 {@value #ESCALATION_PERSIST_MINUTES} 分钟未消除、
+ *       critical 且建议含写操作关键词三类信号入异步深度诊断队列，由 r1 worker 串行复核，
+ *       不阻塞 60 秒巡检周期；另有 POST /api/diagnosis 人工触发旁路</li>
  * </ul>
  */
 @Component
@@ -61,33 +63,44 @@ public class OpsScheduler {
     /** LLM 调用最大等待秒数：fixedDelay 60s 的 75%，留余量给指标拉取与解析 */
     static final long LLM_TIMEOUT_SECONDS = 45;
 
-    /** 阈值兜底阈值（与 memory 中约束一致） */
+    /** CPU 使用率告警线：超过即判 warning（也用于 AI 漏报兜底强改） */
     private static final double CPU_WARN_THRESHOLD = 0.90;
+    /** 堆使用率严重线：超过即判 critical（95% 留给 GC 与突发分配一点余量） */
     private static final double HEAP_CRITICAL_THRESHOLD = 0.95;
 
+    /** 4.3 升级：快通道 JSON 连续解析失败达到该次数 → 升级深度诊断 */
+    static final int PARSE_FAILURE_LIMIT = 2;
+    /** 4.3 升级：同一事件持续达到该分钟数仍未消除 → 升级深度诊断 */
+    static final long ESCALATION_PERSIST_MINUTES = 5;
+    /** 4.3 升级：critical 建议中出现这些写操作关键词 → 升级深度诊断（写动作必须经深度核实） */
+    static final String[] WRITE_KEYWORDS = {"重启", "回滚", "停机", "下线", "kill", "restart", "rollback"};
+
     private final ChatClient inspectorChatClient;
-    private final PrometheusTool prometheusTool;
-    private final SystemHealthTools systemHealthTools;
+    private final SnapshotCollector snapshotCollector;
     private final OpsAlertReporter reporter;
     private final MetricsService metricsService;
     private final IncidentStore incidentStore;
     private final AuditLogger audit;
+    private final com.aiops.aiopscopilot.service.diagnosis.DiagnosisService diagnosisService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    /** 连续解析失败计数：解析成功一轮即归零；达到 PARSE_FAILURE_LIMIT 触发深度升级 */
+    private int consecutiveParseFailures = 0;
+
     public OpsScheduler(@Qualifier("qwenChatClient") ChatClient inspectorChatClient,
-                        PrometheusTool prometheusTool,
-                        SystemHealthTools systemHealthTools,
+                        SnapshotCollector snapshotCollector,
                         OpsAlertReporter reporter,
                         MetricsService metricsService,
                         IncidentStore incidentStore,
-                        AuditLogger audit) {
+                        AuditLogger audit,
+                        com.aiops.aiopscopilot.service.diagnosis.DiagnosisService diagnosisService) {
         this.inspectorChatClient = inspectorChatClient;
-        this.prometheusTool = prometheusTool;
-        this.systemHealthTools = systemHealthTools;
+        this.snapshotCollector = snapshotCollector;
         this.reporter = reporter;
         this.metricsService = metricsService;
         this.incidentStore = incidentStore;
         this.audit = audit;
+        this.diagnosisService = diagnosisService;
     }
 
     /**
@@ -102,23 +115,13 @@ public class OpsScheduler {
         long start = System.currentTimeMillis();
         Map<String, Object> snapshot = null;
         try {
-            // 1. 预拉指标快照（不让模型自主查，省 token + 时延）
-            snapshot = prometheusTool.queryFixedMetrics();
-
-            // 2. 二级诊断：当 Prometheus 显示 BLOCKED 线程数 > 0 时，主动调用 ThreadMXBean 检测死锁。
-            //    Prometheus 只能告诉我们"有几个阻塞线程"，ThreadMXBean 才能告诉我们
-            //    "是否真死锁 + 谁在等谁的锁 + 阻塞在哪个方法"——
-            //    这套组合 = Prometheus 是触角，ThreadMXBean 是显微镜。
-            Object blocked = snapshot.get("blockedThreads");
-            if (blocked instanceof Double && (Double) blocked > 0) {
-                snapshot.put("deadlockDiagnosis", systemHealthTools.detectDeadlock());
-            }
-
-            // 3. 构造结构化 Prompt 让模型判断，加超时保护避免 Ollama 卡死拖垮巡检
+            // 1. 预拉指标快照（7 条核心指标 + BLOCKED>0 时 ThreadMXBean 死锁二级诊断）
+            snapshot = snapshotCollector.collect();
+            // 2. 构造结构化 Prompt 让模型判断，加超时保护避免 Ollama 卡死拖垮巡检
             String prompt = buildInspectionPrompt(snapshot);
             String reply = callLlmWithTimeout(prompt);
 
-            // 4. 解析模型输出，分级响应
+            // 3. 解析模型输出，分级响应
             handleInspectionResult(reply, snapshot, start, false);
         } catch (TimeoutException te) {
             // LLM 超时：Ollama 卡死或推理过慢，启用阈值兜底
@@ -184,7 +187,7 @@ public class OpsScheduler {
     /**
      * 纯阈值兜底判断：构造与 LLM 等价的 JSON 输出。
      * <p>
-     * 规则（与 memory 约束一致）：
+     * 规则（只卡"硬信号"，刻意保守）：
      * <ul>
      *   <li>CPU &gt; {@value #CPU_WARN_THRESHOLD} → warning</li>
      *   <li>BLOCKED &gt; 0 → critical（死锁强信号）</li>
@@ -275,9 +278,12 @@ public class OpsScheduler {
                 + "7) 指标值 = -1 表示查询失败，不应判为异常\n\n"
                 + "仅输出严格的 JSON（不要 markdown 代码块、不要任何解释文字），格式：\n"
                 + "{\"status\":\"normal|warning|critical\","
+                + "\"confidence\":\"high|medium|low\","
                 + "\"summary\":\"一句话异常摘要（正常时填'各项指标正常'）\","
                 + "\"rootCause\":\"根因分析（无异常填 N/A）\","
-                + "\"suggestion\":\"处置建议（无异常填 N/A）\"}";
+                + "\"suggestion\":\"处置建议（无异常填 N/A）\"}\n"
+                + "confidence 表示你对本次判断的把握：指标齐全且结论明确填 high；"
+                + "指标基本可用但存在轻度不确定填 medium；指标缺失(-1)、相互矛盾或只能靠猜测填 low。";
     }
 
     /**
@@ -300,7 +306,9 @@ public class OpsScheduler {
         String json = extractJson(reply);
         try {
             JsonNode node = objectMapper.readTree(json);
+            consecutiveParseFailures = 0;
             String status = node.path("status").asString("unknown");
+            String confidence = node.path("confidence").asString("medium");
             String summary = node.path("summary").asString("无摘要");
             String rootCause = node.path("rootCause").asString("N/A");
             String suggestion = node.path("suggestion").asString("N/A");
@@ -321,6 +329,14 @@ public class OpsScheduler {
                 for (Incident inc : resolved) {
                     reporter.logResolved(inc);
                 }
+                // 4.3：判 normal 但模型自报低置信度——可能漏报，交深度模型复核
+                if ("low".equalsIgnoreCase(confidence)) {
+                    String fp = IncidentStore.fingerprintOf("normal", snapshot);
+                    diagnosisService.submitEscalated(
+                            com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger.LOW_CONFIDENCE,
+                            fp, snapshot,
+                            "快通道判定 normal 但自报 confidence=low，存在漏报可能，请深度复核指标快照。");
+                }
             } else {
                 // 状态机去重：首次 NEW 走全量报告，后续 ACTIVE 走心跳
                 // 指纹基于指标快照（稳定），不基于 LLM rootCause 文本（每次描述会不同）
@@ -333,18 +349,83 @@ public class OpsScheduler {
                     reporter.logHeartbeat(incident);
                     audit.inspectionFinished(status + "|active", System.currentTimeMillis() - start, fp);
                 }
+                // 4.3：按规则评估是否升级深度诊断（同指纹防抖由 DiagnosisService 负责）
+                String escalation = chooseEscalationTrigger(incident, confidence, java.time.Instant.now());
+                if (escalation != null) {
+                    String note = "快通道结论：confidence=" + confidence
+                            + "；summary=" + summary
+                            + "；rootCause=" + finalRootCause
+                            + "；suggestion=" + suggestion
+                            + (incident.isNew() ? ""
+                            : "；事件已持续 " + java.time.Duration.between(incident.firstSeen(), java.time.Instant.now()).toMinutes() + " 分钟");
+                    diagnosisService.submitEscalated(escalation, fp, snapshot, note);
+                }
             }
         } catch (Exception e) {
             metricsService.recordInspection(degraded ? "degraded_parse_error" : "parse_error", durationMs);
             // 审计链闭合：解析失败也要写 END，避免审计日志里出现只有 START 的悬空轮次
             audit.inspectionFinished((degraded ? "degraded_" : "") + "parse_error", durationMs, "none");
             log.error("[OpsScheduler] 巡检结果解析失败，模型原始输出：\n{}", reply);
+            // 4.3：正常路径连续解析失败 → 升级深度模型（降级路径不升级：Ollama 已不可用，r1 同样调不动）
+            if (!degraded) {
+                consecutiveParseFailures++;
+                if (consecutiveParseFailures >= PARSE_FAILURE_LIMIT) {
+                    String raw = reply == null ? "" : reply.substring(0, Math.min(reply.length(), 1000));
+                    diagnosisService.submitEscalated(
+                            com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger.PARSE_FAIL,
+                            "PARSE_FAIL", snapshot,
+                            "快通道连续 " + consecutiveParseFailures
+                                    + " 轮输出无法解析为 JSON，最近一次原始输出：\n" + raw);
+                    // 提交后归零，后续是否再升级由 DiagnosisService 的防抖窗口兜底
+                    consecutiveParseFailures = 0;
+                }
+            }
         }
     }
 
     /**
-     * AI 漏报兜底：AI 判 normal 但指标严重超阈值时强改。
-     * 落实 memory 约束："if AI判定normal但CPU使用率>90%，强制改判为warning并标注原因"。
+     * 4.3 升级触发规则（纯函数，不依赖 LLM/队列，便于单测）。
+     * <p>
+     * 优先级：critical 且建议写操作（最危险，写动作必须先深度核实）&gt;
+     * 持续 {@value #ESCALATION_PERSIST_MINUTES} 分钟未消除（快通道搞不定）&gt;
+     * 自报低置信度；一轮巡检最多升级一个 trigger。
+     *
+     * @return 应提交的 trigger；无需升级返回 null
+     */
+    static String chooseEscalationTrigger(Incident incident, String confidence, java.time.Instant now) {
+        if (incident.isNew()
+                && "critical".equalsIgnoreCase(incident.severity())
+                && containsWriteAction(incident.suggestion())) {
+            return com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger.CRITICAL_WRITE;
+        }
+        if (!incident.isNew()
+                && java.time.Duration.between(incident.firstSeen(), now).toMinutes() >= ESCALATION_PERSIST_MINUTES) {
+            return com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger.PERSISTENT;
+        }
+        if ("low".equalsIgnoreCase(confidence)) {
+            return com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger.LOW_CONFIDENCE;
+        }
+        return null;
+    }
+
+    /** 处置建议是否含写操作关键词（中文 + 常见英文命令） */
+    static boolean containsWriteAction(String suggestion) {
+        if (suggestion == null) {
+            return false;
+        }
+        String lower = suggestion.toLowerCase();
+        for (String keyword : WRITE_KEYWORDS) {
+            if (lower.contains(keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * AI 漏报兜底：AI 判 normal 但指标严重超阈值时强改级别，并在 rootCause 标注
+     * 兜底已介入——模型可能对明显异常过于保守，关键硬信号（死锁/堆爆/CPU 打满）
+     * 不允许被一句"正常"盖过去。每次介入都写审计，便于事后核对是 AI 对还是兜底对。
      */
     private String applyThresholdBackstop(String status, Map<String, Object> snapshot, String rootCause) {
         if (!"normal".equalsIgnoreCase(status)) {

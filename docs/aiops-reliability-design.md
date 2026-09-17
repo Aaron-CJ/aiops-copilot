@@ -1,7 +1,7 @@
-# 事件状态机与降级设计
+# 事件状态机、降级与深度诊断设计
 
-> 配套白皮书 §4.1（双模型路由 + 可靠性增强）与 §5.1（事件生命周期管理）的详细设计文档。
-> 本文档的实现已通过 20 个单元测试（IncidentStoreTest 15 + 故障注入确定性回归 FaultInjectionEvaluationTest 5）+ 端到端死锁/降级路径验证。
+> 配套白皮书 §4.1（双模型路由 + 可靠性增强）、§4.2/4.3（异步深度诊断与升级路由）与 §5.1（事件生命周期管理）的详细设计文档。
+> 本文档的实现已通过 73 个单元测试（IncidentStoreTest 15 + FaultInjectionEvaluationTest 5 + DiagnosisServiceTest 16 + EscalationRuleTest 16 + OpsSchedulerEscalationWiringTest 10 + SnapshotCollectorTest 2 + DiagnosisControllerTest 7 + 其余 2）+ 端到端死锁/降级/深度诊断链路验证。
 
 ## 1. 设计背景
 
@@ -10,7 +10,7 @@
 1. **告警不刷屏**：同一持续性故障（如死锁）在恢复前会被反复"发现"，必须去重——否则 60 条/小时的告警风暴会淹没真正重要的信号，且每轮重复 LLM 推理浪费 Token。
 2. **Ollama 挂了巡检不能停**：LLM 是核心决策组件，但不是唯一手段。当 Ollama 进程不可用、网络异常或推理卡死时，巡检调度器必须降级到硬阈值判断，否则等同于"AI 一挂，监控全瞎"。
 
-补充约束（来自项目 memory）：**AI 漏报兜底**——模型可能误判 normal（例如 qwen3:8b 关闭思考链后对复合故障识别有盲区），代码层必须在关键指标严重超阈值时强改 warning/critical，不依赖 AI 的正确性。
+补充约束：**AI 漏报兜底**——模型可能误判 normal（例如 qwen3:8b 关闭思考链后对复合故障识别有盲区），代码层必须在关键指标严重超阈值时强改 warning/critical，不依赖 AI 的正确性。
 
 ## 2. 事件状态机与去重
 
@@ -68,7 +68,7 @@ fingerprint = 异常级别 + "|" + 指标特征串
 
 ### 3.1 LLM 超时保护
 
-[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L153)：
+[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L152)：
 
 ```java
 CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
@@ -81,7 +81,7 @@ return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);  // 45 秒
 
 ### 3.2 降级路径
 
-[OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L172)：
+[OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L171)：
 
 ```
 catch (TimeoutException | Exception):
@@ -91,13 +91,13 @@ catch (TimeoutException | Exception):
     recordInspection("error", ...)   // 指标拉取也失败，本轮完全失败
 ```
 
-降级路径调用 [fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L197) 构造与 LLM 等价的 JSON，再走 `handleInspectionResult(..., degraded=true)`：
+降级路径调用 [fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L196) 构造与 LLM 等价的 JSON，再走 `handleInspectionResult(..., degraded=true)`：
 - 仍接入 IncidentStore 状态机去重（同一指纹的 NEW→ACTIVE 流转不变）
 - `metricsService.recordInspection("degraded_" + status, ...)` 标记降级路径，便于运维区分
 
 ### 3.3 阈值兜底规则
 
-[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L197) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
+[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L196) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
 
 | 条件 | 级别 | rootCause 标注 |
 |------|------|---------------|
@@ -109,7 +109,7 @@ catch (TimeoutException | Exception):
 
 ### 3.4 AI 漏报兜底（applyThresholdBackstop）
 
-[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L349) 在 LLM 路径（非降级）中额外加一道兜底：
+[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L426) 在 LLM 路径（非降级）中额外加一道兜底：
 
 - **仅当 AI 判 normal 时介入**（warning/critical 不改判，避免覆盖 AI 的更细致判断）
 - normal 但 `blockedThreads > 0` → 强改 critical
@@ -179,4 +179,90 @@ catch (TimeoutException | Exception):
 | `fallbackResult()` | 降级路径阈值判断结果 | `巡检\|FALLBACK_RESULT\|status=degraded\|rootCause=...\|snapshot=...` |
 
 审计链闭合保证：每条 `巡检|START` 都有对应的 `巡检|END`——解析失败记 `status=parse_error`（降级路径为 `degraded_parse_error`）、指标拉取/兜底全失败记 `status=error`，不会出现只有 START 的悬空轮次。
+
+## 6. 异步深度诊断与升级路由（白皮书 4.2/4.3）
+
+### 6.1 为什么必须异步
+
+deepseek-r1:8b 启用思考链后单次推理实测 1.7-6.6 分钟（见白皮书双模型表），是巡检 60 秒预算的 2-7 倍、同步 HTTP 120 秒超时的 1-3 倍。同步等待会同时拖垮巡检周期与交互请求；但 r1 的长链推理在复合故障与 SOP 决策上的能力是关闭思考链的 qwen3:8b 不具备的。解法是**任务队列 + 轮询**，把"等待"从请求线程移走。
+
+### 6.2 组件与数据流
+
+```
+OpsScheduler（巡检）─4.3 规则命中─┐
+                                 ├─→ DiagnosisService.enqueue（有界队列 20）
+POST /api/diagnosis（人工）──────┘            │ PENDING
+                                             ▼
+                          单个虚拟线程 worker（deep-diagnosis-worker）
+                                             │ RUNNING：deepseekChatClient + enableThinking
+                                             │ 15 分钟硬超时
+                                             ▼
+                          SUCCEEDED(report) / FAILED(error)
+                                             │
+                          OpsAlertReporter.logDeepReport（控制台）
+                          AuditLogger（深度诊断|END，落盘）
+                          GET /api/diagnosis/{taskId}（轮询拉取）
+```
+
+涉及类：
+
+| 类 | 职责 |
+|----|------|
+| [DiagnosisTask](../src/main/java/com/aiops/aiopscopilot/service/diagnosis/DiagnosisTask.java) | 不可变任务记录，状态 `PENDING→RUNNING→SUCCEEDED/FAILED` 经 with* 派生 |
+| [DiagnosisService](../src/main/java/com/aiops/aiopscopilot/service/diagnosis/DiagnosisService.java) | 有界队列、单 worker、防抖、终态淘汰、r1 调用与深度 Prompt 组装 |
+| [DiagnosisController](../src/main/java/com/aiops/aiopscopilot/controller/DiagnosisController.java) | `POST /api/diagnosis` 提交、`GET /api/diagnosis/{taskId}` 轮询 |
+| [SnapshotCollector](../src/main/java/com/aiops/aiopscopilot/service/SnapshotCollector.java) | 7 条指标 + BLOCKED>0 时死锁二级诊断；巡检与深度诊断共用，保证快照口径一致 |
+
+### 6.3 队列、超时与防抖参数
+
+| 参数 | 值 | 理由 |
+|------|----|------|
+| 队列容量 | 20 | r1 串行且单次数分钟，堆积无意义；满了拒绝 + 审计 `REJECTED|reason=queue_full`，不阻塞巡检线程 |
+| worker 数 | 1（虚拟线程） | Ollama 本身串行推理，多 worker 只会排队争抢；99% 时间阻塞在 HTTP 等待，适合虚拟线程 |
+| 推理硬超时 | 15 分钟 | r1 独占 Ollama 实测最长 6.6 分钟；2026-09-17 端到端实测 worker 与每分钟巡检 qwen3 并发争抢 Ollama 串行推理时单任务 530 秒（8.8 分钟），15 分钟覆盖争抢场景且不误杀；超时任务标 FAILED |
+| 同指纹防抖窗口 | 10 分钟 | 有 PENDING/RUNNING 在途、或窗口内已升级过 → 拒绝（`reason=dedup_window_or_inflight`）；**手动触发不受限** |
+| 终态任务保留 | 最近 100 条 | 内存态，超出按 finishedAt 淘汰最旧 |
+
+重启语义：任务不持久化——与 IncidentStore 取舍一致，未完成的深度诊断由下一轮巡检按 4.3 规则重新升级。
+
+### 6.4 升级触发规则（4.3）
+
+[OpsScheduler.chooseEscalationTrigger](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 是纯静态函数（不碰 LLM 与队列），规则与优先级：
+
+| 优先级 | trigger | 条件 |
+|--------|---------|------|
+| 1（最高） | `critical_write` | NEW + severity=critical + suggestion 含写操作关键词（重启/回滚/停机/下线/kill/restart/rollback） |
+| 2 | `persistent` | ACTIVE 且 firstSeen 距今 ≥ 5 分钟 |
+| 3 | `low_confidence` | 快通道 JSON 自报 `confidence=low`（含判 normal 时的漏报复核） |
+| 旁路 | `parse_fail` | 正常路径（非降级）连续 2 轮 JSON 解析失败；提交后计数归零，防抖窗口兜底 |
+
+一轮巡检最多升级一个 trigger。降级路径（Ollama 不可用）不触发升级——r1 同样调不动，排队只会全部 FAILED。
+
+巡检 JSON 契约因此新增可选字段：`"confidence":"high|medium|low"`，老输出缺字段时按 `medium` 处理，向后兼容。
+
+### 6.5 深度 Prompt 结构
+
+自由文本 Markdown（报告给人读，非 JSON），五个固定部分：根因定位（区分现象与根因）、证据链（逐条指标）、影响面与演化风险、处置建议（只读动作与写操作分开，写操作强制标注【需人工审批】）、置信度与不确定性。快照与快通道结论均标注为不可信数据，延续提示注入防御口径。
+
+### 6.6 审计事件
+
+| 方法 | 输出 |
+|------|------|
+| `deepDiagnosisSubmitted()` | `深度诊断\|SUBMITTED\|taskId=..\|trigger=..\|fingerprint=..` |
+| `deepDiagnosisFinished()` | `深度诊断\|END\|...\|result=succeeded/failed\|elapsedMs=..` |
+| `deepDiagnosisRejected()` | `深度诊断\|REJECTED\|trigger=..\|fingerprint=..\|reason=dedup_window_or_inflight/queue_full` |
+
+### 6.7 送达渠道的边界
+
+当前为 pull 模式（轮询接口 + 控制台/审计），**不含** push——飞书/钉钉卡片属于白皮书 5.2。接入时 push 只从 `OpsAlertReporter.logDeepReport` 一处接出，队列/worker/升级规则都不用改。系统能力边界不变：深度模型只产出分析与建议，写操作仍须人工审批。
+
+### 6.8 测试覆盖
+
+| 测试类 | 用例数 | 关键验证 |
+|--------|--------|---------|
+| DiagnosisServiceTest | 16 | 同指纹 PENDING/RUNNING 在途防抖、窗口内终态防抖与窗口过期放行、不同指纹放行、队列满拒绝自动与手动任务、get 查询、worker 成功流转 SUCCEEDED 且 prompt 含五段要素/不可信数据/人工审批声明、模型异常流转 FAILED 且 worker 继续消费下一条、**15 分钟硬超时按注入阈值（200ms）快速 FAILED 且 error 标明硬超时、cancel(true) 中断挂死调用后 worker 继续消费**、手动提交绕防抖、终态淘汰到上限且不误删在途任务、start/stop 生命周期 |
+| EscalationRuleTest | 16 | critical+写建议→critical_write、warning 含写词不升级、持续 5 分钟整（>=）→persistent、4分59秒不升级、NEW 旧 firstSeen 不走 persistent、ACTIVE critical 写建议超时落到 persistent、critical_write 优先级压过 low、severity 大小写不敏感、中英文写关键词与空串、low→low_confidence、persistent 优先级高于 low、medium/HIGH 不误触发 |
+| OpsSchedulerEscalationWiringTest | 10 | 反射调 handleInspectionResult：首轮失败不升级、连续 2 轮失败恰好一次 PARSE_FAIL 且 note 带原始输出、升级后计数归零、成功轮重置计数、原始输出截断 1000 字符、degraded 路径永不升级、critical 写建议→CRITICAL_WRITE 指纹含 BLOCKED=2、normal+low→LOW_CONFIDENCE、缺 confidence 默认 medium 不升级、同指纹第二轮走心跳不升级 |
+| SnapshotCollectorTest | 2 | BLOCKED=0 不调 detectDeadlock 且快照无诊断字段；BLOCKED>0 挂死锁诊断结果 |
+| DiagnosisControllerTest | 7 | POST 成功 200 返回 PENDING 视图、空白 message 归一化 null、非空白 trim、队列满 503、GET 存在返回终态视图、不存在 404、FAILED 视图带 error |
 

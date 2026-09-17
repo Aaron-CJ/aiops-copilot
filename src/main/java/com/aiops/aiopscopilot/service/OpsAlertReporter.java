@@ -108,4 +108,34 @@ public class OpsAlertReporter {
                 metricsSnapshot.get("blockedThreads"),
                 metricsSnapshot.get("gcCountLast5m"));
     }
+
+    /**
+     * 深度诊断报告（DiagnosisService worker 完成一个任务时调用）。
+     * <p>
+     * INFO 级——深度报告是对已有故障的补充分析，不是新告警，事件本身的首次发现已由
+     * {@link #report} 以 ERROR 报过；FAILED 时降为 WARN。
+     * 后续接飞书/钉钉时，push 动作从这里接出。
+     */
+    public void logDeepReport(com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask task, long elapsedMs) {
+        boolean success = task.status() == com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Status.SUCCEEDED;
+        StringBuilder sb = new StringBuilder(1024);
+        sb.append("\n==================================================");
+        sb.append("\n[AIOps 深度诊断报告] trigger=").append(task.trigger());
+        sb.append(" | taskId=").append(task.taskId());
+        sb.append(" | 指纹=").append(task.fingerprint());
+        sb.append(" | 耗时=").append(elapsedMs / 1000).append("s");
+        sb.append(" | 状态=").append(task.status());
+        sb.append("\n--------------------------------------------------");
+        if (success) {
+            sb.append("\n").append(task.report());
+        } else {
+            sb.append("\n深度诊断失败: ").append(task.error());
+        }
+        sb.append("\n==================================================");
+        if (success) {
+            log.info(sb.toString());
+        } else {
+            log.warn(sb.toString());
+        }
+    }
 }

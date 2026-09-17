@@ -4,7 +4,13 @@ import java.io.Serial;
 import java.io.Serializable;
 
 /**
- * 统一 API 响应对象
+ * 统一 API 响应对象：{@code {code, message, data}}，JSON 中另带一个由 {@link #isSuccess()}
+ * 序列化出的 {@code success} 布尔字段，前端可直接判断。
+ * <p>
+ * 项目约定（见 {@link com.aiops.aiopscopilot.common.exception.GlobalExceptionHandler}）：
+ * 业务成败全部 HTTP 200，语义看 body 里的 {@code code}——成功 200；
+ * 业务级 404/503（如任务不存在、队列已满）直接复用 HTTP 风格数字；
+ * 通用业务失败 1000。只有参数错误（400）、真正的服务异常（500）等才用真实 HTTP 状态码。
  *
  * @param <T> 业务数据类型
  */

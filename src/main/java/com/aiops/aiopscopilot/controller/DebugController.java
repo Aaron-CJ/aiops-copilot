@@ -222,7 +222,6 @@ public class DebugController {
             Thread.ofVirtual().name("cpu-spike-" + i).start(() -> {
                 // 纯自旋占满 ForkJoinPool 载体线程，推高 process_cpu_usage
                 while (cpuSpikeGeneration.get() == generation && System.nanoTime() < deadline) {
-                    // busy spin
                 }
             });
         }

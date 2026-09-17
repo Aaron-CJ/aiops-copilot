@@ -133,7 +133,7 @@ class FaultInjectionEvaluationTest {
 
     /** 与 IncidentStoreTest 相同的手法：依赖为 null 的 OpsScheduler 只测纯逻辑私有方法。 */
     private String invokeFallback(Map<String, Object> snap) throws Exception {
-        OpsScheduler sched = new OpsScheduler(null, null, null, null, null, null, new AuditLogger());
+        OpsScheduler sched = new OpsScheduler(null, null, null, null, null, new AuditLogger(), null);
         Method m = OpsScheduler.class.getDeclaredMethod("fallbackByThreshold", Map.class);
         m.setAccessible(true);
         return (String) m.invoke(sched, snap);

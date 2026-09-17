@@ -27,6 +27,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 
+/**
+ * 深度通道（deepseek-r1:8b）对外接口集，全部挂在 /api/ai 下：
+ * <ul>
+ *   <li>{@code GET /chat} — 自由对话，SSE 流式；把 Ollama 的 thinking 字段
+ *       重新包成 {@code </think>} 段推给前端，与正式回答区分渲染</li>
+ *   <li>{@code GET /rag} / {@code /rag/stream} — RAG 问答（同步/SSE）：
+ *       先 Milvus 相似度检索 knowledge.txt 片段，无命中直接回复"未找到"省一次模型调用，
+ *       有命中才带片段提问，系统 Prompt 强约束"只能依据知识库作答 + 注明来源"抗幻觉</li>
+ *   <li>{@code GET /ingest} — 知识库重新摄入（切片→bge-m3 向量化→写 Milvus）</li>
+ * </ul>
+ * 与 {@link AgentController} 的区别：本类基于"检索到的静态知识"，Agent 基于"实时工具数据"。
+ */
 @RestController
 @RequestMapping("/api/ai")
 public class AiChatController {

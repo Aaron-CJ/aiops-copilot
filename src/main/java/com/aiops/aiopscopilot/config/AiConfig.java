@@ -10,14 +10,25 @@ import com.aiops.aiopscopilot.tool.PrometheusTool;
 import com.aiops.aiopscopilot.tool.SystemHealthTools;
 
 /**
- * AI 模型 Bean 配置
+ * 三个 ChatClient Bean 的装配中心——项目"双模型双通道"架构的入口：
+ * <ul>
+ *   <li>{@link #deepseekChatClient}：deepseek-r1:8b 深度通道，开思考链，
+ *       服务 RAG 问答（/api/ai/**）与异步深度诊断任务，追求推理深度不追求延迟</li>
+ *   <li>{@link #qwenChatClient}：qwen3:8b 快通道，关思考链、不挂工具，
+ *       专供 OpsScheduler 每分钟巡检（指标由调度器预拉后直接塞 Prompt）</li>
+ *   <li>{@link #opsAgentClient}：同样 qwen3:8b 关思考链，但挂 PrometheusTool +
+ *       SystemHealthTools，供 /api/agent/ops 交互问答时模型自主 Function Calling 取数</li>
+ * </ul>
+ * Builder 由 spring-ai-starter-model-ollama 按 application.yml 自动注入
+ * （base-url、默认模型），这里只做按通道差异化的覆盖。
  */
 @Configuration
 public class AiConfig {
 
     /**
-     * 构建 ChatClient：Builder 已按 application.yml 的 ollama 配置自动装配（模型、base-url 等）。
-     * 显式命名 Bean，多 ChatClient 并存时用 @Qualifier 精确注入。
+     * 深度通道：使用 yml 默认模型 deepseek-r1:8b（思考链默认开启），
+     * 服务 RAG 问答与 DiagnosisService 异步深度诊断。
+     * 显式命名 Bean，三个 ChatClient 并存时各处用 @Qualifier 精确注入。
      */
     @Bean
     public ChatClient deepseekChatClient(ChatClient.Builder builder) {

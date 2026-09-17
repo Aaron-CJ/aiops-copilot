@@ -23,8 +23,10 @@ import tools.jackson.databind.ObjectMapper;
  * 双重身份（同一份查询能力被两条路径复用，避免重复实现）：
  * <ul>
  *   <li>被动模式：{@link #queryMetric(String)} 带 {@code @Tool} 注解，模型自主决定查什么 PromQL（用户提问时）</li>
- *   <li>主动模式：{@link #queryFixedMetrics()} 是普通 public 方法，巡检调度器预拉 7 条核心指标塞 Prompt，
- *       不让模型反复试错查（每分钟跑一次，模型自主查会浪费 5-10 次 token）</li>
+ *   <li>主动模式：{@link #queryFixedMetrics()} 是普通 public 方法，巡检调度器预拉 7 条核心指标塞 Prompt。
+ *       实测（2026-09-17，qwen3:8b）：模型自主查时在单轮内并行发起 5-6 次 queryMetric、零 PromQL 重试，
+ *       但开放式提问只查 5 项、维度覆盖不确定；预拉保证每轮 7 条指标确定性到齐，
+ *       且巡检 ChatClient 不挂工具 schema、不承担工具编排开销与覆盖不确定性</li>
  * </ul>
  * 这正是"AIOps = 监控给 AI 看"理念的核心落地——Prometheus API 是 Agent 的传感器，不是展示板。
  */
@@ -134,7 +136,7 @@ public class PrometheusTool {
                 }
             }
         } catch (Exception ignored) {
-            // 静默吞掉
+            // 同 queryScalar：分代明细是辅助维度，缺失不应中断整轮快照
         }
         return result;
     }

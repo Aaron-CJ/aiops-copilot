@@ -13,16 +13,16 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * 第二批核心可靠性的纯单元测试（不依赖 Spring 容器）。
+ * 事件状态机与两条代码兜底路径的纯单元测试（不依赖 Spring 容器与 LLM）。
  * <p>
- * 覆盖三个新增/改造的关键逻辑：
+ * 覆盖三块逻辑：
  * <ol>
- *   <li>{@link IncidentStore} 状态机去重（NEW → ACTIVE → RESOLVED）</li>
- *   <li>{@link OpsScheduler#applyThresholdBackstop} AI 漏报兜底</li>
- *   <li>{@link OpsScheduler#fallbackByThreshold} Ollama 降级路径</li>
+ *   <li>{@link IncidentStore} 状态机去重（NEW → ACTIVE → RESOLVED、复发重新 NEW、指纹构造）</li>
+ *   <li>{@link OpsScheduler#applyThresholdBackstop} AI 漏报兜底（normal 被硬指标强改）</li>
+ *   <li>{@link OpsScheduler#fallbackByThreshold} Ollama 降级路径（阈值规则 + JSON 拼装）</li>
  * </ol>
- * <p>
- * 用 Reflection 调用 OpsScheduler 的私有方法，避免修改源码可见性。
+ * 后两者是 OpsScheduler 的 private 方法，用反射调用——不为测试改生产方法可见性；
+ * 构造器其余依赖传 null，因为这两条路径根本不会触达它们。
  */
 class IncidentStoreTest {
 
@@ -263,7 +263,7 @@ class IncidentStoreTest {
      * audit 传真实实例（AuditLogger 无 Spring 依赖，可直接 new），避免 NPE。
      */
     private OpsScheduler newSchedulerWithNulls() {
-        return new OpsScheduler(null, null, null, null, null, null, new AuditLogger());
+        return new OpsScheduler(null, null, null, null, null, new AuditLogger(), null);
     }
 
     private String invokeBackstop(OpsScheduler sched, String status, Map<String, Object> snap) throws Exception {

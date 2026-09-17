@@ -1,7 +1,8 @@
 package com.aiops.aiopscopilot.common.result;
 
 /**
- * 统一响应状态码
+ * 通用响应状态码枚举。业务端点也可不使用本枚举、直接内联 HTTP 风格码
+ * （如 DiagnosisController 的 404/503），约定详见 {@link Result} 类注释。
  */
 public enum ResultCode {
 
