@@ -81,6 +81,19 @@ class EscalationRuleTest {
         assertFalse(OpsScheduler.containsWriteAction(null));
     }
 
+    /** 否定词修饰的写关键词不算写建议（升级路由的反向用例） */
+    @Test
+    void negatedWriteKeywordsDoNotTrigger() {
+        assertFalse(OpsScheduler.containsWriteAction("无需重启应用"));
+        assertFalse(OpsScheduler.containsWriteAction("不建议重启或回滚"), "连词分布否定：两个关键词都被否定");
+        assertFalse(OpsScheduler.containsWriteAction("避免直接回滚数据库"));
+        assertFalse(OpsScheduler.containsWriteAction("切忌 kill 进程"));
+        // 跨小句不传染：前一小句的否定词不影响后一小句的肯定建议
+        assertTrue(OpsScheduler.containsWriteAction("不要慌，建议立即重启应用"));
+        // 同一小句内肯定建议仍算
+        assertTrue(OpsScheduler.containsWriteAction("建议重启，但不建议回滚配置"));
+    }
+
     // ==================== G7：持续时长边界值 ====================
 
     /** 恰好 5 分钟（>= 边界，包含等于）→ persistent */

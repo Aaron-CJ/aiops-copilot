@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 
 import com.aiops.aiopscopilot.common.audit.AuditLogger;
 import com.aiops.aiopscopilot.service.IncidentStore.Incident;
+import com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask;
 
 /**
  * 巡检告警报告输出器：当前以控制台日志输出 ASCII 框线格式报告
@@ -116,8 +117,8 @@ public class OpsAlertReporter {
      * {@link #report} 以 ERROR 报过；FAILED 时降为 WARN。
      * 后续接飞书/钉钉时，push 动作从这里接出。
      */
-    public void logDeepReport(com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask task, long elapsedMs) {
-        boolean success = task.status() == com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Status.SUCCEEDED;
+    public void logDeepReport(DiagnosisTask task, long elapsedMs) {
+        boolean success = task.status() == DiagnosisTask.Status.SUCCEEDED;
         StringBuilder sb = new StringBuilder(1024);
         sb.append("\n==================================================");
         sb.append("\n[AIOps 深度诊断报告] trigger=").append(task.trigger());

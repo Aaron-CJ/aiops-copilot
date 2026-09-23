@@ -135,6 +135,43 @@ class OpsSchedulerEscalationWiringTest {
         verify(diagnosisService, never()).submitEscalated(anyString(), anyString(), any(), any());
     }
 
+    /**
+     * 降级路径的 critical + 写建议（兜底建议固定含"重启 Ollama"）也不升级——
+     * 与 parse_fail 分支同一守卫：Ollama 已不可用，r1 同样调不动。
+     */
+    @Test
+    void degradedCriticalWithWriteSuggestionNeverEscalates() {
+        String degradedReply = json("critical", "medium",
+                "阈值兜底：存在 BLOCKED 线程", "代码级兜底：疑似死锁",
+                "Ollama 不可用，建议人工介入或重启 Ollama 服务");
+        handle(degradedReply, DEADLOCK_SNAP, true);
+
+        verify(diagnosisService, never()).submitEscalated(anyString(), anyString(), any(), any());
+    }
+
+    /**
+     * LLM 连续 3 轮降级 → 显式 LLM_UNAVAILABLE 告警（report 一次）；
+     * 继续降级走心跳，且降级 normal 轮不 bumpNormal——事件不得被"降级 normal"错误归档。
+     */
+    @Test
+    void threeDegradedRoundsRaiseLlmUnavailableIncident() throws Exception {
+        Method degrade = OpsScheduler.class.getDeclaredMethod("handleDegraded", Map.class, long.class);
+        degrade.setAccessible(true);
+
+        for (int i = 0; i < 3; i++) {
+            degrade.invoke(scheduler, NORMAL_SNAP, System.currentTimeMillis());
+        }
+        verify(reporter, times(1)).report(eq("CRITICAL|LLM_UNAVAILABLE;"), eq("critical"),
+                anyString(), anyString(), anyString(), any(), any());
+
+        // 第 4、5 轮继续降级：同指纹心跳而非重复报告；绝无 RESOLVED（盲期不归档）
+        degrade.invoke(scheduler, NORMAL_SNAP, System.currentTimeMillis());
+        degrade.invoke(scheduler, NORMAL_SNAP, System.currentTimeMillis());
+        verify(reporter, times(2)).logHeartbeat(any());
+        verify(reporter, never()).logResolved(any());
+        verify(diagnosisService, never()).submitEscalated(anyString(), anyString(), any(), any());
+    }
+
     /** critical NEW + 写操作建议：提交 CRITICAL_WRITE 升级，指纹对应 BLOCKED=2 */
     @Test
     void criticalWithWriteSuggestionSubmitsCriticalWrite() {

@@ -1,8 +1,13 @@
 package com.aiops.aiopscopilot.service;
 
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -15,6 +20,10 @@ import org.springframework.stereotype.Component;
 
 import com.aiops.aiopscopilot.common.audit.AuditLogger;
 import com.aiops.aiopscopilot.service.IncidentStore.Incident;
+import com.aiops.aiopscopilot.service.diagnosis.DiagnosisService;
+import com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask;
+
+import jakarta.annotation.PreDestroy;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -49,10 +58,13 @@ import tools.jackson.databind.ObjectMapper;
  *       {@link #fallbackByThreshold} 硬阈值兜底，巡检不会因 Ollama 卡死而完全失效</li>
  *   <li>AI 漏报兜底：AI 判 normal 但 CPU&gt;90%、堆&gt;95% 或 BLOCKED&gt;0 时强改
  *       warning/critical，防止模型误判导致漏报</li>
- *   <li>升级路由（{@link com.aiops.aiopscopilot.service.diagnosis.DiagnosisService}）：
+ *   <li>升级路由（{@link DiagnosisService}）：
  *       低置信度/连续解析失败、持续 {@value #ESCALATION_PERSIST_MINUTES} 分钟未消除、
  *       critical 且建议含写操作关键词三类信号入异步深度诊断队列，由 r1 worker 串行复核，
  *       不阻塞 60 秒巡检周期；另有 POST /api/diagnosis 人工触发旁路</li>
+ *   <li>LLM 失效的显式告警：连续 {@value #LLM_UNAVAILABLE_ROUNDS} 轮降级 → 登记独立指纹的
+ *       LLM_UNAVAILABLE critical 事件（监控者自身失效必须可见），复用状态机心跳/归档；
+ *       恢复后随连续 3 轮 normal 自动 RESOLVED</li>
  * </ul>
  */
 @Component
@@ -74,6 +86,15 @@ public class OpsScheduler {
     static final long ESCALATION_PERSIST_MINUTES = 5;
     /** 4.3 升级：critical 建议中出现这些写操作关键词 → 升级深度诊断（写动作必须经深度核实） */
     static final String[] WRITE_KEYWORDS = {"重启", "回滚", "停机", "下线", "kill", "restart", "rollback"};
+    /** 写关键词的否定前缀：同一小句内出现即视为否定（如"无需重启""不建议重启或回滚"） */
+    static final String[] WRITE_NEGATIONS = {"无需", "不必", "不要", "不建议", "避免", "切忌"};
+    /** 小句边界：否定词只在同一小句内生效，跨小句不传染（"不要慌，建议重启"→重启仍是写建议） */
+    private static final String CLAUSE_BREAKS = "，。；！？,;.!";
+
+    /** LLM 失效告警：连续降级达到该轮数 → 显式 LLM_UNAVAILABLE 事件（偶发 1-2 轮抖动不告警） */
+    static final int LLM_UNAVAILABLE_ROUNDS = 3;
+    /** LLM 失效告警的固定指纹——故障源是 Ollama 而非本应用指标，不带指标特征 */
+    static final String LLM_UNAVAILABLE_FP = "CRITICAL|LLM_UNAVAILABLE;";
 
     private final ChatClient inspectorChatClient;
     private final SnapshotCollector snapshotCollector;
@@ -81,11 +102,19 @@ public class OpsScheduler {
     private final MetricsService metricsService;
     private final IncidentStore incidentStore;
     private final AuditLogger audit;
-    private final com.aiops.aiopscopilot.service.diagnosis.DiagnosisService diagnosisService;
+    private final DiagnosisService diagnosisService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     /** 连续解析失败计数：解析成功一轮即归零；达到 PARSE_FAILURE_LIMIT 触发深度升级 */
     private int consecutiveParseFailures = 0;
+
+    /** 连续降级轮数：LLM 正常返回即归零；达到 LLM_UNAVAILABLE_ROUNDS 触发显式告警 */
+    private int consecutiveDegradedRounds = 0;
+
+    /** LLM 调用执行器：专用虚拟线程而非公共 ForkJoinPool——超时 cancel 后底层 HTTP 不会中断，
+     *  被占死的应是廉价虚拟线程，不能落在 commonPool 上饿死其他并行计算 */
+    private final ExecutorService llmCalls = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("inspection-llm-call", 0).factory());
 
     public OpsScheduler(@Qualifier("qwenChatClient") ChatClient inspectorChatClient,
                         SnapshotCollector snapshotCollector,
@@ -93,7 +122,7 @@ public class OpsScheduler {
                         MetricsService metricsService,
                         IncidentStore incidentStore,
                         AuditLogger audit,
-                        com.aiops.aiopscopilot.service.diagnosis.DiagnosisService diagnosisService) {
+                        DiagnosisService diagnosisService) {
         this.inspectorChatClient = inspectorChatClient;
         this.snapshotCollector = snapshotCollector;
         this.reporter = reporter;
@@ -120,6 +149,8 @@ public class OpsScheduler {
             // 2. 构造结构化 Prompt 让模型判断，加超时保护避免 Ollama 卡死拖垮巡检
             String prompt = buildInspectionPrompt(snapshot);
             String reply = callLlmWithTimeout(prompt);
+            // LLM 正常返回：解除连续降级计数（LLM_UNAVAILABLE 事件由后续 normal 轮按状态机归档）
+            consecutiveDegradedRounds = 0;
 
             // 3. 解析模型输出，分级响应
             handleInspectionResult(reply, snapshot, start, false);
@@ -149,16 +180,15 @@ public class OpsScheduler {
     }
 
     /**
-     * 调用 LLM 并强制超时。CompletableFuture.supplyAsync 在公共 ForkJoinPool 上跑，
-     * LLM 调用是阻塞 IO 不会占用 CPU，对调度器无影响。超时后任务仍会继续完成
-     * （Ollama 推理不会真停），但本巡检周期不再等待。
+     * 调用 LLM 并强制超时。调用跑在专用虚拟线程执行器上——超时 cancel 后底层 HTTP 不会中断，
+     * 被占死的是廉价虚拟线程而非公共 ForkJoinPool 载体；本巡检周期不再等待。
      */
     private String callLlmWithTimeout(String prompt) throws TimeoutException, ExecutionException, InterruptedException {
         CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
                 inspectorChatClient.prompt()
                         .user(prompt)
                         .call()
-                        .content());
+                        .content(), llmCalls);
         try {
             return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (TimeoutException te) {
@@ -171,8 +201,11 @@ public class OpsScheduler {
     /**
      * 降级路径：Ollama 不可用时，直接基于指标快照做硬阈值判断。
      * 不走 LLM，不消耗 Token，输出与 LLM 等价的 JSON，仍接入状态机去重。
+     * 同时跟踪 LLM 失效告警（{@link #trackLlmUnavailable}）。
      */
     private void handleDegraded(Map<String, Object> snapshot, long start) {
+        // 放在 try 之前：兜底自身异常也不能丢掉 LLM 失效这枚信号
+        trackLlmUnavailable(snapshot);
         try {
             String degradedReply = fallbackByThreshold(snapshot);
             audit.fallbackResult("degraded", degradedReply, snapshot);
@@ -181,6 +214,31 @@ public class OpsScheduler {
             metricsService.recordInspection("error", System.currentTimeMillis() - start);
             audit.inspectionFinished("error", System.currentTimeMillis() - start, "none");
             log.error("[OpsScheduler] 阈值兜底也失败: {}", ex.getMessage(), ex);
+        }
+    }
+
+    /**
+     * LLM 失效的显式告警（监控者自身失效必须可见）：连续降级达到 {@value #LLM_UNAVAILABLE_ROUNDS}
+     * 轮即登记独立指纹的 critical 事件，复用事件状态机——后续降级轮走心跳，
+     * LLM 恢复后由连续 3 轮 normal 自动 RESOLVED（降级轮不 bump normal，见 handleInspectionResult）；
+     * 偶发 1-2 轮降级（瞬时抖动）不告警。
+     */
+    private void trackLlmUnavailable(Map<String, Object> snapshot) {
+        consecutiveDegradedRounds++;
+        if (consecutiveDegradedRounds < LLM_UNAVAILABLE_ROUNDS) {
+            return;
+        }
+        String summary = "Ollama 持续不可用，巡检已连续 " + consecutiveDegradedRounds + " 轮降级";
+        String rootCause = "代码级兜底：LLM 服务连续 " + consecutiveDegradedRounds
+                + " 轮超时/异常，巡检以硬阈值降级运行，语义分析失效";
+        String suggestion = "检查 Ollama 进程与模型在位（GET /api/health/check）；"
+                + "恢复后巡检自动回到 AI 路径，连续 3 轮 normal 后本事件自动归档";
+        Incident incident = incidentStore.recordOrUpdate(
+                LLM_UNAVAILABLE_FP, "critical", summary, rootCause, suggestion);
+        if (incident.isNew()) {
+            reporter.report(LLM_UNAVAILABLE_FP, "critical", summary, rootCause, suggestion, snapshot, null);
+        } else {
+            reporter.logHeartbeat(incident);
         }
     }
 
@@ -233,7 +291,7 @@ public class OpsScheduler {
         }
 
         String summary = "normal".equals(status) ? "各项指标正常" : "阈值兜底：" + rootCause;
-        String rc = rootCause.length() == 0 ? "N/A" : rootCause.toString().trim();
+        String rc = rootCause.isEmpty() ? "N/A" : rootCause.toString().trim();
         String suggestion = "normal".equals(status)
                 ? "N/A"
                 : "Ollama 不可用，建议人工介入或重启 Ollama 服务后让 AI 重新诊断";
@@ -287,9 +345,7 @@ public class OpsScheduler {
     }
 
     /**
-     * 解析模型输出（先经 {@link #extractJson} 剥离思考段/markdown 包裹）并按级别路由。
-     * <p>
-     * 第二批可靠性改造后的流程：
+     * 解析模型输出（先经 {@link #extractJson} 剥离思考段/markdown 包裹）并按级别路由：
      * <ol>
      *   <li>解析 JSON 得到 status/summary/rootCause/suggestion</li>
      *   <li>AI 漏报兜底：normal 但 CPU&gt;90% 或 BLOCKED&gt;0 → 强改 warning/critical</li>
@@ -324,16 +380,20 @@ public class OpsScheduler {
             if ("normal".equalsIgnoreCase(status)) {
                 reporter.logNormal(snapshot);
                 audit.inspectionFinished("normal", durationMs, "none");
-                // 通知所有 ACTIVE 事件递增 normal 计数，达到阈值自动 RESOLVED
-                java.util.List<Incident> resolved = incidentStore.bumpNormalAndResolve();
-                for (Incident inc : resolved) {
-                    reporter.logResolved(inc);
+                // 通知所有 ACTIVE 事件递增 normal 计数，达到阈值自动 RESOLVED。
+                // 降级轮的 normal 只是硬阈值判断（语义置信度低），盲期不用于归档事件——
+                // 否则 Ollama 长挂时 LLM_UNAVAILABLE 事件会被"降级 normal"轮错误归档后反复 NEW
+                if (!degraded) {
+                    List<Incident> resolved = incidentStore.bumpNormalAndResolve();
+                    for (Incident inc : resolved) {
+                        reporter.logResolved(inc);
+                    }
                 }
                 // 4.3：判 normal 但模型自报低置信度——可能漏报，交深度模型复核
                 if ("low".equalsIgnoreCase(confidence)) {
                     String fp = IncidentStore.fingerprintOf("normal", snapshot);
                     diagnosisService.submitEscalated(
-                            com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger.LOW_CONFIDENCE,
+                            DiagnosisTask.Trigger.LOW_CONFIDENCE,
                             fp, snapshot,
                             "快通道判定 normal 但自报 confidence=low，存在漏报可能，请深度复核指标快照。");
                 }
@@ -349,16 +409,19 @@ public class OpsScheduler {
                     reporter.logHeartbeat(incident);
                     audit.inspectionFinished(status + "|active", System.currentTimeMillis() - start, fp);
                 }
-                // 4.3：按规则评估是否升级深度诊断（同指纹防抖由 DiagnosisService 负责）
-                String escalation = chooseEscalationTrigger(incident, confidence, java.time.Instant.now());
-                if (escalation != null) {
-                    String note = "快通道结论：confidence=" + confidence
-                            + "；summary=" + summary
-                            + "；rootCause=" + finalRootCause
-                            + "；suggestion=" + suggestion
-                            + (incident.isNew() ? ""
-                            : "；事件已持续 " + java.time.Duration.between(incident.firstSeen(), java.time.Instant.now()).toMinutes() + " 分钟");
-                    diagnosisService.submitEscalated(escalation, fp, snapshot, note);
+                // 4.3：按规则评估是否升级深度诊断（同指纹防抖由 DiagnosisService 负责）。
+                // 降级路径不升级——Ollama 已不可用，r1 同样调不动（与 parse_fail 分支同一守卫）
+                if (!degraded) {
+                    String escalation = chooseEscalationTrigger(incident, confidence, Instant.now());
+                    if (escalation != null) {
+                        String note = "快通道结论：confidence=" + confidence
+                                + "；summary=" + summary
+                                + "；rootCause=" + finalRootCause
+                                + "；suggestion=" + suggestion
+                                + (incident.isNew() ? ""
+                                : "；事件已持续 " + Duration.between(incident.firstSeen(), Instant.now()).toMinutes() + " 分钟");
+                        diagnosisService.submitEscalated(escalation, fp, snapshot, note);
+                    }
                 }
             }
         } catch (Exception e) {
@@ -372,7 +435,7 @@ public class OpsScheduler {
                 if (consecutiveParseFailures >= PARSE_FAILURE_LIMIT) {
                     String raw = reply == null ? "" : reply.substring(0, Math.min(reply.length(), 1000));
                     diagnosisService.submitEscalated(
-                            com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger.PARSE_FAIL,
+                            DiagnosisTask.Trigger.PARSE_FAIL,
                             "PARSE_FAIL", snapshot,
                             "快通道连续 " + consecutiveParseFailures
                                     + " 轮输出无法解析为 JSON，最近一次原始输出：\n" + raw);
@@ -396,26 +459,52 @@ public class OpsScheduler {
         if (incident.isNew()
                 && "critical".equalsIgnoreCase(incident.severity())
                 && containsWriteAction(incident.suggestion())) {
-            return com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger.CRITICAL_WRITE;
+            return DiagnosisTask.Trigger.CRITICAL_WRITE;
         }
         if (!incident.isNew()
-                && java.time.Duration.between(incident.firstSeen(), now).toMinutes() >= ESCALATION_PERSIST_MINUTES) {
-            return com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger.PERSISTENT;
+                && Duration.between(incident.firstSeen(), now).toMinutes() >= ESCALATION_PERSIST_MINUTES) {
+            return DiagnosisTask.Trigger.PERSISTENT;
         }
         if ("low".equalsIgnoreCase(confidence)) {
-            return com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger.LOW_CONFIDENCE;
+            return DiagnosisTask.Trigger.LOW_CONFIDENCE;
         }
         return null;
     }
 
-    /** 处置建议是否含写操作关键词（中文 + 常见英文命令） */
+    /**
+     * 处置建议是否含写操作关键词（中文 + 常见英文命令）。
+     * 同一小句内被否定词修饰的关键词不算（"无需重启""不建议重启或回滚"），
+     * 跨小句不传染（"不要慌，建议重启"→重启仍是写建议）。
+     */
     static boolean containsWriteAction(String suggestion) {
         if (suggestion == null) {
             return false;
         }
         String lower = suggestion.toLowerCase();
         for (String keyword : WRITE_KEYWORDS) {
-            if (lower.contains(keyword)) {
+            int idx = lower.indexOf(keyword);
+            while (idx >= 0) {
+                if (!negatedInClause(lower, idx)) {
+                    return true;
+                }
+                idx = lower.indexOf(keyword, idx + keyword.length());
+            }
+        }
+        return false;
+    }
+
+    /** 关键词所在小句（按 {@value #CLAUSE_BREAKS} 切分）内是否出现否定词——覆盖"不建议重启或回滚"的连词分布否定 */
+    private static boolean negatedInClause(String s, int keywordStart) {
+        int clauseStart = 0;
+        for (int i = keywordStart - 1; i >= 0; i--) {
+            if (CLAUSE_BREAKS.indexOf(s.charAt(i)) >= 0) {
+                clauseStart = i + 1;
+                break;
+            }
+        }
+        String clause = s.substring(clauseStart, keywordStart);
+        for (String negation : WRITE_NEGATIONS) {
+            if (clause.contains(negation)) {
                 return true;
             }
         }
@@ -479,5 +568,11 @@ public class OpsScheduler {
         } catch (Exception e) {
             return snapshot.toString();
         }
+    }
+
+    /** 停机时关闭 LLM 调用执行器（虚拟线程本身是 daemon 不阻塞 JVM 退出，这里是生命周期整洁性） */
+    @PreDestroy
+    void shutdown() {
+        llmCalls.shutdownNow();
     }
 }
