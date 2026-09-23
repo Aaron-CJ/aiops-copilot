@@ -1,7 +1,7 @@
 # 事件状态机、降级与深度诊断设计
 
 > 配套白皮书 §4.1（双模型路由 + 可靠性增强）、§4.2/4.3（异步深度诊断与升级路由）与 §5.1（事件生命周期管理）的详细设计文档。
-> 本文档的实现已通过 73 个单元测试（IncidentStoreTest 15 + FaultInjectionEvaluationTest 5 + DiagnosisServiceTest 16 + EscalationRuleTest 16 + OpsSchedulerEscalationWiringTest 10 + SnapshotCollectorTest 2 + DiagnosisControllerTest 7 + 其余 2）+ 端到端死锁/降级/深度诊断链路验证。
+> 本文档的实现已通过 108 个单元测试（2026-09-23 clean test 全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
 
 ## 1. 设计背景
 
@@ -23,9 +23,9 @@ NEW（首次发现）→ ACTIVE（持续中，第二周期起改走 INFO 心跳�
 
 | 状态 | 触发条件 | 输出 |
 |------|----------|------|
-| NEW | 当前轮 fingerprint 在 store 中不存在或上次已 RESOLVED | [OpsAlertReporter.report](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L52) — ERROR + ASCII 框线全量报告 |
-| ACTIVE | 同 fingerprint 仍在（未 RESOLVED） | [OpsAlertReporter.logHeartbeat](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L76) — INFO 一行心跳 |
-| RESOLVED | 连续 3 轮巡检 normal 后自动标记 | [OpsAlertReporter.logResolved](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L89) — INFO 一行恢复 |
+| NEW | 当前轮 fingerprint 在 store 中不存在或上次已 RESOLVED | [OpsAlertReporter.report](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L53) — ERROR + ASCII 框线全量报告 |
+| ACTIVE | 同 fingerprint 仍在（未 RESOLVED） | [OpsAlertReporter.logHeartbeat](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L77) — INFO 一行心跳 |
+| RESOLVED | 连续 3 轮巡检 normal 后自动标记 | [OpsAlertReporter.logResolved](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L90) — INFO 一行恢复 |
 
 ### 2.2 Fingerprint 构造（基于指标快照，不基于 LLM 文本）
 
@@ -68,20 +68,21 @@ fingerprint = 异常级别 + "|" + 指标特征串
 
 ### 3.1 LLM 超时保护
 
-[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L152)：
+[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L186)：
 
 ```java
 CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
-        inspectorChatClient.prompt().user(prompt).call().content());
+        inspectorChatClient.prompt().user(prompt).call().content(), llmCalls);
 return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);  // 45 秒
 ```
 
 - 超时预算：`LLM_TIMEOUT_SECONDS = 45`（fixedDelay 60 秒的 75%，留余量给指标拉取与解析）
-- 超时后 `future.cancel(true)`，但 Ollama 客户端可能不响应中断——至少释放等待线程，本周期走降级路径
+- 跑在专用虚拟线程执行器 `llmCalls` 上而非公共 ForkJoinPool：超时后 `future.cancel(true)` 并不能中断底层 HTTP，被占死的应是廉价虚拟线程，不能落在 commonPool 上饿死其他并行计算
+- 超时后本周期走降级路径，Ollama 侧推理自行结束
 
 ### 3.2 降级路径
 
-[OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L171)：
+[OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L206)：
 
 ```
 catch (TimeoutException | Exception):
@@ -91,13 +92,13 @@ catch (TimeoutException | Exception):
     recordInspection("error", ...)   // 指标拉取也失败，本轮完全失败
 ```
 
-降级路径调用 [fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L196) 构造与 LLM 等价的 JSON，再走 `handleInspectionResult(..., degraded=true)`：
+降级路径调用 [fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L258) 构造与 LLM 等价的 JSON，再走 `handleInspectionResult(..., degraded=true)`：
 - 仍接入 IncidentStore 状态机去重（同一指纹的 NEW→ACTIVE 流转不变）
 - `metricsService.recordInspection("degraded_" + status, ...)` 标记降级路径，便于运维区分
 
 ### 3.3 阈值兜底规则
 
-[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L196) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
+[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L258) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
 
 | 条件 | 级别 | rootCause 标注 |
 |------|------|---------------|
@@ -109,13 +110,22 @@ catch (TimeoutException | Exception):
 
 ### 3.4 AI 漏报兜底（applyThresholdBackstop）
 
-[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L426) 在 LLM 路径（非降级）中额外加一道兜底：
+[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L519) 在 LLM 路径（非降级）中额外加一道兜底：
 
 - **仅当 AI 判 normal 时介入**（warning/critical 不改判，避免覆盖 AI 的更细致判断）
 - normal 但 `blockedThreads > 0` → 强改 critical
 - normal 但 `heapUsage > 0.95` → 强改 critical
 - normal 但 `cpuUsage > 0.90` → 强改 warning
 - rootCause 追加 `[代码级兜底已介入：warning]` 标注，便于事后定位 AI 漏报原因
+
+### 3.5 LLM 长期不可用的显式告警（LLM_UNAVAILABLE）
+
+Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标——"AI 瞎了"这样重要的故障不能只活在日志里。设计（`OpsScheduler.trackLlmUnavailable`）：
+
+- **触发**：连续 3 轮降级（`handleDegraded` 被调用）即登记独立指纹 `CRITICAL|LLM_UNAVAILABLE;` 的 critical 事件，复用 5.1 状态机——后续降级轮走 INFO 心跳；偶发 1-2 轮降级（瞬时抖动）不告警
+- **恢复**：LLM 正常返回即重置计数；事件由连续 3 轮 normal 自动 RESOLVED
+- **配套规则一（盲期不归档）**：降级轮的 normal 只是硬阈值判断、语义置信度低，不调用 `bumpNormalAndResolve`——否则 Ollama 长挂时事件会被"降级 normal"轮错误归档，随后又被下一轮降级登记为 NEW，反复震荡
+- **配套规则二（降级不升级）**：降级路径不触发任何 4.3 深度诊断升级——r1 与快通道共用同一个 Ollama，挂了就都调不动，排队只会产出一串注定 FAILED 的任务
 
 ## 4. 验证
 
@@ -223,6 +233,11 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 | 同指纹防抖窗口 | 10 分钟 | 有 PENDING/RUNNING 在途、或窗口内已升级过 → 拒绝（`reason=dedup_window_or_inflight`）；**手动触发不受限** |
 | 终态任务保留 | 最近 100 条 | 内存态，超出按 finishedAt 淘汰最旧 |
 
+> 表中"值"均为生产默认值，已全部外部化到 `application.yml` 的 `aiops.diagnosis.*`
+> （`queue-capacity` / `dedup-window-minutes` / `worker-timeout-minutes` / `max-finished-tasks`），
+> 可用同名大写环境变量 `AIOPS_DIAGNOSIS_*` 覆盖，无需改代码重新打包。
+> 抽成可注入参数而非常量的另一个收益：worker 超时分支可用毫秒级 Duration 单测，不必真等 15 分钟。
+
 重启语义：任务不持久化——与 IncidentStore 取舍一致，未完成的深度诊断由下一轮巡检按 4.3 规则重新升级。
 
 ### 6.4 升级触发规则（4.3）
@@ -261,8 +276,15 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 | 测试类 | 用例数 | 关键验证 |
 |--------|--------|---------|
 | DiagnosisServiceTest | 16 | 同指纹 PENDING/RUNNING 在途防抖、窗口内终态防抖与窗口过期放行、不同指纹放行、队列满拒绝自动与手动任务、get 查询、worker 成功流转 SUCCEEDED 且 prompt 含五段要素/不可信数据/人工审批声明、模型异常流转 FAILED 且 worker 继续消费下一条、**15 分钟硬超时按注入阈值（200ms）快速 FAILED 且 error 标明硬超时、cancel(true) 中断挂死调用后 worker 继续消费**、手动提交绕防抖、终态淘汰到上限且不误删在途任务、start/stop 生命周期 |
-| EscalationRuleTest | 16 | critical+写建议→critical_write、warning 含写词不升级、持续 5 分钟整（>=）→persistent、4分59秒不升级、NEW 旧 firstSeen 不走 persistent、ACTIVE critical 写建议超时落到 persistent、critical_write 优先级压过 low、severity 大小写不敏感、中英文写关键词与空串、low→low_confidence、persistent 优先级高于 low、medium/HIGH 不误触发 |
-| OpsSchedulerEscalationWiringTest | 10 | 反射调 handleInspectionResult：首轮失败不升级、连续 2 轮失败恰好一次 PARSE_FAIL 且 note 带原始输出、升级后计数归零、成功轮重置计数、原始输出截断 1000 字符、degraded 路径永不升级、critical 写建议→CRITICAL_WRITE 指纹含 BLOCKED=2、normal+low→LOW_CONFIDENCE、缺 confidence 默认 medium 不升级、同指纹第二轮走心跳不升级 |
+| EscalationRuleTest | 17 | critical+写建议→critical_write、warning 含写词不升级、**否定词修饰不算写建议（"无需重启""不建议重启或回滚"）且跨小句不传染（"不要慌，建议重启"仍算）**、持续 5 分钟整（>=）→persistent、4分59秒不升级、NEW 旧 firstSeen 不走 persistent、ACTIVE critical 写建议超时落到 persistent、critical_write 优先级压过 low、severity 大小写不敏感、中英文写关键词与空串、low→low_confidence、persistent 优先级高于 low、medium/HIGH 不误触发 |
+| OpsSchedulerEscalationWiringTest | 12 | 反射调 handleInspectionResult/handleDegraded：首轮失败不升级、连续 2 轮失败恰好一次 PARSE_FAIL 且 note 带原始输出、升级后计数归零、成功轮重置计数、原始输出截断 1000 字符、degraded 路径永不升级（parse_fail 与 **critical+写建议两条路径都验**）、**连续 3 轮降级 → LLM_UNAVAILABLE 告警 report 一次、后续降级走心跳且降级 normal 轮不 RESOLVED**、critical 写建议→CRITICAL_WRITE 指纹含 BLOCKED=2、normal+low→LOW_CONFIDENCE、缺 confidence 默认 medium 不升级、同指纹第二轮走心跳不升级 |
 | SnapshotCollectorTest | 2 | BLOCKED=0 不调 detectDeadlock 且快照无诊断字段；BLOCKED>0 挂死锁诊断结果 |
 | DiagnosisControllerTest | 7 | POST 成功 200 返回 PENDING 视图、空白 message 归一化 null、非空白 trim、队列满 503、GET 存在返回终态视图、不存在 404、FAILED 视图带 error |
+| ApiTokenAuthFilterTest | 8 | MockHttpServletRequest 纯单测：无凭据/错 token→401 且不放行，Bearer（scheme 大小写不敏感、值首尾空白容忍）、X-API-Key、?token= 三种方式放行，空 Bearer 值→401 |
+| KnowledgeIngesterTest | 8 | 标题提取纯函数：标准标题提取并剥离正文、无标题兜底文件名、文首空行跳过、英文冒号与 trim、单/双引号标题拒绝、空内容兜底；ingest 接线（mock VectorStore + 真实语料）：新旧 source 双删、切片继承标题 source、标题不入正文 |
+| OpsSchedulerExtractJsonTest | 9 | 反射测 extractJson：纯 JSON 透传、```json/```围栏剥离、只有开头围栏、</think> 残留剥离、思考段+围栏组合、null→空串、散文原样返回（不做花括号扫描）、围栏后空白 trim |
+| PrometheusToolTest | 7 | 反射测 parseValue：小数/整数/科学计数法正常解析，NaN（大小写）/空串/脏字符串/null 统一 -1 哨兵（全系统"查询失败"契约） |
+| 其余 | 22 | IncidentStoreTest 15（指纹/状态机/反射兜底）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）+ AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准，非断言型回归） |
+
+> 合计 **108** 个用例（2026-09-23，clean test 全绿；除 contextLoads 需 Milvus 外均不依赖任何外部服务）。除 contextLoads 外全部是不起容器的纯单测（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法，见 .trae/learning-guide.md 测试章节）。
 

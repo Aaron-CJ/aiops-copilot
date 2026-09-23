@@ -33,6 +33,10 @@ VOLUME /app/logs
 # 暴露应用端口
 EXPOSE 8080
 
+# 部署约束：单实例设计——事件状态机（IncidentStore）与深度诊断任务队列（DiagnosisService）
+# 都在进程内存，审计日志在本地卷。横向扩多副本会导致重复告警、诊断任务不共享、审计分散；
+# 需要多实例时必须先引入共享状态存储（Redis 等）并改造这两处，再考虑扩容。
+
 # 环境变量声明（方便 docker run -e 注入）：
 #   SPRING_PROFILES_ACTIVE=prod         生产 profile（关闭 DebugController 等故障注入夹具）
 #   AIOPS_API_TOKEN=你的强随机令牌         /api/** 鉴权令牌（prod 必填）
@@ -40,5 +44,6 @@ EXPOSE 8080
 #   PROMETHEUS_BASE_URL=http://宿主机IP:9090  Prometheus API 地址
 #   MILVUS_HOST=宿主机IP  Milvus gRPC 地址
 #   MILVUS_PASSWORD=你的强密码  Milvus 凭据（生产必须改）
+#   AIOPS_DIAGNOSIS_WORKER_TIMEOUT_MINUTES=15  深度诊断可调参数（队列容量/防抖窗口/超时/保留条数，见 application.yml）
 
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]

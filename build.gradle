@@ -15,8 +15,10 @@ java {
 }
 
 repositories {
-	mavenLocal {
-		url = 'file:///D:/m2/repository'
+	// 本地 Maven 缓存（可选）：仅当该目录存在时启用，其他机器/CI 自动跳过，不破坏可移植性
+	def localM2 = file('D:/m2/repository')
+	if (localM2.exists()) {
+		maven { url = localM2.toURI() }
 	}
 	maven { url = 'https://maven.aliyun.com/repository/public' }
 	mavenCentral()
