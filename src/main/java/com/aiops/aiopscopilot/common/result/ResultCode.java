@@ -1,8 +1,8 @@
 package com.aiops.aiopscopilot.common.result;
 
 /**
- * 通用响应状态码枚举。业务端点也可不使用本枚举、直接内联 HTTP 风格码
- * （如 DiagnosisController 的 404/503），约定详见 {@link Result} 类注释。
+ * 通用响应状态码枚举。业务端点优先使用本枚举表达错误码；
+ * 确需枚举之外的语义码时也可内联 HTTP 风格码，约定详见 {@link Result} 类注释。
  */
 public enum ResultCode {
 
@@ -11,6 +11,8 @@ public enum ResultCode {
     UNAUTHORIZED(401, "未授权"),
     FORBIDDEN(403, "禁止访问"),
     NOT_FOUND(404, "资源不存在"),
+    /** 资源满/过载等暂不可用场景（如深度诊断任务队列已满） */
+    SERVICE_UNAVAILABLE(503, "服务暂不可用"),
     INTERNAL_ERROR(500, "系统内部错误"),
     BUSINESS_ERROR(1000, "业务处理失败");
 

@@ -56,7 +56,8 @@ public class ApiTokenAuthFilter extends OncePerRequestFilter {
     /** 依次从 Bearer 头、X-API-Key 头、token 查询参数提取，均未提供返回 null。 */
     private String extractToken(HttpServletRequest request) {
         String auth = request.getHeader("Authorization");
-        if (auth != null && auth.startsWith(BEARER_PREFIX)) {
+        // RFC 7235 规定 auth-scheme 大小写不敏感（"bearer"/"Bearer" 均应接受）
+        if (auth != null && auth.regionMatches(true, 0, BEARER_PREFIX, 0, BEARER_PREFIX.length())) {
             return auth.substring(BEARER_PREFIX.length()).trim();
         }
         String apiKey = request.getHeader(HEADER_API_KEY);
