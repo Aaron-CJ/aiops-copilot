@@ -50,6 +50,7 @@ public class KnowledgeIngester {
      * 执行一次知识库摄入（标题约定见类注释），重复调用幂等。
      *
      * @return 实际写入 Milvus 的文本片段数量
+     * @throws IOException 知识文件读取失败，或标题含引号（无法安全构建 Milvus 过滤表达式）
      */
     public int ingest() throws IOException {
         Resource resource = new ClassPathResource(FALLBACK_SOURCE);
@@ -59,34 +60,9 @@ public class KnowledgeIngester {
             rawContent = StreamUtils.copyToString(in, StandardCharsets.UTF_8);
         }
 
-        // —— 标题提取状态机：只检查"首个非空行"，避免正文中偶然出现的"知识库：xxx"被误判为标题 ——
-        String source = FALLBACK_SOURCE;   // 来源名，先假设文档无标题（兜底文件名）
-        StringBuilder body = new StringBuilder();
-        boolean titleResolved = false;     // false=尚未遇到首个非空行，仍需尝试匹配标题；true=标题问题已有结论，后续行全部进正文
-        for (String line : rawContent.split("\\R", -1)) {
-            if (!titleResolved) {
-                Matcher matcher = TITLE_LINE.matcher(line);
-                if (matcher.matches()) {
-                    // 命中标题约定：冒号后内容作为 source，continue 将标题行丢弃、不进入切片正文。
-                    // source 会拼进 Milvus 删除表达式的字符串字面量，含引号会破坏表达式——拒绝而不是静默转义
-                    String title = matcher.group(1).trim();
-                    if (title.contains("'") || title.contains("\"")) {
-                        throw new IOException("知识库标题含引号（\" 或 '），无法安全构建 Milvus 过滤表达式，请修改标题: " + title);
-                    }
-                    source = title;
-                    titleResolved = true;
-                    continue;
-                }
-                if (!line.isBlank()) {
-                    // 首个非空行不是标题：认定文档无标题，关闭匹配；该行是正文，下面照常追加
-                    titleResolved = true;
-                }
-                // 标题之前的空行：开关保持 false，继续向下寻找首个非空行
-            }
-            body.append(line).append('\n');
-        }
-        // 标题行被抽走后文首可能残留空行，统一 strip 掉
-        String content = body.toString().strip();
+        ResolvedSource resolved = resolveSourceAndBody(rawContent);
+        String source = resolved.source();
+        String content = resolved.content();
 
         // —— 防重删除（保证重复 ingest 幂等）——
         // 本次写入的片段 source 是提取出的标题，先删同名旧片段；
@@ -104,5 +80,45 @@ public class KnowledgeIngester {
         vectorStore.add(chunks);
 
         return chunks.size();
+    }
+
+    /** 标题提取结果：source 为来源名（无标题文档兜底文件名），content 为剥离标题行后的正文 */
+    record ResolvedSource(String source, String content) {
+    }
+
+    /**
+     * 标题提取状态机（纯函数，便于单测全部分支）：
+     * 只检查"首个非空行"——命中「知识库：标题」约定则提取为 source 并从正文剥离，
+     * 首个非空行不是标题则认定整篇无标题，正文中再出现"知识库："也不误判。
+     *
+     * @throws IOException 标题含引号（" 或 '）——source 会拼进 Milvus 删除表达式的
+     *                     字符串字面量，含引号会破坏表达式，拒绝而不是静默转义
+     */
+    static ResolvedSource resolveSourceAndBody(String rawContent) throws IOException {
+        String source = FALLBACK_SOURCE;
+        StringBuilder body = new StringBuilder();
+        boolean titleResolved = false;
+        for (String line : rawContent.split("\\R", -1)) {
+            if (!titleResolved) {
+                Matcher matcher = TITLE_LINE.matcher(line);
+                if (matcher.matches()) {
+                    String title = matcher.group(1).trim();
+                    if (title.contains("'") || title.contains("\"")) {
+                        throw new IOException("知识库标题含引号（\" 或 '），无法安全构建 Milvus 过滤表达式，请修改标题: " + title);
+                    }
+                    source = title;
+                    titleResolved = true;
+                    continue;
+                }
+                if (!line.isBlank()) {
+                    // 首个非空行不是标题：认定文档无标题，关闭匹配；该行是正文，下面照常追加
+                    titleResolved = true;
+                }
+                // 标题之前的空行：开关保持 false，继续向下寻找首个非空行
+            }
+            body.append(line).append('\n');
+        }
+        // 标题行被抽走后文首可能残留空行，统一 strip 掉
+        return new ResolvedSource(source, body.toString().strip());
     }
 }

@@ -8,7 +8,7 @@
 
 执行：
     python scripts/milvus_drop_collection.py
-执行后重启 Spring Boot 应用，会自动以新维度重建 collection，再调 /api/ai/ingest 灌库。
+执行后重启 Spring Boot 应用，会自动以新维度重建 collection，再调 POST /api/ai/ingest 灌库。
 
 注意：本脚本会物理删除知识数据，执行前确认已备份或可重新 ingest。
 """

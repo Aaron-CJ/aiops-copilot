@@ -20,6 +20,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -35,7 +36,8 @@ import reactor.core.publisher.Flux;
  *   <li>{@code GET /rag} / {@code /rag/stream} — RAG 问答（同步/SSE）：
  *       先 Milvus 相似度检索 knowledge.txt 片段，无命中直接回复"未找到"省一次模型调用，
  *       有命中才带片段提问，系统 Prompt 强约束"只能依据知识库作答 + 注明来源"抗幻觉</li>
- *   <li>{@code GET /ingest} — 知识库重新摄入（切片→bge-m3 向量化→写 Milvus）</li>
+ *   <li>{@code POST /ingest} — 知识库重新摄入（切片→bge-m3 向量化→写 Milvus；
+ *       写副作用操作用 POST，不挂在 GET 上）</li>
  * </ul>
  * 与 {@link AgentController} 的区别：本类基于"检索到的静态知识"，Agent 基于"实时工具数据"。
  */
@@ -119,11 +121,12 @@ public class AiChatController {
     }
 
     /**
-     * 知识库初始化接口：需先启动 Milvus 并本地拉取 embedding 模型（ollama pull bge-m3）。
+     * 知识库初始化接口（POST——写 Milvus 的副作用操作）：需先启动 Milvus 并本地拉取
+     * embedding 模型（ollama pull bge-m3）。
      *
      * @return 写入 Milvus 的文本片段数量
      */
-    @GetMapping("/ingest")
+    @PostMapping("/ingest")
     public Result<Integer> ingest() throws IOException {
         int count = knowledgeIngester.ingest();
         return Result.success(count);
