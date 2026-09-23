@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.aiops.aiopscopilot.common.result.Result;
+import com.aiops.aiopscopilot.common.result.ResultCode;
 import com.aiops.aiopscopilot.service.diagnosis.DiagnosisService;
 import com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask;
 
@@ -38,7 +39,7 @@ public class DiagnosisController {
     public Result<TaskView> submit(@RequestParam(required = false, defaultValue = "") String message) {
         DiagnosisTask task = diagnosisService.submitManual(message.isBlank() ? null : message.trim());
         if (task == null) {
-            return Result.fail(503, "深度诊断队列已满，请稍后再试");
+            return Result.fail(ResultCode.SERVICE_UNAVAILABLE, "深度诊断队列已满，请稍后再试");
         }
         return Result.success("深度诊断任务已提交，请用 taskId 轮询结果", TaskView.of(task));
     }
@@ -48,7 +49,7 @@ public class DiagnosisController {
     public Result<TaskView> get(@PathVariable String taskId) {
         DiagnosisTask task = diagnosisService.get(taskId);
         if (task == null) {
-            return Result.fail(404, "任务不存在或已被清理（终态任务仅保留最近一批）");
+            return Result.fail(ResultCode.NOT_FOUND, "任务不存在或已被清理（终态任务仅保留最近一批）");
         }
         return Result.success(TaskView.of(task));
     }

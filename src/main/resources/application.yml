@@ -17,6 +17,12 @@ aiops:
     # 快速通道模型：定时巡检 + 交互 Agent（关闭思考链，追求低延迟）
     # 深度推理/RAG 模型直接复用下方 spring.ai.ollama.chat.model（deepseek-r1:8b）
     fast: qwen3:8b
+  diagnosis:
+    # 深度诊断任务队列（DiagnosisService，白皮书 4.2），均可用环境变量覆盖
+    queue-capacity: ${AIOPS_DIAGNOSIS_QUEUE_CAPACITY:20}          # 有界队列容量，满则拒绝并记审计
+    dedup-window-minutes: ${AIOPS_DIAGNOSIS_DEDUP_WINDOW_MINUTES:10}   # 同一指纹自动升级的最小间隔
+    worker-timeout-minutes: ${AIOPS_DIAGNOSIS_WORKER_TIMEOUT_MINUTES:15} # r1 单次推理硬超时（实测最长 8.8 分钟）
+    max-finished-tasks: ${AIOPS_DIAGNOSIS_MAX_FINISHED_TASKS:100} # 终态任务内存保留条数
 
 spring:
   application:

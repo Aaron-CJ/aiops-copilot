@@ -17,8 +17,11 @@ import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.client.ChatClient;
 
 import com.aiops.aiopscopilot.common.audit.AuditLogger;
+import com.aiops.aiopscopilot.service.MetricsService;
 import com.aiops.aiopscopilot.service.OpsAlertReporter;
 import com.aiops.aiopscopilot.service.SnapshotCollector;
+
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -28,6 +31,11 @@ import static org.mockito.Mockito.*;
  * worker 通过 start()/stop() 手动控制，ChatClient 用动态代理伪造整条 fluent 链。
  */
 class DiagnosisServiceTest {
+
+    /** 与生产默认一致的可调参数（构造器已外部化，测试显式传值） */
+    private static final int QUEUE_CAPACITY = 20;
+    private static final int MAX_FINISHED_TASKS = 100;
+    private static final long DEDUP_WINDOW_MINUTES = 10;
 
     private DiagnosisService service;
 
@@ -39,14 +47,15 @@ class DiagnosisServiceTest {
     }
 
     private DiagnosisService newService(ChatClient chatClient, SnapshotCollector collector) {
-        AuditLogger audit = new AuditLogger();
-        return new DiagnosisService(chatClient, collector, new OpsAlertReporter(audit), audit);
+        return newService(chatClient, collector, Duration.ofMinutes(15));
     }
 
     private DiagnosisService newService(ChatClient chatClient, SnapshotCollector collector,
                                         Duration workerTimeout) {
         AuditLogger audit = new AuditLogger();
-        return new DiagnosisService(chatClient, collector, new OpsAlertReporter(audit), audit, workerTimeout);
+        return new DiagnosisService(chatClient, collector, new OpsAlertReporter(audit), audit,
+                new MetricsService(new SimpleMeterRegistry()), workerTimeout,
+                QUEUE_CAPACITY, DEDUP_WINDOW_MINUTES, MAX_FINISHED_TASKS);
     }
 
     /** 同指纹自动升级：PENDING 在途去重，第二次被拒 */
@@ -95,7 +104,7 @@ class DiagnosisServiceTest {
     void queueFullRejectsNewTask() throws Exception {
         service = newService(null, null);
         int accepted = 0;
-        for (int i = 0; i < DiagnosisService.QUEUE_CAPACITY; i++) {
+        for (int i = 0; i < QUEUE_CAPACITY; i++) {
             DiagnosisTask t = service.submitEscalated(
                     DiagnosisTask.Trigger.PERSISTENT, "FP|" + i + ";", Map.of(), null);
             if (t != null) accepted++;
@@ -103,10 +112,10 @@ class DiagnosisServiceTest {
         DiagnosisTask overflow = service.submitEscalated(
                 DiagnosisTask.Trigger.PERSISTENT, "FP|OVERFLOW;", Map.of(), null);
 
-        assertEquals(DiagnosisService.QUEUE_CAPACITY, accepted);
+        assertEquals(QUEUE_CAPACITY, accepted);
         assertNull(overflow, "有界队列满了必须拒绝，不能让 r1 任务无限堆积");
         // offer 失败必须回滚 tasks.put，被拒任务不能在 Map 里留下永不出队的幽灵条目
-        assertEquals(DiagnosisService.QUEUE_CAPACITY, taskStore().size());
+        assertEquals(QUEUE_CAPACITY, taskStore().size());
     }
 
     /** G5：手动提交绕过防抖，但绕不过有界队列——队列满时同样拒绝（防止手动接口打满 r1 队列） */
@@ -116,7 +125,7 @@ class DiagnosisServiceTest {
         when(collector.collect()).thenReturn(Map.of("cpuUsage", 0.1));
         service = newService(null, collector);
 
-        for (int i = 0; i < DiagnosisService.QUEUE_CAPACITY; i++) {
+        for (int i = 0; i < QUEUE_CAPACITY; i++) {
             assertNotNull(service.submitEscalated(
                     DiagnosisTask.Trigger.PERSISTENT, "FP|Q" + i + ";", Map.of(), null));
         }
@@ -286,7 +295,7 @@ class DiagnosisServiceTest {
     void finishedTasksArePrunedBeyondLimit() throws Exception {
         service = newService(null, null);
         Map<String, DiagnosisTask> store = taskStore();
-        for (int i = 0; i < DiagnosisService.MAX_FINISHED_TASKS + 1; i++) {
+        for (int i = 0; i < MAX_FINISHED_TASKS + 1; i++) {
             store.put("old" + i, DiagnosisTask
                     .pending("old" + i, DiagnosisTask.Trigger.MANUAL, "manual", Map.of(), null)
                     .withSuccess("report " + i));
@@ -298,7 +307,7 @@ class DiagnosisServiceTest {
         assertNotNull(fresh);
         long finishedCount = store.values().stream()
                 .filter(t -> t.finishedAt() != null).count();
-        assertEquals(DiagnosisService.MAX_FINISHED_TASKS, finishedCount,
+        assertEquals(MAX_FINISHED_TASKS, finishedCount,
                 "终态任务应被淘汰到上限以内");
         assertTrue(store.containsKey(fresh.taskId()));
     }
@@ -309,7 +318,7 @@ class DiagnosisServiceTest {
     void pruneNeverEvictsInFlightTasks() throws Exception {
         service = newService(null, null);
         Map<String, DiagnosisTask> store = taskStore();
-        for (int i = 0; i < DiagnosisService.MAX_FINISHED_TASKS + 5; i++) {
+        for (int i = 0; i < MAX_FINISHED_TASKS + 5; i++) {
             store.put("old" + i, DiagnosisTask
                     .pending("old" + i, DiagnosisTask.Trigger.MANUAL, "manual", Map.of(), null)
                     .withSuccess("report " + i));

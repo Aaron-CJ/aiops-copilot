@@ -65,4 +65,29 @@ public class MetricsService {
         meterRegistry.timer("aiops_rag_retrieval_seconds")
                 .record(durationMs, TimeUnit.MILLISECONDS);
     }
+
+    /**
+     * 记录一次深度诊断任务终态（DiagnosisService worker 完成/失败一个任务时调用）。
+     *
+     * @param trigger    升级触发原因（manual / parse_fail / low_confidence / persistent / critical_write）
+     * @param result     终态：succeeded / failed
+     * @param durationMs 任务耗时（毫秒，RUNNING 起点到终态）
+     */
+    public void recordDiagnosis(String trigger, String result, long durationMs) {
+        meterRegistry.counter("aiops_diagnosis_total",
+                "trigger", trigger, "result", result).increment();
+        meterRegistry.timer("aiops_diagnosis_duration_seconds")
+                .record(durationMs, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * 记录一次深度诊断提交被拒。
+     *
+     * @param trigger 升级触发原因
+     * @param reason  拒绝原因：dedup_window_or_inflight（防抖）/ queue_full（队列满）
+     */
+    public void recordDiagnosisRejected(String trigger, String reason) {
+        meterRegistry.counter("aiops_diagnosis_rejected_total",
+                "trigger", trigger, "reason", reason).increment();
+    }
 }

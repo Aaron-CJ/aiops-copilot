@@ -18,13 +18,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.ollama.api.OllamaChatOptions;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import com.aiops.aiopscopilot.common.audit.AuditLogger;
+import com.aiops.aiopscopilot.service.MetricsService;
 import com.aiops.aiopscopilot.service.OpsAlertReporter;
 import com.aiops.aiopscopilot.service.SnapshotCollector;
 
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import tools.jackson.databind.ObjectMapper;
 
 /**
@@ -37,37 +42,39 @@ import tools.jackson.databind.ObjectMapper;
  * 为什么是内存态：与 IncidentStore 的取舍一致——任务是进程内工作单元，重启时未完成的诊断
  * 让下一轮巡检重新升级即可；不引入数据库/消息队列等外部依赖。
  * <p>
- * 防抖（仅自动升级，手动不限制）：同一指纹有 PENDING/RUNNING 任务、或在
- * {@value #DEDUP_WINDOW_MINUTES} 分钟窗口内已提交过，则拒绝重复升级——r1 单次 1.7-6.6 分钟，
- * 不能让同一起故障每分钟都排一个深度任务。
+ * 防抖（仅自动升级，手动不限制）：同一指纹有 PENDING/RUNNING 任务、或在防抖窗口内
+ * （默认 10 分钟，{@code aiops.diagnosis.dedup-window-minutes}）已提交过，则拒绝重复升级——
+ * r1 单次 1.7-6.6 分钟，不能让同一起故障每分钟都排一个深度任务。
+ * <p>
+ * 可调参数（{@code aiops.diagnosis.*}，见 application.yml）：队列容量、防抖窗口、
+ * worker 硬超时、终态保留条数。
  */
 @Service
 public class DiagnosisService {
 
     private static final Logger log = LoggerFactory.getLogger(DiagnosisService.class);
 
-    /** 待处理队列容量：r1 串行且单次数分钟，堆积无意义；满了拒绝新任务并记审计 */
-    static final int QUEUE_CAPACITY = 20;
-    /** 同一指纹自动升级的最小间隔 */
-    static final long DEDUP_WINDOW_MINUTES = 10;
-    /** 终态任务在内存中最多保留条数（按完成时间淘汰最旧） */
-    static final int MAX_FINISHED_TASKS = 100;
-    /** worker 单次推理硬超时：实测最长 6.6 分钟，留余量到 15 分钟，防止调用永久挂死 */
-    static final long WORKER_TIMEOUT_MINUTES = 15;
+    /** 待处理队列容量：r1 串行且单次数分钟，堆积无意义；满了拒绝新任务并记审计（默认 20） */
+    private final int queueCapacity;
+    /** 同一指纹自动升级的最小间隔分钟（默认 10） */
+    private final long dedupWindowMinutes;
+    /** 终态任务在内存中最多保留条数（按完成时间淘汰最旧，默认 100） */
+    private final int maxFinishedTasks;
 
     private final ChatClient deepModel;
     private final SnapshotCollector snapshotCollector;
     private final OpsAlertReporter reporter;
     private final AuditLogger audit;
+    private final MetricsService metricsService;
     /**
-     * worker 单次推理硬超时（单一权威阈值）。生产默认 {@value #WORKER_TIMEOUT_MINUTES} 分钟；
-     * 抽成可注入 Duration 而非写死在 future.get 里，是为了让超时分支可以用毫秒级阈值单测，
-     * 不必真等 15 分钟。
+     * worker 单次推理硬超时（单一权威阈值）。生产默认 15 分钟
+     * （{@code aiops.diagnosis.worker-timeout-minutes}）；抽成可注入 Duration 而非写死在
+     * future.get 里，是为了让超时分支可以用毫秒级阈值单测，不必真等 15 分钟。
      */
     private final Duration workerTimeout;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    private final BlockingQueue<String> pendingTaskIds = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+    private final BlockingQueue<String> pendingTaskIds;
     private final Map<String, DiagnosisTask> tasks = new ConcurrentHashMap<>();
     /** fingerprint → 最近一次自动提交时间（防抖窗口） */
     private final Map<String, Instant> lastEscalatedAt = new ConcurrentHashMap<>();
@@ -76,38 +83,56 @@ public class DiagnosisService {
     // 虚拟线程阻塞期间不占载体线程；Ollama 本身串行推理，多 worker 只会排队争抢。
     private final ExecutorService worker = Executors.newThreadPerTaskExecutor(
             Thread.ofVirtual().name("deep-diagnosis-worker", 0).factory());
+    /** r1 调用执行器：专用虚拟线程而非公共 ForkJoinPool——15 分钟硬超时后底层 HTTP 不会中断，
+     *  被占死的应是廉价虚拟线程，不能落在 commonPool 上饿死其他并行计算 */
+    private final ExecutorService llmCalls = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("deep-llm-call", 0).factory());
     private volatile boolean running;
 
     // 存在两个构造器时 Spring 不会自动挑选，必须显式标注生产用的这一个
-    @org.springframework.beans.factory.annotation.Autowired
+    @Autowired
     public DiagnosisService(@Qualifier("deepseekChatClient") ChatClient deepModel,
                             SnapshotCollector snapshotCollector,
                             OpsAlertReporter reporter,
-                            AuditLogger audit) {
-        this(deepModel, snapshotCollector, reporter, audit, Duration.ofMinutes(WORKER_TIMEOUT_MINUTES));
+                            AuditLogger audit,
+                            MetricsService metricsService,
+                            @Value("${aiops.diagnosis.queue-capacity:20}") int queueCapacity,
+                            @Value("${aiops.diagnosis.dedup-window-minutes:10}") long dedupWindowMinutes,
+                            @Value("${aiops.diagnosis.worker-timeout-minutes:15}") long workerTimeoutMinutes,
+                            @Value("${aiops.diagnosis.max-finished-tasks:100}") int maxFinishedTasks) {
+        this(deepModel, snapshotCollector, reporter, audit, metricsService,
+                Duration.ofMinutes(workerTimeoutMinutes), queueCapacity, dedupWindowMinutes, maxFinishedTasks);
     }
 
-    /** 测试入口：覆盖硬超时时长（生产路径始终走 4 参构造器的 15 分钟默认值） */
+    /** 测试入口：直接注入全部可调参数（生产路径始终走上方构造器的 yml 默认值） */
     DiagnosisService(ChatClient deepModel, SnapshotCollector snapshotCollector,
-                     OpsAlertReporter reporter, AuditLogger audit, Duration workerTimeout) {
+                     OpsAlertReporter reporter, AuditLogger audit, MetricsService metricsService,
+                     Duration workerTimeout, int queueCapacity, long dedupWindowMinutes, int maxFinishedTasks) {
         this.deepModel = deepModel;
         this.snapshotCollector = snapshotCollector;
         this.reporter = reporter;
         this.audit = audit;
+        this.metricsService = metricsService;
         this.workerTimeout = workerTimeout;
+        this.queueCapacity = queueCapacity;
+        this.dedupWindowMinutes = dedupWindowMinutes;
+        this.maxFinishedTasks = maxFinishedTasks;
+        this.pendingTaskIds = new ArrayBlockingQueue<>(queueCapacity);
     }
 
-    @jakarta.annotation.PostConstruct
+    @PostConstruct
     void start() {
         running = true;
         worker.submit(this::workerLoop);
-        log.info("[DiagnosisService] 深度诊断 worker 已启动");
+        log.info("[DiagnosisService] 深度诊断 worker 已启动（队列容量={}，防抖窗口={}分钟，硬超时={}）",
+                queueCapacity, dedupWindowMinutes, workerTimeout);
     }
 
-    @jakarta.annotation.PreDestroy
+    @PreDestroy
     void stop() {
         running = false;
         worker.shutdownNow();
+        llmCalls.shutdownNow();
         try {
             if (!worker.awaitTermination(5, TimeUnit.SECONDS)) {
                 log.warn("[DiagnosisService] worker 5s 内未退出，强制关闭");
@@ -148,6 +173,7 @@ public class DiagnosisService {
         // 提交频率低（巡检每分钟一轮），synchronized 保证"防抖检查 + 入队"原子
         synchronized (this) {
             if (dedup && isDeduplicated(fingerprint)) {
+                metricsService.recordDiagnosisRejected(trigger, "dedup_window_or_inflight");
                 audit.deepDiagnosisRejected(trigger, fingerprint, "dedup_window_or_inflight");
                 return null;
             }
@@ -159,9 +185,10 @@ public class DiagnosisService {
             if (!pendingTaskIds.offer(taskId)) {
                 // 队列满：回滚 Map 占位后拒绝
                 tasks.remove(taskId);
+                metricsService.recordDiagnosisRejected(trigger, "queue_full");
                 audit.deepDiagnosisRejected(trigger, fingerprint, "queue_full");
                 log.warn("[DiagnosisService] 深度诊断队列已满（{}），拒绝任务 trigger={} fp={}",
-                        QUEUE_CAPACITY, trigger, fingerprint);
+                        queueCapacity, trigger, fingerprint);
                 return null;
             }
             if (dedup) {
@@ -182,20 +209,20 @@ public class DiagnosisService {
             }
         }
         Instant last = lastEscalatedAt.get(fingerprint);
-        return last != null && Duration.between(last, Instant.now()).toMinutes() < DEDUP_WINDOW_MINUTES;
+        return last != null && Duration.between(last, Instant.now()).toMinutes() < dedupWindowMinutes;
     }
 
     /** 终态任务超过上限时淘汰 finishedAt 最旧的 */
     private void pruneFinished() {
         long finishedCount = tasks.values().stream()
                 .filter(t -> t.finishedAt() != null).count();
-        if (finishedCount <= MAX_FINISHED_TASKS) {
+        if (finishedCount <= maxFinishedTasks) {
             return;
         }
         tasks.values().stream()
                 .filter(t -> t.finishedAt() != null)
                 .sorted(Comparator.comparing(DiagnosisTask::finishedAt))
-                .limit(finishedCount - MAX_FINISHED_TASKS)
+                .limit(finishedCount - maxFinishedTasks)
                 .forEach(t -> tasks.remove(t.taskId()));
     }
 
@@ -227,13 +254,15 @@ public class DiagnosisService {
             String prompt = buildDeepPrompt(task);
             String report = callDeepModelWithTimeout(prompt);
             task = task.withSuccess(report);
-            audit.deepDiagnosisFinished(taskId, task.trigger(), task.fingerprint(),
-                    "succeeded", System.currentTimeMillis() - start);
+            long elapsed = System.currentTimeMillis() - start;
+            audit.deepDiagnosisFinished(taskId, task.trigger(), task.fingerprint(), "succeeded", elapsed);
+            metricsService.recordDiagnosis(task.trigger(), "succeeded", elapsed);
         } catch (Exception e) {
             String reason = e.getClass().getSimpleName() + ": " + e.getMessage();
             task = task.withFailure(reason);
-            audit.deepDiagnosisFinished(taskId, task.trigger(), task.fingerprint(),
-                    "failed", System.currentTimeMillis() - start);
+            long elapsed = System.currentTimeMillis() - start;
+            audit.deepDiagnosisFinished(taskId, task.trigger(), task.fingerprint(), "failed", elapsed);
+            metricsService.recordDiagnosis(task.trigger(), "failed", elapsed);
             log.warn("[DiagnosisService] 深度诊断失败 taskId={} reason={}", taskId, reason);
         } finally {
             tasks.put(taskId, task);
@@ -242,7 +271,7 @@ public class DiagnosisService {
     }
 
     /**
-     * r1 调用 + 硬超时（在异步线程内运行，不影响 worker 之外的组件；超时后 Ollama 侧推理仍会自行结束）。
+     * r1 调用 + 硬超时（跑在专用虚拟线程执行器上，不占公共 ForkJoinPool；超时后 Ollama 侧推理仍会自行结束）。
      * 所有失败统一转非受检异常，由 {@link #process} 的 catch 收敛为 FAILED 终态。
      */
     private String callDeepModelWithTimeout(String prompt) {
@@ -251,7 +280,7 @@ public class DiagnosisService {
                         .options(OllamaChatOptions.builder().enableThinking())
                         .user(prompt)
                         .call()
-                        .content());
+                        .content(), llmCalls);
         try {
             return future.get(workerTimeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException te) {
