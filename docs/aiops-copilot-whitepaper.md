@@ -28,7 +28,7 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 - **落地实现**（`PrometheusTool`）：一份查询能力，两条路径复用——
   - **被动模式**：`queryMetric(promql)` 带 `@Tool` 注解，交互问答时模型自主构造 PromQL；
   - **主动模式**：`queryFixedMetrics()` 由调度器每分钟预拉 7 条核心指标（CPU、堆总使用率、堆内存分代、QPS、最大请求延迟、BLOCKED 线程数、5 分钟 GC 次数）直接塞 Prompt，**不让模型在巡检中自主查**（实测 2026-09-17，qwen3:8b 交互 Agent：自主查在单轮内并行发起 5-6 次 queryMetric、零 PromQL 重试，但开放式提问只查 5 项、维度覆盖不确定——预拉保证每轮 7 条指标确定性到齐，且巡检 ChatClient 不挂工具 schema、不承担工具编排开销与覆盖不确定性）。
-- **工程细节**：PromQL 含双引号（如 `{state="blocked"}`）必须 `URLEncoder.encode` 后以 `java.net.URI` 对象发起请求，绕过 RestClient 的二次编码；查询失败返回 `-1` 而非 `0`，让模型区分"无数据"与"值为零"。
+- **工程细节**：PromQL 含双引号（如 `{state="blocked"}`）必须 `URLEncoder.encode` 后以 `java.net.URI` 对象发起请求，绕过 RestClient 的二次编码；查询失败返回 `-1` 而非 `0`，让模型区分"无数据"与"值为零"。主动模式的 QPS 查询用 Java 侧减法排除 `/actuator/prometheus` 抓取产生的 ≈0.067 QPS 基线污染（该污染曾静默屏蔽"qps==0 应用假死"判定）：`sum(rate(全部[1m])) - rate({uri="/actuator/prometheus"}[1m])`。注意不能在 PromQL 中直接写 `!=`——`URI.create` 会把 `%21(!)` 规范化为字面量 `!`，导致 Prometheus parse error；两条子查询都只用 `=` 规避此坑。
 - **生产意义**：减少系统组件、降低资源消耗，为大模型腾出算力。
 
 #### 1.2 主动巡检引擎：语义判断替代静态阈值 ✅

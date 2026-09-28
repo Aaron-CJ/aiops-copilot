@@ -95,8 +95,18 @@ public class PrometheusTool {
                 "sum(jvm_memory_used_bytes{area=\"heap\"}) / sum(jvm_memory_max_bytes{area=\"heap\"} > 0)"));
         snapshot.put("heapMemoryByGen", querySeriesByLabel(
                 "jvm_memory_used_bytes{area=\"heap\"}", "id"));
-        snapshot.put("qpsLast1m", queryScalar(
-                "rate(http_server_requests_seconds_count[1m])"));
+        // 排除 /actuator/prometheus 抓取请求带来的 QPS 基线污染（约 4 次/分钟 ≈ 0.067 QPS），
+        // 否则空闲系统永远看不到 qps=0，假死检测被静默屏蔽。
+        // 不直接写 {uri!="..."}：URI.create 会把 %21(!) 规范化为字面量 !，与后续 %3D(=) 组合后
+        // Prometheus 报 "unexpected character after '!' inside braces"。改用总速率减去 actuator 速率，
+        // 两条子查询都只用 =（编码路径已验证可用）。
+        double totalQps = queryScalar("sum(rate(http_server_requests_seconds_count[1m]))");
+        double actuatorQps = queryScalar(
+                "rate(http_server_requests_seconds_count{uri=\"/actuator/prometheus\"}[1m])");
+        double qps = totalQps < 0 ? -1 : Math.max(0, totalQps - Math.max(0, actuatorQps));
+        snapshot.put("qpsLast1m", qps);
+        // maxRequestSeconds 不过滤：actuator 抓取耗时通常 <0.5s，远低于 5s 慢请求阈值，基线无害；
+        // 且空闲时返回 -1（无请求可测）符合"指标缺失"语义，不触发误判。
         snapshot.put("maxRequestSeconds", queryScalar("http_server_requests_seconds_max"));
         snapshot.put("blockedThreads", queryScalar(
                 "jvm_threads_states_threads{state=\"blocked\"}"));

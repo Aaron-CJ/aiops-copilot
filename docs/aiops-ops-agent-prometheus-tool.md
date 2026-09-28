@@ -32,6 +32,22 @@
 
 复用 `deepseekChatClient` 会把巡检专属的 system prompt 和工具 schema 注入到所有对话调用里，污染 `AiChatController`、`ChatController` 等场景的 token 消耗。新建专用 Bean 隔离职责。
 
+### 自指监控的口径处理（2026-09-28 修复）
+
+系统用同一个 Prometheus 既暴露自身指标又供巡检查询（自指结构）。Prometheus 每 15s 抓取
+`/actuator/prometheus` 本身会在 `http_server_requests_seconds` 留下样本，给巡检 QPS 引入
+≈0.067 的恒定基线污染——后果不只是数字不准：**空闲系统永远看不到 qps=0**，"qps==0 且
+cpu>=0 → 应用假死"的兜底判定被静默屏蔽。
+
+`queryFixedMetrics()` 的 QPS 查询因此排除自指流量。**注意不能直接写 `{uri!="/actuator/prometheus"}`**：
+`URI.create` 会把 `%21`（`!`）规范化为字面量 `!`，但保留 `%3D`（`=`），Prometheus 收到后报
+`unexpected character after '!' inside braces`。实际方案是 Java 侧减法：
+`sum(rate(http_server_requests_seconds_count[1m])) - rate(http_server_requests_seconds_count{uri="/actuator/prometheus"}[1m])`，
+两条子查询都只用 `=`（编码路径已验证可用），`totalQps<0` 时保留 -1 哨兵语义。
+maxRequestSeconds 不过滤：actuator 抓取耗时通常 <0.5s，远低于 5s 慢请求阈值，基线无害。
+被动模式 `queryMetric(promql)` 由模型自由构造表达式，不做强制过滤（人机对话场景基线无害，
+且系统提示词的示例本身即教学用途）。
+
 ## 验证
 
 0. **编译通过**：`.\gradlew.bat compileJava`
