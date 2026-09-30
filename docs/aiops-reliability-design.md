@@ -1,7 +1,9 @@
 # 事件状态机、降级与深度诊断设计
 
 > 配套白皮书 §4.1（双模型路由 + 可靠性增强）、§4.2/4.3（异步深度诊断与升级路由）与 §5.1（事件生命周期管理）的详细设计文档。
-> 本文档的实现已通过 108 个单元测试（2026-09-23 clean test 全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
+> 本文档的实现已通过 109 个测试（108 单测 + 1 集成，2026-09-23 clean test 全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
+>
+> 阅读路线：**§1** 讲两条硬约束（告警不刷屏、LLM 挂了巡检不能停）与 AI 漏报兜底，**§2** 事件状态机与指纹去重，**§3** Ollama 降级与阈值兜底，**§4** 单元与端到端验证，**§5** 审计日志，**§6** 异步深度诊断与升级路由全链路。
 
 ## 1. 设计背景
 
@@ -13,6 +15,8 @@
 补充约束：**AI 漏报兜底**——模型可能误判 normal（例如 qwen3:8b 关闭思考链后对复合故障识别有盲区），代码层必须在关键指标严重超阈值时强改 warning/critical，不依赖 AI 的正确性。
 
 ## 2. 事件状态机与去重
+
+> 同一持续性故障会被反复"发现"——状态机负责把它压成"NEW 1 次 + 心跳 N 次 + RESOLVED 1 次"。
 
 ### 2.1 状态机定义
 
@@ -65,6 +69,8 @@ fingerprint = 异常级别 + "|" + 指标特征串
 每次状态更新都新建 `Incident` 实例（所有字段 final），保证 `ConcurrentHashMap` 读写的内存可见性。`consecutiveNormalRounds` 计数通过新建实例递增，不暴露 setter，避免外部意外修改。
 
 ## 3. Ollama 降级与阈值兜底
+
+> LLM 是核心决策组件，但不是唯一手段。本章五条防线：超时保护、降级路径、阈值兜底、AI 漏报兜底、失效显式告警。
 
 ### 3.1 LLM 超时保护
 
@@ -134,6 +140,8 @@ Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标�
 
 ## 4. 验证
 
+> 两层验证：单测锁定状态机与阈值规则，端到端日志验证真实 Ollama 故障下的去重与降级行为。
+
 ### 4.1 单元测试
 
 [IncidentStoreTest](../src/test/java/com/aiops/aiopscopilot/service/IncidentStoreTest.java) 覆盖 15 个用例：
@@ -171,6 +179,8 @@ Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标�
 
 ## 5. 审计日志
 
+> 审计日志独立于业务日志，记录"AI 为什么这么判"的完整证据链，Agent 自身无写接口、不可篡改。
+
 ### 5.1 设计原则
 
 [AuditLogger](../src/main/java/com/aiops/aiopscopilot/common/audit/AuditLogger.java) 独立于业务日志，落盘到 `logs/aiops-audit.log`（[logback-spring.xml](../src/main/resources/logback-spring.xml) 配置按天轮转、保留 30 天、200MB/文件、5GB 总上限、gzip 压缩）。
@@ -196,6 +206,8 @@ Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标�
 审计链闭合保证：每条 `巡检|START` 都有对应的 `巡检|END`——解析失败记 `status=parse_error`（降级路径为 `degraded_parse_error`）、指标拉取/兜底全失败记 `status=error`，不会出现只有 START 的悬空轮次。
 
 ## 6. 异步深度诊断与升级路由（白皮书 4.2/4.3）
+
+> 同步等不起 r1 的分钟级推理——本章用"任务队列 + 轮询"把等待从请求线程移走：6.1 讲动机，6.2 数据流，6.3 参数，6.4 升级规则，6.5 深度 Prompt，6.6 审计事件，6.7 渠道边界，6.8 测试覆盖。
 
 ### 6.1 为什么必须异步
 
@@ -278,18 +290,53 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 
 ### 6.8 测试覆盖
 
-| 测试类 | 用例数 | 关键验证 |
-|--------|--------|---------|
-| DiagnosisServiceTest | 16 | 同指纹 PENDING/RUNNING 在途防抖、窗口内终态防抖与窗口过期放行、不同指纹放行、队列满拒绝自动与手动任务、get 查询、worker 成功流转 SUCCEEDED 且 prompt 含五段要素/不可信数据/人工审批声明、模型异常流转 FAILED 且 worker 继续消费下一条、**15 分钟硬超时按注入阈值（200ms）快速 FAILED 且 error 标明硬超时、cancel(true) 中断挂死调用后 worker 继续消费**、手动提交绕防抖、终态淘汰到上限且不误删在途任务、start/stop 生命周期 |
-| EscalationRuleTest | 17 | critical+写建议→critical_write、warning 含写词不升级、**否定词修饰不算写建议（"无需重启""不建议重启或回滚"）且跨小句不传染（"不要慌，建议重启"仍算）**、持续 5 分钟整（>=）→persistent、4分59秒不升级、NEW 旧 firstSeen 不走 persistent、ACTIVE critical 写建议超时落到 persistent、critical_write 优先级压过 low、severity 大小写不敏感、中英文写关键词与空串、low→low_confidence、persistent 优先级高于 low、medium/HIGH 不误触发 |
-| OpsSchedulerEscalationWiringTest | 12 | 反射调 handleInspectionResult/handleDegraded：首轮失败不升级、连续 2 轮失败恰好一次 PARSE_FAIL 且 note 带原始输出、升级后计数归零、成功轮重置计数、原始输出截断 1000 字符、degraded 路径永不升级（parse_fail 与 **critical+写建议两条路径都验**）、**连续 3 轮降级 → LLM_UNAVAILABLE 告警 report 一次、后续降级走心跳且降级 normal 轮不 RESOLVED**、critical 写建议→CRITICAL_WRITE 指纹含 BLOCKED=2、normal+low→LOW_CONFIDENCE、缺 confidence 默认 medium 不升级、同指纹第二轮走心跳不升级 |
-| SnapshotCollectorTest | 2 | BLOCKED=0 不调 detectDeadlock 且快照无诊断字段；BLOCKED>0 挂死锁诊断结果 |
-| DiagnosisControllerTest | 7 | POST 成功 200 返回 PENDING 视图、空白 message 归一化 null、非空白 trim、队列满 503、GET 存在返回终态视图、不存在 404、FAILED 视图带 error |
-| ApiTokenAuthFilterTest | 8 | MockHttpServletRequest 纯单测：无凭据/错 token→401 且不放行，Bearer（scheme 大小写不敏感、值首尾空白容忍）、X-API-Key、?token= 三种方式放行，空 Bearer 值→401 |
-| KnowledgeIngesterTest | 8 | 标题提取纯函数：标准标题提取并剥离正文、无标题兜底文件名、文首空行跳过、英文冒号与 trim、单/双引号标题拒绝、空内容兜底；ingest 接线（mock VectorStore + 真实语料）：新旧 source 双删、切片继承标题 source、标题不入正文 |
-| OpsSchedulerExtractJsonTest | 9 | 反射测 extractJson：纯 JSON 透传、```json/```围栏剥离、只有开头围栏、</think> 残留剥离、思考段+围栏组合、null→空串、散文原样返回（不做花括号扫描）、围栏后空白 trim |
-| PrometheusToolTest | 7 | 反射测 parseValue：小数/整数/科学计数法正常解析，NaN（大小写）/空串/脏字符串/null 统一 -1 哨兵（全系统"查询失败"契约） |
-| 其余 | 22 | IncidentStoreTest 15（指纹/状态机/反射兜底）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）+ AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准，非断言型回归） |
+各测试类的用例数与关键验证维度如下（超长验证维度用列表展开，避免表格单元格过长）：
 
-> 合计 **108** 个用例（2026-09-23，clean test 全绿；除 contextLoads 需 Milvus 外均不依赖任何外部服务）。除 contextLoads 外全部是不起容器的纯单测（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法，见 .trae/learning-guide.md 测试章节）。
+| 测试类 | 用例数 |
+|--------|--------|
+| [DiagnosisServiceTest](../src/test/java/com/aiops/aiopscopilot/service/diagnosis/DiagnosisServiceTest.java) | 16 |
+| [EscalationRuleTest](../src/test/java/com/aiops/aiopscopilot/service/EscalationRuleTest.java) | 17 |
+| [OpsSchedulerEscalationWiringTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerEscalationWiringTest.java) | 12 |
+| [SnapshotCollectorTest](../src/test/java/com/aiops/aiopscopilot/service/SnapshotCollectorTest.java) | 2 |
+| [DiagnosisControllerTest](../src/test/java/com/aiops/aiopscopilot/controller/DiagnosisControllerTest.java) | 7 |
+| [ApiTokenAuthFilterTest](../src/test/java/com/aiops/aiopscopilot/common/security/ApiTokenAuthFilterTest.java) | 9 |
+| [KnowledgeIngesterTest](../src/test/java/com/aiops/aiopscopilot/service/KnowledgeIngesterTest.java) | 8 |
+| [OpsSchedulerExtractJsonTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerExtractJsonTest.java) | 9 |
+| [PrometheusToolTest](../src/test/java/com/aiops/aiopscopilot/tool/PrometheusToolTest.java) | 7 |
+| 其余（详见学习文档 14.1 测试地图） | 22 |
+
+**各测试类关键验证维度**：
+
+- **DiagnosisServiceTest（16 个）**
+  - 同指纹 PENDING/RUNNING 在途防抖、窗口内终态防抖与窗口过期放行、不同指纹放行
+  - 队列满时自动与手动任务均被拒绝
+  - 15 分钟硬超时按注入阈值（200ms）快速 FAILED 且 error 标明硬超时；`cancel(true)` 中断挂死调用后 worker 继续消费
+  - 手动提交绕防抖；终态淘汰到上限且不误删在途任务；start/stop 生命周期
+  - 成功流转 SUCCEEDED 时 prompt 含五段要素、不可信数据声明、人工审批声明
+  - 模型异常流转 FAILED 后 worker 继续消费下一条；get 查询
+
+- **EscalationRuleTest（17 个）**
+  - 优先级与边界：critical+写建议→`critical_write`（最高）；持续 5 分钟整（>=）→`persistent`，4 分 59 秒不升级
+  - 否定词修饰不算写建议（"无需重启""不建议重启或回滚"），且跨小句不传染（"不要慌，建议重启"仍算）
+  - NEW 旧 firstSeen 不走 persistent；ACTIVE critical 写建议超时落到 persistent；critical_write 优先级压过 low
+  - severity 大小写不敏感；中英文写关键词与空串
+  - low→`low_confidence`；persistent 优先级高于 low；medium/HIGH 不误触发
+
+- **OpsSchedulerEscalationWiringTest（12 个）**
+  - 反射调 `handleInspectionResult`/`handleDegraded`：首轮失败不升级、连续 2 轮失败恰好一次 `parse_fail` 且 note 带原始输出
+  - 升级后计数归零、成功轮重置计数、原始输出截断 1000 字符
+  - 降级路径永不升级（`parse_fail` 与 critical+写建议两条路径都验）
+  - 连续 3 轮降级 → `LLM_UNAVAILABLE` 告警 report 一次、后续降级走心跳、降级 normal 轮不 RESOLVED
+  - critical 写建议 → `CRITICAL_WRITE` 指纹含 `BLOCKED=2`；normal+low→`LOW_CONFIDENCE`；缺 confidence 默认 medium 不升级
+  - 同指纹第二轮走心跳不升级
+
+- **SnapshotCollectorTest（2 个）**：BLOCKED=0 不调 `detectDeadlock` 且快照无诊断字段；BLOCKED>0 挂死锁诊断结果
+- **DiagnosisControllerTest（7 个）**：POST 成功 200 返回 PENDING 视图、空白 message 归一化 null、非空白 trim、队列满 503、GET 存在返回终态视图、不存在 404、FAILED 视图带 error
+- **ApiTokenAuthFilterTest（9 个）**：MockHttpServletRequest 纯单测——无凭据/错 token→401 且不放行；Bearer（scheme 大小写不敏感、值首尾空白容忍）、X-API-Key、`?token=`（仅两个 SSE 端点放行，普通端点拒绝）三种方式；空 Bearer 值→401
+- **KnowledgeIngesterTest（8 个）**：标题提取纯函数（标准标题提取并剥离正文、无标题兜底文件名、文首空行跳过、英文冒号与 trim、单/双引号标题拒绝、空内容兜底）；ingest 接线（mock VectorStore + 真实语料）：新旧 source 双删、切片继承标题 source、标题不入正文
+- **OpsSchedulerExtractJsonTest（9 个）**：反射测 `extractJson`——纯 JSON 透传、```json/```围栏剥离、只有开头围栏、`</think>` 残留剥离、思考段+围栏组合、null→空串、散文原样返回（不做花括号扫描）、围栏后空白 trim
+- **PrometheusToolTest（7 个）**：反射测 `parseValue`——小数/整数/科学计数法正常解析，NaN（大小写）/空串/脏字符串/null 统一 -1 哨兵（全系统"查询失败"契约）
+- **其余 22 个**：IncidentStoreTest 15（指纹/状态机/反射兜底）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）+ AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准，非断言型回归）
+
+> 合计 **109** 个用例（108 单测 + 1 集成；2026-09-23，clean test 全绿；除 contextLoads 需 Milvus 外均不依赖任何外部服务）。除 contextLoads 外全部是不起容器的纯单测（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法，见 .trae/learning-guide.md 测试章节）。
 

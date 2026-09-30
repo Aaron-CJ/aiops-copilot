@@ -5,6 +5,8 @@
 > **确定性层**（指纹构造 / 阈值兜底 / 状态机流转）由 [FaultInjectionEvaluationTest](../src/test/java/com/aiops/aiopscopilot/service/FaultInjectionEvaluationTest.java) 在 CI 自动执行；
 > **LLM 根因层**（根因关键词命中、语义推理质量）需真实 Ollama，按本文第 3 节流程人工执行。
 > 每次变更 prompt / 模型 / 工具后先跑确定性层，绿了再做 LLM 层回归。
+>
+> 阅读路线：**§1** 注入端点速查，**§2** 五类用例表，**§3** LLM 层手动回归流程，**§4** 度量口径，**§5** 已知边界。
 
 ## 1. 注入端点（仅 dev profile 装配）
 
@@ -53,8 +55,14 @@
 
 ## 5. 已知边界（如实标注，避免误判"失败"）
 
-1. **虚拟线程死锁不可观测（JDK 21.0.12 实测）**：`ThreadMXBean.findDeadlockedThreads()` 与 `Thread.getAllStackTraces()`（Micrometer 线程状态指标数据源）均不覆盖虚拟线程——虚拟请求线程上的 synchronized/ReentrantLock 死锁对 blockedThreads 指标与 detectDeadlock() 完全不可见（本注入器最初直接在请求线程上加锁时实测发现，连续多轮巡检误报 normal）。因此死锁注入刻意把锁竞争放在平台 worker 线程上（对应真实系统 @Async/批处理 worker 池形态）。虚拟线程挂起需引入活跃请求数等业务信号识别，已列入白皮书路线图。
+以下 5 条是本手册的"防误读"条款——遇到这些现象时不要误判为系统失败，而是系统边界：
+
+1. **虚拟线程死锁不可观测（JDK 21.0.12 实测）**：`ThreadMXBean.findDeadlockedThreads()` 与 `Thread.getAllStackTraces()`（Micrometer 线程状态指标数据源）均不覆盖虚拟线程——**虚拟请求线程上的 synchronized/ReentrantLock 死锁对 blockedThreads 指标与 detectDeadlock() 完全不可见**（本注入器最初直接在请求线程上加锁时实测发现，连续多轮巡检误报 normal）。因此死锁注入刻意把锁竞争放在平台 worker 线程上（对应真实系统 @Async/批处理 worker 池形态）。虚拟线程挂起需引入活跃请求数等业务信号识别，已列入白皮书路线图。
+
 2. **空闲即 QPS=0（实测修正）**：actuator 抓取请求**不计入** `http_server_requests`——本机实测空闲应用（仅 Prometheus 抓取）`qpsLast1m=0.0`。因此无业务流量完成时 ZERO_QPS 特征即成立（F1 实测指纹含 `ZERO_QPS;`）；但 LLM 路径下模型对空闲 QPS=0 多判 normal，且 AI 漏报兜底刻意不覆盖 QPS（强改会对空闲系统每轮误报假死）——ZERO_QPS 进指纹发生在模型判异常或降级路径时。真正的全进程假死（连 actuator 都不响应）表现为指标整体变 -1（Prometheus 抓取失败），依赖 LLM 按"-1=查询失败"规则忽略，属于更深的观测边界。
+
 3. **F4 无代码兜底是设计而非缺陷**：纯延迟属于语义信号，硬阈值会产生大量误报（定时任务同样推高 max）——这正是白皮书"语义判断替代静态阈值"要解决的场景。
+
 4. **死锁只能重启恢复**：`/api/debug/reset` 不含死锁（死锁线程无法代码释放）。
+
 5. **LLM 层结果随模型版本波动**：每次更换模型 / prompt 后必须重跑并归档（建议把结果表追加为本文新小节）。
