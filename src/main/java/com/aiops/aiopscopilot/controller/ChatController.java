@@ -1,6 +1,7 @@
 package com.aiops.aiopscopilot.controller;
 
 import com.aiops.aiopscopilot.common.result.Result;
+import com.aiops.aiopscopilot.common.web.RequestLimits;
 import com.aiops.aiopscopilot.service.MetricsService;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.beans.factory.annotation.Value;
@@ -31,6 +32,7 @@ public class ChatController {
 
     @GetMapping
     public Result<String> chat(@RequestParam String message) {
+        RequestLimits.checkMessage(message);
         long start = System.currentTimeMillis();
         String reply = deepseekChatClient.prompt().user(message).call().content();
         metricsService.recordAIRequest(reasoningModel, "/api/chat", System.currentTimeMillis() - start);

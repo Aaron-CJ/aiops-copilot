@@ -1,6 +1,7 @@
 package com.aiops.aiopscopilot.controller;
 
 import com.aiops.aiopscopilot.common.result.Result;
+import com.aiops.aiopscopilot.common.web.RequestLimits;
 import com.aiops.aiopscopilot.service.MetricsService;
 import com.aiops.aiopscopilot.tool.PrometheusTool;
 import com.aiops.aiopscopilot.tool.SystemHealthTools;
@@ -45,6 +46,7 @@ public class AgentController {
      */
     @GetMapping("/ops")
     public Result<String> ops(@RequestParam(defaultValue = "请检查当前服务器健康状态，包括 CPU 占用率和内存剩余，并给出简短评估。") String message) {
+        RequestLimits.checkMessage(message);
         // opsAgentClient 已通过 defaultSystem 注入 AIOps 人设，这里不再重复 .system()
         long start = System.currentTimeMillis();
         String reply = opsAgentClient.prompt()

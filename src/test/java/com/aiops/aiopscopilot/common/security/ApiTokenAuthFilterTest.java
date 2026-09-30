@@ -83,12 +83,27 @@ class ApiTokenAuthFilterTest {
         pass(request);
     }
 
-    /** 浏览器 EventSource 无法自定义请求头时的兜底：?token= 查询参数 */
+    /**
+     * 浏览器 EventSource 无法自定义请求头时的兜底：?token= 查询参数。
+     * 仅对 SSE 端点放行——token 进 URL 会泄漏到访问日志/浏览器历史，不对全部 API 开放。
+     */
     @Test
-    void queryParamTokenPasses() throws Exception {
+    void queryParamTokenPassesOnSsePathOnly() throws Exception {
+        MockHttpServletRequest sseRequest = new MockHttpServletRequest("GET", "/api/ai/rag/stream");
+        sseRequest.setParameter("token", TOKEN);
+        pass(sseRequest);
+
+        MockHttpServletRequest otherSse = new MockHttpServletRequest("GET", "/api/ai/chat");
+        otherSse.setParameter("token", TOKEN);
+        pass(otherSse);
+    }
+
+    /** 非 SSE 端点的 ?token= 一律拒绝：防止 token 经 URL 泄漏面扩大 */
+    @Test
+    void queryParamTokenRejectedOnNonSsePath() throws Exception {
         MockHttpServletRequest request = request();
         request.setParameter("token", TOKEN);
-        pass(request);
+        blocked(request);
     }
 
     /** Bearer 值首尾空白应被容忍（手工拼头的常见失误） */

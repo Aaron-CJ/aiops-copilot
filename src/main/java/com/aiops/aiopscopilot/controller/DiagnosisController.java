@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.aiops.aiopscopilot.common.result.Result;
 import com.aiops.aiopscopilot.common.result.ResultCode;
+import com.aiops.aiopscopilot.common.web.RequestLimits;
 import com.aiops.aiopscopilot.service.diagnosis.DiagnosisService;
 import com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask;
 
@@ -37,6 +38,7 @@ public class DiagnosisController {
      */
     @PostMapping
     public Result<TaskView> submit(@RequestParam(required = false, defaultValue = "") String message) {
+        RequestLimits.checkMessage(message);
         DiagnosisTask task = diagnosisService.submitManual(message.isBlank() ? null : message.trim());
         if (task == null) {
             return Result.fail(ResultCode.SERVICE_UNAVAILABLE, "深度诊断队列已满，请稍后再试");

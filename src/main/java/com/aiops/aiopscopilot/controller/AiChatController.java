@@ -9,6 +9,7 @@ import java.util.stream.Collectors;
 
 import jakarta.servlet.http.HttpServletResponse;
 import com.aiops.aiopscopilot.common.result.Result;
+import com.aiops.aiopscopilot.common.web.RequestLimits;
 import com.aiops.aiopscopilot.service.KnowledgeIngester;
 import com.aiops.aiopscopilot.service.MetricsService;
 import org.springframework.ai.chat.client.ChatClient;
@@ -86,6 +87,7 @@ public class AiChatController {
      */
     @GetMapping(value = "/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<String> chat(@RequestParam String message, HttpServletResponse response) {
+        RequestLimits.checkMessage(message);
         // SseEmitter 会把 Content-Type 硬编码为不带 charset 的 text/event-stream，
         // 提前声明响应编码可让 Tomcat 提交响应头时追加 charset=UTF-8，避免浏览器乱码
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
@@ -141,6 +143,7 @@ public class AiChatController {
      */
     @GetMapping("/rag")
     public Result<String> rag(@RequestParam String message) {
+        RequestLimits.checkMessage(message);
         RAGContext context = retrieveContext(message);
         if (context == null) {
             return Result.success("知识库中未找到相关信息");
@@ -165,6 +168,7 @@ public class AiChatController {
      */
     @GetMapping(value = "/rag/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<String> ragStream(@RequestParam String message, HttpServletResponse response) {
+        RequestLimits.checkMessage(message);
         // 同 /chat：提前声明编码，让响应头携带 charset=UTF-8，避免浏览器中文乱码
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
         RAGContext context = retrieveContext(message);
