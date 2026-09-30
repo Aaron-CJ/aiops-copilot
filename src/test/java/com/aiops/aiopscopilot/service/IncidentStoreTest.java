@@ -211,8 +211,13 @@ class IncidentStoreTest {
         assertTrue(json.contains("\"status\":\"warning\""), "CPU>90% 应降级为 warning: " + json);
     }
 
+    /**
+     * QPS=0 假死判定带连续确认（ZERO_QPS_CONFIRM_ROUNDS=2）：第 1 轮 warning"待确认"，
+     * 同一实例连续第 2 轮仍 QPS=0 才升级 critical——空闲/低流量系统单轮 QPS=0 是常态，
+     * 旧的单轮 critical 会造成每分钟误报。
+     */
     @Test
-    void fallback_qpsZero_returnsCritical() throws Exception {
+    void fallback_qpsZero_requiresTwoConsecutiveRoundsForCritical() throws Exception {
         OpsScheduler sched = newSchedulerWithNulls();
         Map<String, Object> snap = new HashMap<>();
         snap.put("cpuUsage", 0.5);
@@ -221,9 +226,13 @@ class IncidentStoreTest {
         snap.put("qpsLast1m", 0.0);
         snap.put("gcCountLast5m", 0.0);
 
-        String json = invokeFallback(sched, snap);
+        String firstRound = invokeFallback(sched, snap);
+        assertTrue(firstRound.contains("\"status\":\"warning\""),
+                "第 1 轮 QPS=0 应判 warning 待确认: " + firstRound);
 
-        assertTrue(json.contains("\"status\":\"critical\""), "QPS=0 应降级为 critical（应用假死）: " + json);
+        String secondRound = invokeFallback(sched, snap);
+        assertTrue(secondRound.contains("\"status\":\"critical\""),
+                "连续第 2 轮 QPS=0 应升级 critical（应用假死）: " + secondRound);
     }
 
     @Test

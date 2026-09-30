@@ -2,7 +2,9 @@ package com.aiops.aiopscopilot.tool;
 
 import java.net.URI;
 import java.net.URLEncoder;
+import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -11,6 +13,7 @@ import java.util.Map;
 
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 
@@ -37,9 +40,18 @@ public class PrometheusTool {
     private final String prometheusBaseUrl;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    /** 依赖探测超时：连接 2s / 读取 5s。RestClient 默认请求工厂不设超时，Prometheus 挂起时
+     *  queryScalar 会永久阻塞，@Scheduled 单线程调度器 + fixedDelay 语义下后续巡检全部静默停摆——
+     *  巡检核心循环不允许存在无超时的外部调用（与 HealthCheckController 同一套防线） */
+    private static final Duration PROM_CONNECT_TIMEOUT = Duration.ofSeconds(2);
+    private static final Duration PROM_READ_TIMEOUT = Duration.ofSeconds(5);
+
     public PrometheusTool(@Value("${aiops.prometheus.base-url:http://localhost:9090}") String baseUrl) {
         this.prometheusBaseUrl = baseUrl;
-        this.restClient = RestClient.builder().baseUrl(baseUrl).build();
+        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(
+                HttpClient.newBuilder().connectTimeout(PROM_CONNECT_TIMEOUT).build());
+        factory.setReadTimeout(PROM_READ_TIMEOUT);
+        this.restClient = RestClient.builder().baseUrl(baseUrl).requestFactory(factory).build();
     }
 
     /**

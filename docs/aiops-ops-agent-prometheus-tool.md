@@ -28,6 +28,8 @@
 
 这个分工对应"Agent 主动出击"——巡检不是让模型当查询工，而是让模型当"判断工"。
 
+两条路径共用同一个 RestClient 实例，显式配置**连接 2s / 读取 5s 超时**（`JdkClientHttpRequestFactory`，2026-09-30 评审补充）：RestClient 默认请求工厂不设超时，Prometheus 挂起（接受连接但不响应）时查询会永久阻塞，`@Scheduled` 单线程 + fixedDelay 语义下整个巡检链路静默停摆。快照 8 条串行查询最坏约 40s，仍在 60s 巡检预算内；模型自主查询单次最多 5s 超时返回 -1 哨兵，Agent 拿到 -1 会如实告知"指标不可用"而非无限等待。
+
 ### 新建 opsAgentClient Bean（而非复用 deepseekChatClient）
 
 复用 `deepseekChatClient` 会把巡检专属的 system prompt 和工具 schema 注入到所有对话调用里，污染 `AiChatController`、`ChatController` 等场景的 token 消耗。新建专用 Bean 隔离职责。

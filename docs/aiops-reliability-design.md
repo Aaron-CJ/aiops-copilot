@@ -80,6 +80,8 @@ return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);  // 45 秒
 - 跑在专用虚拟线程执行器 `llmCalls` 上而非公共 ForkJoinPool：超时后 `future.cancel(true)` 并不能中断底层 HTTP，被占死的应是廉价虚拟线程，不能落在 commonPool 上饿死其他并行计算
 - 超时后本周期走降级路径，Ollama 侧推理自行结束
 
+**指标拉取超时（2026-09-30 评审补充）**：超时防线不只在 LLM 侧——[PrometheusTool](../src/main/java/com/aiops/aiopscopilot/tool/PrometheusTool.java) 的 RestClient 显式配置连接 2s / 读取 5s 超时（`JdkClientHttpRequestFactory`）。RestClient 默认请求工厂不设超时，Prometheus 挂起（接受连接但不响应）时 `queryScalar` 会永久阻塞；`@Scheduled` 单线程调度器 + fixedDelay 语义下，后续巡检全部静默停摆，监控系统自身悄然死亡且无任何告警。快照 8 条串行查询的最坏耗时因此有上界（约 40s），仍在 60s 巡检预算内（2026-09-30 实测：黑洞地址下诊断提交 40.1s 返回、巡检周期 69s 正常轮转，修复前该场景无限挂死）。
+
 ### 3.2 降级路径
 
 [OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L206)：
@@ -98,15 +100,18 @@ catch (TimeoutException | Exception):
 
 ### 3.3 阈值兜底规则
 
-[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L258) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
+[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L268) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
 
 | 条件 | 级别 | rootCause 标注 |
 |------|------|---------------|
 | `blockedThreads > 0` | critical | `代码级兜底：存在 BLOCKED 线程（N），疑似死锁` |
 | `heapUsage > 0.95` | critical | `代码级兜底：堆内存使用率 X > 0.95` |
-| `qpsLast1m == 0 且 cpu >= 0` | critical | `代码级兜底：QPS=0 但端口在，应用可能假死` |
+| `qpsLast1m == 0 且 cpu >= 0`（连续第 1 轮） | warning | `QPS=0（第 1 轮，待确认——可能为空闲低流量，连续 2 轮后升级 critical）` |
+| `qpsLast1m == 0 且 cpu >= 0`（连续 ≥ 2 轮） | critical | `QPS=0 已持续 N 轮，端口在但无请求，应用可能假死` |
 | `gcCountLast5m > 10` | warning（若未达 critical） | `代码级兜底：5min GC 次数 N > 10，疑似内存泄漏` |
 | `cpuUsage > 0.90` | warning（若未达 critical） | `代码级兜底：CPU 使用率 X > 0.90` |
+
+**QPS=0 连续确认（ZERO_QPS_CONFIRM_ROUNDS=2）**：actuator 抓取已从 QPS 基线中扣除，合法空闲/低流量系统每轮 QPS 都是严格 0——单轮 critical 会让空闲环境每分钟误报一次"应用假死"（告警狼来了效应）。改为连续 2 轮确认：第 1 轮 warning"待确认"，QPS 恢复 >0 即归零计数，连续 2 轮才升级 critical。真实假死只多等 1 分钟确认，换来空闲系统零误报（2026-09-30 实测：空闲系统兜底第 1 轮正确输出 warning 待确认）。AI 路径的巡检 Prompt 同步增加了"CPU 极低且无其他异常时 QPS=0 可能为合法空闲"的边界说明，双路径口径一致。兜底输出改用 ObjectMapper 序列化（原手写 JSON 拼接的转义器漏控制字符，已删除）。
 
 ### 3.4 AI 漏报兜底（applyThresholdBackstop）
 
@@ -137,7 +142,7 @@ Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标�
 |------|--------|---------|
 | IncidentStore 状态机 | 5 | NEW→ACTIVE→RESOLVED 流转、复发重新置 NEW、normal 重置计数 |
 | AI 漏报兜底 | 5 | normal+CPU>90→warning、normal+BLOCKED>0→critical、normal+堆>95→critical、warning 不变、全正常不变 |
-| Ollama 降级路径 | 5 | BLOCKED>0→critical、CPU>90→warning、QPS=0→critical、GC>10→warning、全正常→normal |
+| Ollama 降级路径 | 5 | BLOCKED>0→critical、CPU>90→warning、QPS=0 连续 2 轮才 critical（首轮 warning 待确认）、GC>10→warning、全正常→normal |
 
 另见 [故障注入评估手册](aiops-fault-injection-eval.md)：F1-F5 五类故障场景（死锁/内存泄漏/假死/慢接口/瞬时尖峰）的确定性回归由 [FaultInjectionEvaluationTest](../src/test/java/com/aiops/aiopscopilot/service/FaultInjectionEvaluationTest.java) 覆盖，验证指纹构造、阈值兜底与尖峰抑制的状态机行为。
 

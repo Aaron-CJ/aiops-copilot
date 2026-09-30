@@ -60,8 +60,13 @@ class FaultInjectionEvaluationTest {
         assertTrue(json.contains("内存泄漏"), "GC 频繁应指向内存泄漏: " + json);
     }
 
-    // ==================== F3 应用假死：QPS=0 但指标可拉取 ====================
+    // ==================== F3 应用假死：QPS=0 但指标可拉取（连续 2 轮确认） ====================
 
+    /**
+     * QPS=0 假死判定带连续确认（ZERO_QPS_CONFIRM_ROUNDS=2）：空闲/低流量系统单轮 QPS=0
+     * 是常态，第 1 轮只判 warning"待确认"，同一实例连续第 2 轮仍 QPS=0 才升级 critical。
+     * 用同一个 OpsScheduler 实例连调两次验证计数器语义。
+     */
     @Test
     void f3_appStall_zeroQps_fingerprintAndFallback() throws Exception {
         Map<String, Object> snap = baseSnapshot();
@@ -70,9 +75,23 @@ class FaultInjectionEvaluationTest {
         assertEquals("CRITICAL|ZERO_QPS;", IncidentStore.fingerprintOf("critical", snap),
                 "QPS=0 应产出 ZERO_QPS 特征指纹");
 
-        String json = invokeFallback(snap);
-        assertTrue(json.contains("\"status\":\"critical\""), "QPS=0 兜底应判 critical: " + json);
-        assertTrue(json.contains("假死"), "根因应含假死关键词: " + json);
+        OpsScheduler sched = newScheduler();
+        String firstRound = invokeFallback(sched, snap);
+        assertTrue(firstRound.contains("\"status\":\"warning\""),
+                "第 1 轮 QPS=0 应判 warning 待确认（空闲低流量单轮 QPS=0 是常态）: " + firstRound);
+        assertTrue(firstRound.contains("待确认"), "第 1 轮根因应含待确认说明: " + firstRound);
+
+        String secondRound = invokeFallback(sched, snap);
+        assertTrue(secondRound.contains("\"status\":\"critical\""),
+                "连续第 2 轮 QPS=0 应升级 critical 假死: " + secondRound);
+        assertTrue(secondRound.contains("假死"), "根因应含假死关键词: " + secondRound);
+
+        // QPS 恢复后计数必须归零：下一轮 QPS=0 重新从 warning 起步
+        Map<String, Object> recovered = baseSnapshot();
+        invokeFallback(sched, recovered);
+        String reconfirm = invokeFallback(sched, snap);
+        assertTrue(reconfirm.contains("\"status\":\"warning\""),
+                "QPS 恢复一轮后计数应归零，再次 QPS=0 从 warning 重新确认: " + reconfirm);
     }
 
     // ==================== F4 慢接口：纯延迟无硬阈值（设计边界） ====================
@@ -132,8 +151,15 @@ class FaultInjectionEvaluationTest {
     }
 
     /** 与 IncidentStoreTest 相同的手法：依赖为 null 的 OpsScheduler 只测纯逻辑私有方法。 */
+    private OpsScheduler newScheduler() {
+        return new OpsScheduler(null, null, null, null, null, new AuditLogger(), null);
+    }
+
     private String invokeFallback(Map<String, Object> snap) throws Exception {
-        OpsScheduler sched = new OpsScheduler(null, null, null, null, null, new AuditLogger(), null);
+        return invokeFallback(newScheduler(), snap);
+    }
+
+    private String invokeFallback(OpsScheduler sched, Map<String, Object> snap) throws Exception {
         Method m = OpsScheduler.class.getDeclaredMethod("fallbackByThreshold", Map.class);
         m.setAccessible(true);
         return (String) m.invoke(sched, snap);
