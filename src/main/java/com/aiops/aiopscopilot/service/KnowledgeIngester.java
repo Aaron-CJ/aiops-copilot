@@ -48,11 +48,14 @@ public class KnowledgeIngester {
 
     /**
      * 执行一次知识库摄入（标题约定见类注释），重复调用幂等。
+     * <p>
+     * 加 synchronized：两个并发 ingest 会交错执行 delete→add，可能写入两份重复片段
+     * （期间检索会重复召回）。摄入是低频运维操作，方法级锁即可，无需更细的并发控制。
      *
      * @return 实际写入 Milvus 的文本片段数量
      * @throws IOException 知识文件读取失败，或标题含引号（无法安全构建 Milvus 过滤表达式）
      */
-    public int ingest() throws IOException {
+    public synchronized int ingest() throws IOException {
         Resource resource = new ClassPathResource(FALLBACK_SOURCE);
         String rawContent;
         // StreamUtils.copyToString 不会关闭流，必须 try-with-resources，否则每次摄入泄漏一个文件句柄

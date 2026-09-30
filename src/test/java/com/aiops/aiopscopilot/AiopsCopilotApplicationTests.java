@@ -1,5 +1,6 @@
 package com.aiops.aiopscopilot;
 
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
@@ -13,8 +14,12 @@ import org.springframework.boot.test.context.SpringBootTest;
  * （2026-09-23 实测：Connection refused localhost:19530 → DEADLINE_EXCEEDED）；
  * Ollama 侧是惰性 WebClient，离线不影响装配。跑本测试前先启动
  * docker/milvus-standalone-docker-compose.yml。真正调用模型/向量库的端到端验证仍需手动起齐依赖。
+ * <p>
+ * 标记为 integration：依赖本地 Milvus 基础设施，不进 gradle test 默认集，
+ * 用 {@code gradle integrationTest} 单独触发（见 build.gradle 测试分层）。
  */
 @SpringBootTest
+@Tag("integration")
 class AiopsCopilotApplicationTests {
 
     @Test

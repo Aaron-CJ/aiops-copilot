@@ -212,18 +212,23 @@ public class DiagnosisService {
         return last != null && Duration.between(last, Instant.now()).toMinutes() < dedupWindowMinutes;
     }
 
-    /** 终态任务超过上限时淘汰 finishedAt 最旧的 */
+    /**
+     * 内存纪律：终态任务超过上限时淘汰 finishedAt 最旧的；
+     * 顺带清理防抖窗口外的 lastEscalatedAt 旧条目——该 Map 只增不减，
+     * 指纹空间实际有界，但与 tasks 上限治理保持同一纪律，长期运行不积沙成塔。
+     */
     private void pruneFinished() {
         long finishedCount = tasks.values().stream()
                 .filter(t -> t.finishedAt() != null).count();
-        if (finishedCount <= maxFinishedTasks) {
-            return;
+        if (finishedCount > maxFinishedTasks) {
+            tasks.values().stream()
+                    .filter(t -> t.finishedAt() != null)
+                    .sorted(Comparator.comparing(DiagnosisTask::finishedAt))
+                    .limit(finishedCount - maxFinishedTasks)
+                    .forEach(t -> tasks.remove(t.taskId()));
         }
-        tasks.values().stream()
-                .filter(t -> t.finishedAt() != null)
-                .sorted(Comparator.comparing(DiagnosisTask::finishedAt))
-                .limit(finishedCount - maxFinishedTasks)
-                .forEach(t -> tasks.remove(t.taskId()));
+        lastEscalatedAt.entrySet().removeIf(e ->
+                Duration.between(e.getValue(), Instant.now()).toMinutes() >= dedupWindowMinutes);
     }
 
     private void workerLoop() {

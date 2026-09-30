@@ -15,10 +15,11 @@ java {
 }
 
 repositories {
-	// 本地 Maven 缓存（可选）：仅当该目录存在时启用，其他机器/CI 自动跳过，不破坏可移植性
-	def localM2 = file('D:/m2/repository')
-	if (localM2.exists()) {
-		maven { url = localM2.toURI() }
+	// 本地 Maven 缓存（可选）：通过 ~/.gradle/gradle.properties 配置 localM2=<路径> 启用，
+	// 未配置或目录不存在时自动跳过，机器无关、不破坏可移植性
+	def localM2Path = providers.gradleProperty('localM2').orNull
+	if (localM2Path != null && file(localM2Path).exists()) {
+		maven { url = file(localM2Path).toURI() }
 	}
 	maven { url = 'https://maven.aliyun.com/repository/public' }
 	mavenCentral()
@@ -55,6 +56,21 @@ tasks.named('compileTestJava') {
 	options.compilerArgs += ['-Xlint:deprecation']
 }
 
+// 测试分层：test 只跑单元测试（秒级反馈，无基础设施依赖）；
+// 集成测试（@Tag("integration")，需 Milvus/Ollama 在位）用 gradle integrationTest 单独触发
 tasks.named('test') {
-	useJUnitPlatform()
+	useJUnitPlatform {
+		excludeTags 'integration'
+	}
+}
+
+tasks.register('integrationTest', Test) {
+	description = '运行 @Tag("integration") 的集成测试（需本地 Milvus/Ollama 基础设施）'
+	group = 'verification'
+	useJUnitPlatform {
+		includeTags 'integration'
+	}
+	testClassesDirs = sourceSets.test.output.classesDirs
+	classpath = sourceSets.test.runtimeClasspath
+	shouldRunAfter tasks.named('test')
 }
