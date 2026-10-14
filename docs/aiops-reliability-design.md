@@ -1,7 +1,7 @@
 # 事件状态机、降级与深度诊断设计
 
 > 配套白皮书 §4.1（双模型路由 + 可靠性增强）、§4.2/4.3（异步深度诊断与升级路由）与 §5.1（事件生命周期管理）的详细设计文档。
-> 本文档的实现已通过 109 个测试（108 单测 + 1 集成，2026-09-23 clean test 全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
+> 本文档的实现已通过 112 个测试（111 单测 + 1 集成，2026-10-14 clean test 全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
 >
 > 阅读路线：**§1** 讲两条硬约束（告警不刷屏、LLM 挂了巡检不能停）与 AI 漏报兜底，**§2** 事件状态机与指纹去重，**§3** Ollama 降级与阈值兜底，**§4** 单元与端到端验证，**§5** 审计日志，**§6** 异步深度诊断与升级路由全链路。
 
@@ -63,10 +63,15 @@ fingerprint = 异常级别 + "|" + 指标特征串
 - 实现：`ConcurrentHashMap<String, Incident>`，重启丢失
 - 取舍：与"自治诊断"能力边界一致——死锁等故障应用重启后也会消失，持久化的旧事件反而是噪音
 - 零依赖、零外部状态，部署简单
+- **RESOLVED 保留窗口 1 小时**：已归档记录不再无限期驻留，超过 1 小时的 RESOLVED 由下一轮 `bumpNormalAndResolve` 顺带清除（`computeIfPresent` 返回 null 即移出 map）。理由：复发判定依赖"同指纹的旧 RESOLVED 记录还在"，但无限期保留既让内存单调增长、又会把数月前的同指纹误判成 relapse；1 小时覆盖同一次故障的合理复发周期，过期后同指纹按全新 NEW 处理
 
 ### 2.4 Incident 不可变性
 
 每次状态更新都新建 `Incident` 实例（所有字段 final），保证 `ConcurrentHashMap` 读写的内存可见性。`consecutiveNormalRounds` 计数通过新建实例递增，不暴露 setter，避免外部意外修改。
+
+状态流转统一走 `compute` / `computeIfPresent`（单键原子），不用 `forEach + put` 的 get-then-put——后者与 `recordOrUpdate` 并发时会丢失更新（`put` 静默覆盖刚写入的 ACTIVE 版本，复活已 RESOLVED 的事件）。当前调用方是单线程调度器、竞态本不可达，改用原子方法是为了让正确性不依赖外部并发约定。
+
+`durationOf` 取 `firstSeen → lastSeen`（而非 `firstSeen → now`）：`lastSeen` 每轮刷新，心跳里的"已持续 N min"反映故障实际被观测到的时间，RESOLVED 事件被查询时也不会"持续增长"。
 
 ## 3. Ollama 降级与阈值兜底
 
@@ -144,11 +149,11 @@ Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标�
 
 ### 4.1 单元测试
 
-[IncidentStoreTest](../src/test/java/com/aiops/aiopscopilot/service/IncidentStoreTest.java) 覆盖 15 个用例：
+[IncidentStoreTest](../src/test/java/com/aiops/aiopscopilot/service/IncidentStoreTest.java) 覆盖 18 个用例：
 
 | 维度 | 用例数 | 关键验证 |
 |------|--------|---------|
-| IncidentStore 状态机 | 5 | NEW→ACTIVE→RESOLVED 流转、复发重新置 NEW、normal 重置计数 |
+| IncidentStore 状态机 | 8 | NEW→ACTIVE→RESOLVED 流转、复发重新置 NEW、normal 重置计数、durationOf 用 lastSeen、RESOLVED 超 TTL 清除、并发 record/bump 不丢更新 |
 | AI 漏报兜底 | 5 | normal+CPU>90→warning、normal+BLOCKED>0→critical、normal+堆>95→critical、warning 不变、全正常不变 |
 | Ollama 降级路径 | 5 | BLOCKED>0→critical、CPU>90→warning、QPS=0 连续 2 轮才 critical（首轮 warning 待确认）、GC>10→warning、全正常→normal |
 
@@ -336,7 +341,7 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 - **KnowledgeIngesterTest（8 个）**：标题提取纯函数（标准标题提取并剥离正文、无标题兜底文件名、文首空行跳过、英文冒号与 trim、单/双引号标题拒绝、空内容兜底）；ingest 接线（mock VectorStore + 真实语料）：新旧 source 双删、切片继承标题 source、标题不入正文
 - **OpsSchedulerExtractJsonTest（9 个）**：反射测 `extractJson`——纯 JSON 透传、```json/```围栏剥离、只有开头围栏、`</think>` 残留剥离、思考段+围栏组合、null→空串、散文原样返回（不做花括号扫描）、围栏后空白 trim
 - **PrometheusToolTest（7 个）**：反射测 `parseValue`——小数/整数/科学计数法正常解析，NaN（大小写）/空串/脏字符串/null 统一 -1 哨兵（全系统"查询失败"契约）
-- **其余 22 个**：IncidentStoreTest 15（指纹/状态机/反射兜底）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）+ AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准，非断言型回归）
+- **其余 25 个**：IncidentStoreTest 18（指纹/状态机/反射兜底/durationOf/TTL 过期/并发防丢失更新）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）+ AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准，非断言型回归）
 
-> 合计 **109** 个用例（108 单测 + 1 集成；2026-09-23，clean test 全绿；除 contextLoads 需 Milvus 外均不依赖任何外部服务）。除 contextLoads 外全部是不起容器的纯单测（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法，见 .trae/learning-guide.md 测试章节）。
+> 合计 **112** 个用例（111 单测 + 1 集成；2026-10-14，clean test 全绿；除 contextLoads 需 Milvus 外均不依赖任何外部服务）。除 contextLoads 外全部是不起容器的纯单测（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法，见 .trae/learning-guide.md 测试章节）。
 

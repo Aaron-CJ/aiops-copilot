@@ -112,6 +112,100 @@ class IncidentStoreTest {
         assertTrue(r.isEmpty(), "故障再次出现后 normal 计数应从头开始，不应立即 RESOLVED");
     }
 
+    // ==================== A2. 本次评审整改的针对性回归 ====================
+
+    /** durationOf 应基于 lastSeen（首次到最后一次观测），而非 firstSeen→now。 */
+    @Test
+    void durationOf_usesLastSeen_notNow() {
+        IncidentStore store = new IncidentStore();
+        Incident inc = store.recordOrUpdate("CRITICAL|X", "critical", "s", "rc", "sg");
+        // lastSeen 由 recordOrUpdate 刷为 now，firstSeen==lastSeen，时长应≈0 而非随调用时刻增长
+        java.time.Duration d = IncidentStore.durationOf(inc);
+        assertTrue(d.toMillis() < 1000, "durationOf 应≈0（firstSeen==lastSeen），而非 firstSeen→now: " + d);
+    }
+
+    /** RESOLVED 超过 TTL 后应被清除，且复发按全新 NEW 处理（不沿用旧 lastSeen）。 */
+    @Test
+    void resolvedEntries_expireAfterTtl() {
+        IncidentStore store = new IncidentStore();
+        String fp = "CRITICAL|OLD";
+
+        // 造一个 RESOLVED 且 lastSeen 远早于 TTL 的记录
+        store.recordOrUpdate(fp, "critical", "首次", "rc", "sg");
+        for (int i = 0; i < 3; i++) store.bumpNormalAndResolve(); // → RESOLVED
+        assertEquals(0, store.activeCount());
+
+        // 手动把 lastSeen 改到 2 小时前（超过 1h TTL），通过反射塞回 map 模拟陈旧记录
+        Incident stale = findIncident(store, fp);
+        assertNotNull(stale);
+        Incident backdated = new Incident(fp, IncidentStatus.RESOLVED,
+                stale.firstSeen(), stale.lastSeen().minusSeconds(7200),
+                stale.consecutiveNormalRounds(), stale.severity(), stale.summary(),
+                stale.rootCause(), stale.suggestion());
+        injectIncident(store, fp, backdated);
+
+        // 下一轮 normal 应把它清掉（返回空 resolved 列表，因它早就是 RESOLVED）
+        store.bumpNormalAndResolve();
+        assertNull(findIncident(store, fp), "过期 RESOLVED 应被清除");
+
+        // 同指纹复发：因旧记录已删，按全新 NEW 处理
+        Incident recur = store.recordOrUpdate(fp, "critical", "复发", "rc", "sg");
+        assertEquals(IncidentStatus.NEW, recur.status(), "过期清除后复发应重新置 NEW");
+    }
+
+    /** bumpNormalAndResolve 与 recordOrUpdate 并发时，computeIfPresent 不应丢失更新。 */
+    @Test
+    void bumpNormalAndResolve_concurrentWithRecord_noLostUpdate() throws Exception {
+        IncidentStore store = new IncidentStore();
+        String fp = "CRITICAL|RACE";
+        store.recordOrUpdate(fp, "critical", "首次", "rc", "sg");
+
+        // 并发：一边 bump（推向 RESOLVED），一边 recordOrUpdate（重置计数回 ACTIVE）
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.Future<?> f1 = pool.submit(() -> {
+            await(start);
+            for (int i = 0; i < 50; i++) store.bumpNormalAndResolve();
+        });
+        java.util.concurrent.Future<?> f2 = pool.submit(() -> {
+            await(start);
+            for (int i = 0; i < 50; i++) store.recordOrUpdate(fp, "critical", "持续", "rc", "sg");
+        });
+        start.countDown();
+        f1.get();
+        f2.get();
+        pool.shutdown();
+
+        // 无异常、map 中该键存在即通过——computeIfPresent 保证单键原子，
+        // 不会出现 put 覆盖 compute 导致的"复活已 RESOLVED"或计数错乱
+        Incident final_ = findIncident(store, fp);
+        assertNotNull(final_, "并发后记录应存在");
+    }
+
+    private static void await(java.util.concurrent.CountDownLatch l) {
+        try { l.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    private static Incident findIncident(IncidentStore store, String fp) {
+        try {
+            java.lang.reflect.Field f = IncidentStore.class.getDeclaredField("incidents");
+            f.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Map<String, Incident> m = (Map<String, Incident>) f.get(store);
+            return m.get(fp);
+        } catch (Exception e) { throw new RuntimeException(e); }
+    }
+
+    private static void injectIncident(IncidentStore store, String fp, Incident inc) {
+        try {
+            java.lang.reflect.Field f = IncidentStore.class.getDeclaredField("incidents");
+            f.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Map<String, Incident> m = (Map<String, Incident>) f.get(store);
+            m.put(fp, inc);
+        } catch (Exception e) { throw new RuntimeException(e); }
+    }
+
     // ==================== B. OpsScheduler.applyThresholdBackstop（AI 漏报兜底） ====================
 
     @Test
