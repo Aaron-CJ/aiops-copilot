@@ -15,7 +15,8 @@ RUN chmod +x gradlew
 COPY src/ ./src/
 
 # 构建 fat JAR（跳过测试，测试在 CI 流水线单独跑）
-# mavenLocal 指向 Windows 路径，在容器内不存在，gradle 自动 fallback 到 mavenCentral
+# 容器内没有 ~/.gradle/gradle.properties，build.gradle 的 localM2 本地仓库开关自动跳过，
+# 依赖走 aliyun / mavenCentral
 RUN ./gradlew bootJar -x test --no-daemon
 
 # ===== 阶段 2：运行 JRE 镜像 =====

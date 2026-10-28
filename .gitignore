@@ -39,6 +39,9 @@ out/
 ### Trae IDE 工作目录（本地会话/缓存，不入库；正式文档放 docs/） ###
 .trae/
 
+### Continue 插件本地缓存（agents/会话历史，不入库） ###
+.continue/
+
 ### 审计日志与运行时日志（logback-spring.xml 写 logs/，不入库） ###
 logs/
 

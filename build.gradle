@@ -15,8 +15,9 @@ java {
 }
 
 repositories {
-	// 本地 Maven 缓存（可选）：通过 ~/.gradle/gradle.properties 配置 localM2=<路径> 启用，
-	// 未配置或目录不存在时自动跳过，机器无关、不破坏可移植性
+	// 本地 Maven 仓库（可选）：在 Gradle 用户目录的 gradle.properties（GRADLE_USER_HOME 下，
+	// 默认 ~/.gradle；Gradle 属性读取顺序：命令行 -P > 该文件 > 项目 gradle.properties）
+	// 配置 localM2=<本地仓库路径> 启用；未配置或目录不存在时自动跳过，机器无关、不破坏可移植性
 	def localM2Path = providers.gradleProperty('localM2').orNull
 	if (localM2Path != null && file(localM2Path).exists()) {
 		maven { url = file(localM2Path).toURI() }
@@ -35,7 +36,7 @@ dependencies {
 	// 供 /actuator/prometheus 输出。版本由 Spring Boot BOM 统一管理
 	implementation 'io.micrometer:micrometer-registry-prometheus'
 
-	implementation platform("org.springframework.ai:spring-ai-bom:2.0.0")
+	implementation platform("org.springframework.ai:spring-ai-bom:2.0.2")
 
 	// Spring AI 2.0 Ollama Starter
 	implementation 'org.springframework.ai:spring-ai-starter-model-ollama'
