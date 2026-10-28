@@ -47,7 +47,7 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 - **做法**：废弃 Alertmanager。Spring `@Scheduled(fixedDelay=60_000, initialDelay=30_000)` 每分钟触发一次巡检。
   - 用 `fixedDelay` 而非 `fixedRate`：巡检含 qwen3:8b 关闭思考链的 LLM 推理，fixedDelay 保证"结束→开始"间隔 60 秒，任务不堆积；
   - 巡检模型输出**严格 JSON**（status/summary/rootCause/suggestion/confidence，confidence 为 4.3 新增字段、缺省按 medium 处理），调度器程序化解析；解析失败时原文（截断 1000 字符）落 ERROR 日志，**调度器必须比模型更稳定**。
-- **二级诊断（证据链增强）** ✅：当快照中 `blockedThreads > 0`，调度器主动调用 `SystemHealthTools.detectDeadlock()`（基于 `ThreadMXBean.findDeadlockedThreads()`，微秒级、零外部进程、同时覆盖 synchronized 与 ReentrantLock），把死锁线程名、等待锁、锁持有者、栈顶 8 帧注入快照。
+- **二级诊断（证据链增强）** ✅：当快照中 `blockedThreads > 0`，调度器主动调用 `SystemHealthTools.detectDeadlock()`（基于 `ThreadMXBean.findDeadlockedThreads()`，微秒级、零外部进程、同时覆盖 synchronized 与 ReentrantLock），把死锁线程名、等待锁、锁持有者与栈帧注入快照。
   - 实战效果：根因分析从泛泛的"可能是死锁或资源竞争"升级为"确认为死锁，由 DebugController 两个接口以相反锁序互相持锁所致（lockOrderA/lockOrderB）"，精确定位到具体代码行号。
   - 已知边界（JDK 21.0.12 实测）：虚拟线程等待 monitor/ReentrantLock 时，`findDeadlockedThreads()` 不检出、`Thread.getAllStackTraces()`（Micrometer 线程状态指标数据源）也不包含虚拟线程——虚拟请求线程上的死锁对 blockedThreads 指标与二级诊断均不可观测，需依赖业务信号（活跃请求数持续不落）识别，已列入路线图。
 - **语义级推理的价值**：Agent 结合多维指标（CPU + GC + QPS + 线程状态）交叉推理，可从源头过滤瞬时尖峰误报；该过滤能力依赖快照维度设计，并通过第三章的评估体系持续度量。
@@ -98,10 +98,10 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 > 用真实故障换来的约束：qwen2.5:14b 因 16G 内存门槛加载失败；r1 因思考链过长拖垮同步链路。任何模型上生产前必须先过延迟与内存预算。
 
 **（b）可靠性增强（已实现，五条防线）**
-- **LLM 超时保护**：[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L186) 用 `CompletableFuture.get(45s)` 包裹 LLM 调用，Ollama 卡死时不会拖垮巡检调度
+- **LLM 超时保护**：[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 用 `CompletableFuture.get(45s)` 包裹 LLM 调用，Ollama 卡死时不会拖垮巡检调度
 - **指标拉取超时**：[PrometheusTool](../src/main/java/com/aiops/aiopscopilot/tool/PrometheusTool.java) 的 RestClient 显式配置连接 2s/读取 5s 超时——Prometheus 挂起时巡检不会永久阻塞（`@Scheduled` 单线程 + fixedDelay 语义下无超时等于整个巡检链路静默停摆）；实测黑洞场景快照 40s 超时返回、巡检正常轮转
-- **阈值降级路径**：[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L268) 在 LLM 超时/异常时基于硬阈值（CPU>0.90 / BLOCKED>0 / 堆>0.95 / QPS=0 连续 2 轮确认 / GC>10）做兜底判断，仍接入状态机去重；QPS=0 首轮仅 warning"待确认"，连续 2 轮才升级 critical 假死（空闲/低流量系统单轮 QPS=0 是常态，单轮 critical 会让空闲环境每分钟误报）
-- **AI 漏报兜底**：[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L519) 在 AI 判 normal 但 BLOCKED>0 / 堆>0.95 / CPU>90% 时强改 critical/critical/warning，rootCause 标注"代码级兜底"（刻意不覆盖 QPS=0：空闲系统 QPS 天然为 0，强改会每轮误报假死）
+- **阈值降级路径**：[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 在 LLM 超时/异常时基于硬阈值（CPU>0.90 / BLOCKED>0 / 堆>0.95 / QPS=0 连续 2 轮确认 / GC>10）做兜底判断，仍接入状态机去重；QPS=0 首轮仅 warning"待确认"，连续 2 轮才升级 critical 假死（空闲/低流量系统单轮 QPS=0 是常态，单轮 critical 会让空闲环境每分钟误报）
+- **AI 漏报兜底**：[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 在 AI 判 normal 但 BLOCKED>0 / 堆>0.95 / CPU>90% 时强改 critical/critical/warning，rootCause 标注"代码级兜底"（刻意不覆盖 QPS=0：空闲系统 QPS 天然为 0，强改会每轮误报假死）
 - **LLM 失效显式告警**：连续 3 轮降级 → 登记独立指纹 `CRITICAL|LLM_UNAVAILABLE;` 的 critical 事件（**监控者自身失效必须可见**，不能只留每轮一条 WARN），复用状态机心跳/归档，恢复后随连续 3 轮 normal 自动 RESOLVED。配套规则：降级轮的 normal 只是硬阈值判断（语义置信度低），不用于归档任何事件——否则 Ollama 长挂时事件会被"降级 normal"轮反复错误归档
 
 #### 4.2 深度推理通道：异步任务架构 ✅
@@ -138,7 +138,7 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 
 **问题**：每分钟巡检一次，同一持续性故障会被重复"发现"和报告 60 次/小时——告警风暴与 Token 浪费的根源。
 
-**已实现机制**（[IncidentStore](../src/main/java/com/aiops/aiopscopilot/service/IncidentStore.java) + [OpsScheduler.handleInspectionResult](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L360)）：
+**已实现机制**（[IncidentStore](../src/main/java/com/aiops/aiopscopilot/service/IncidentStore.java) + [OpsScheduler.handleInspectionResult](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java)）：
 
 **（a）故障指纹基于指标快照特征**（`fingerprint = 异常级别 + "|" + 指标特征串`，如 `CRITICAL|DEADLOCK;BLOCKED=2;`）+ 内存级状态机：
 

@@ -27,9 +27,9 @@ NEW（首次发现）→ ACTIVE（持续中，第二周期起改走 INFO 心跳�
 
 | 状态 | 触发条件 | 输出 |
 |------|----------|------|
-| NEW | 当前轮 fingerprint 在 store 中不存在或上次已 RESOLVED | [OpsAlertReporter.report](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L53) — ERROR + ASCII 框线全量报告 |
-| ACTIVE | 同 fingerprint 仍在（未 RESOLVED） | [OpsAlertReporter.logHeartbeat](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L77) — INFO 一行心跳 |
-| RESOLVED | 连续 3 轮巡检 normal 后自动标记 | [OpsAlertReporter.logResolved](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java#L90) — INFO 一行恢复 |
+| NEW | 当前轮 fingerprint 在 store 中不存在或上次已 RESOLVED | [OpsAlertReporter.report](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java) — ERROR + ASCII 框线全量报告 |
+| ACTIVE | 同 fingerprint 仍在（未 RESOLVED） | [OpsAlertReporter.logHeartbeat](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java) — INFO 一行心跳 |
+| RESOLVED | 连续 3 轮巡检 normal 后自动标记 | [OpsAlertReporter.logResolved](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java) — INFO 一行恢复 |
 
 ### 2.2 Fingerprint 构造（基于指标快照，不基于 LLM 文本）
 
@@ -39,7 +39,7 @@ NEW（首次发现）→ ACTIVE（持续中，第二周期起改走 INFO 心跳�
 >
 > 指标特征是稳定的：只要同一类指标异常（如 BLOCKED>0），无论 LLM 怎么描述都会合并到同一指纹。
 
-实现：[IncidentStore.fingerprintOf](../src/main/java/com/aiops/aiopscopilot/service/IncidentStore.java#L127)
+实现：[IncidentStore.fingerprintOf](../src/main/java/com/aiops/aiopscopilot/service/IncidentStore.java)
 
 ```
 fingerprint = 异常级别 + "|" + 指标特征串
@@ -79,7 +79,7 @@ fingerprint = 异常级别 + "|" + 指标特征串
 
 ### 3.1 LLM 超时保护
 
-[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L186)：
+[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java)：
 
 ```java
 CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
@@ -95,7 +95,7 @@ return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);  // 45 秒
 
 ### 3.2 降级路径
 
-[OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L206)：
+[OpsScheduler.handleDegraded](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java)：
 
 ```
 catch (TimeoutException | Exception):
@@ -105,13 +105,13 @@ catch (TimeoutException | Exception):
     recordInspection("error", ...)   // 指标拉取也失败，本轮完全失败
 ```
 
-降级路径调用 [fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L258) 构造与 LLM 等价的 JSON，再走 `handleInspectionResult(..., degraded=true)`：
+降级路径调用 [fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 构造与 LLM 等价的 JSON，再走 `handleInspectionResult(..., degraded=true)`：
 - 仍接入 IncidentStore 状态机去重（同一指纹的 NEW→ACTIVE 流转不变）
 - `metricsService.recordInspection("degraded_" + status, ...)` 标记降级路径，便于运维区分
 
 ### 3.3 阈值兜底规则
 
-[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L268) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
+[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
 
 | 条件 | 级别 | rootCause 标注 |
 |------|------|---------------|
@@ -126,7 +126,7 @@ catch (TimeoutException | Exception):
 
 ### 3.4 AI 漏报兜底（applyThresholdBackstop）
 
-[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java#L519) 在 LLM 路径（非降级）中额外加一道兜底：
+[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 在 LLM 路径（非降级）中额外加一道兜底：
 
 - **仅当 AI 判 normal 时介入**（warning/critical 不改判，避免覆盖 AI 的更细致判断）
 - normal 但 `blockedThreads > 0` → 强改 critical
@@ -308,7 +308,7 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 | [KnowledgeIngesterTest](../src/test/java/com/aiops/aiopscopilot/service/KnowledgeIngesterTest.java) | 8 |
 | [OpsSchedulerExtractJsonTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerExtractJsonTest.java) | 9 |
 | [PrometheusToolTest](../src/test/java/com/aiops/aiopscopilot/tool/PrometheusToolTest.java) | 7 |
-| 其余（详见学习文档 14.1 测试地图） | 22 |
+| 其余 4 类（明细见下方列表） | 25 |
 
 **各测试类关键验证维度**：
 
@@ -343,5 +343,5 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 - **PrometheusToolTest（7 个）**：反射测 `parseValue`——小数/整数/科学计数法正常解析，NaN（大小写）/空串/脏字符串/null 统一 -1 哨兵（全系统"查询失败"契约）
 - **其余 25 个**：IncidentStoreTest 18（指纹/状态机/反射兜底/durationOf/TTL 过期/并发防丢失更新）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）+ AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准，非断言型回归）
 
-> 合计 **112** 个用例（111 单测 + 1 集成；2026-10-14，clean test 全绿；除 contextLoads 需 Milvus 外均不依赖任何外部服务）。除 contextLoads 外全部是不起容器的纯单测（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法，见 .trae/learning-guide.md 测试章节）。
+> 合计 **112** 个用例（111 单测 + 1 集成；2026-10-14，clean test 全绿；除 contextLoads 需 Milvus 外均不依赖任何外部服务）。除 contextLoads 外全部是不起容器的纯单测（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法）。
 
