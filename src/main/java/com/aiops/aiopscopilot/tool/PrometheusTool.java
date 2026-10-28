@@ -105,8 +105,7 @@ public class PrometheusTool {
         // 缺失该键会让所有堆阈值判断静默失效（读到 null → -1 → 永不触发）
         snapshot.put("heapUsage", queryScalar(
                 "sum(jvm_memory_used_bytes{area=\"heap\"}) / sum(jvm_memory_max_bytes{area=\"heap\"} > 0)"));
-        snapshot.put("heapMemoryByGen", querySeriesByLabel(
-                "jvm_memory_used_bytes{area=\"heap\"}", "id"));
+        snapshot.put("heapMemoryByGen", queryHeapMemoryByGen());
         // 排除 /actuator/prometheus 抓取请求带来的 QPS 基线污染（约 4 次/分钟 ≈ 0.067 QPS），
         // 否则空闲系统永远看不到 qps=0，假死检测被静默屏蔽。
         // 不直接写 {uri!="..."}：URI.create 会把 %21(!) 规范化为字面量 !，与后续 %3D(=) 组合后
@@ -143,17 +142,17 @@ public class PrometheusTool {
         return -1;
     }
 
-    /** 按标签分组查询：返回 {labelValue: value} 映射，用于堆内存分代等多维指标 */
-    private Map<String, Double> querySeriesByLabel(String promql, String labelKey) {
+    /** 堆内存按代分组查询：返回 {代名: 已用字节}（Eden/Survivor/Old），作为 Prompt 的分代明细 */
+    private Map<String, Double> queryHeapMemoryByGen() {
         Map<String, Double> result = new LinkedHashMap<>();
         try {
-            JsonNode dataResult = queryRaw(promql);
+            JsonNode dataResult = queryRaw("jvm_memory_used_bytes{area=\"heap\"}");
             if (dataResult.isArray()) {
                 for (JsonNode item : dataResult) {
-                    String labelValue = item.path("metric").path(labelKey).asString("unknown");
+                    String gen = item.path("metric").path("id").asString("unknown");
                     JsonNode value = item.path("value");
                     if (value.isArray() && value.size() >= 2) {
-                        result.put(labelValue, parseValue(value.get(1).asString()));
+                        result.put(gen, parseValue(value.get(1).asString()));
                     }
                 }
             }
@@ -177,7 +176,7 @@ public class PrometheusTool {
      * <p>
      * URLEncoder 会把空格编成 +，query 参数的标准解码规则会把 + 还原为空格，对 PromQL 语法无影响。
      */
-    private JsonNode queryRaw(String promql) throws Exception {
+    private JsonNode queryRaw(String promql) {
         String url = prometheusBaseUrl + "/api/v1/query?query="
                 + URLEncoder.encode(promql, StandardCharsets.UTF_8);
         String body = restClient.get()

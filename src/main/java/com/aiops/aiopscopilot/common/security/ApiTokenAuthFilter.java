@@ -5,6 +5,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Set;
 
+import org.jspecify.annotations.NullMarked;
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.web.filter.OncePerRequestFilter;
@@ -34,7 +36,11 @@ import tools.jackson.databind.ObjectMapper;
  * 查询参数 {@code ?token=<token>} 仅对两个 SSE 端点放行（浏览器 EventSource 无法自定义
  * 请求头）：token 出现在 URL 中会进入网关/访问日志与浏览器历史，属于降级携带方式，
  * 最小权限原则下不应对全部 /api/* 开放。
+ * <p>
+ * 类级 {@code @NullMarked}（JSpecify）：本类的参数与返回值均不接受 null，
+ * 与 Spring Framework 7 基类的空安全标注对齐。
  */
+@NullMarked
 public class ApiTokenAuthFilter extends OncePerRequestFilter {
 
     private static final Logger log = LoggerFactory.getLogger(ApiTokenAuthFilter.class);
@@ -70,7 +76,7 @@ public class ApiTokenAuthFilter extends OncePerRequestFilter {
      * 依次从 Bearer 头、X-API-Key 头提取；?token= 查询参数仅对 SSE 端点放行，
      * 其余端点返回 null（防止 token 经 URL 泄漏到访问日志/浏览器历史/Referer）。
      */
-    private String extractToken(HttpServletRequest request) {
+    private @Nullable String extractToken(HttpServletRequest request) {
         String auth = request.getHeader("Authorization");
         // RFC 7235 规定 auth-scheme 大小写不敏感（"bearer"/"Bearer" 均应接受）
         if (auth != null && auth.regionMatches(true, 0, BEARER_PREFIX, 0, BEARER_PREFIX.length())) {

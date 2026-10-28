@@ -7,8 +7,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
@@ -25,14 +23,13 @@ import org.springframework.stereotype.Component;
  * 改由 {@link OpsAlertReporter#logHeartbeat} 输出 INFO 级心跳。
  * <p>
  * Fingerprint 构造见 {@link #fingerprintOf}：{@code status + "|" + 指标特征串}
- * （如 {@code CRITICAL|DEADLOCK;BLOCKED=2;}），基于指标快照而非 LLM 文本，
- * 粒度既不会把"CPU 高 + 不同根因描述"合并为同一事件，
- * 也不细到用完整指标快照 hash（会过度去重、漏报同类故障）。
+ * （如 {@code CRITICAL|DEADLOCK;BLOCKED=2;}），基于指标快照而非 LLM 文本：
+ * 同一故障即使 LLM 每轮措辞不同、数值轻微波动，也稳定合并为同一事件；
+ * 又不细到用完整指标快照做 hash——那会把 0.91/0.92 这类微波动拆成不同事件，
+ * 同一故障反复 NEW、去重失效。
  */
 @Component
 public class IncidentStore {
-
-    private static final Logger log = LoggerFactory.getLogger(IncidentStore.class);
 
     /** 连续 normal 轮数达到该阈值后，将 ACTIVE 事件标记为 RESOLVED */
     static final int RESOLVED_NORMAL_ROUNDS = 3;

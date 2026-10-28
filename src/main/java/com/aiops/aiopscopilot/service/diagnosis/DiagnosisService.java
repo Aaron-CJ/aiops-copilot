@@ -290,7 +290,13 @@ public class DiagnosisService {
             return future.get(workerTimeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException te) {
             future.cancel(true);
-            throw new RuntimeException("深度推理超过 " + workerTimeout.toMinutes() + " 分钟硬超时", te);
+            // workerTimeout 是可注入 Duration：生产以整分钟为单位注入（上方 @Autowired 构造器），
+            // 亚分钟值只可能来自直接注入 Duration 的构造器（测试路径）。toMinutes() 会把亚分钟值
+            // 截断为 0，消息将显示"超过 0 分钟"，故按实际量级选择单位。
+            String threshold = workerTimeout.toMinutes() > 0
+                    ? workerTimeout.toMinutes() + " 分钟"
+                    : workerTimeout.toMillis() + " 毫秒";
+            throw new RuntimeException("深度推理超过 " + threshold + "硬超时", te);
         } catch (InterruptedException ie) {
             future.cancel(true);
             Thread.currentThread().interrupt();

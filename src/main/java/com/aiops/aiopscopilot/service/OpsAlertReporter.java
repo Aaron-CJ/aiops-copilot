@@ -20,7 +20,7 @@ import com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask;
  *   <li>{@link #report} — 首次发现（NEW）的故障：ERROR 级 + ASCII 框线全量报告</li>
  *   <li>{@link #logHeartbeat} — 持续中（ACTIVE）的故障：INFO 级一行心跳，避免告警风暴</li>
  *   <li>{@link #logResolved} — 故障恢复（RESOLVED）：INFO 级一行，告知运维"已恢复"</li>
- *   <li>{@link #logNormal} — 巡检正常：INFO 级一行摘要</li>
+ *   <li>{@link #logNormal} — 巡检正常：INFO 级一行摘要；降级路径判定为正常时标注"降级正常"</li>
  * </ul>
  * <p>
  * 所有决策点同时写入审计日志（{@link AuditLogger}），落盘到 logs/aiops-audit.log，
@@ -99,9 +99,13 @@ public class OpsAlertReporter {
     /**
      * 巡检正常时输出 INFO 级一行摘要。
      * 设计原则：正常情况应该静默，运维同学不该被无意义日志打扰。
+     *
+     * @param degraded true 表示本轮是 LLM 不可用时的阈值兜底判定，控制台必须与 AI 正常判定区分，
+     *                 否则 Ollama 挂掉期间运维会误以为巡检仍在 AI 路径正常执行
      */
-    public void logNormal(Map<String, Object> metricsSnapshot) {
-        log.info("[OpsScheduler] 巡检完成: 正常 | CPU={} | 堆使用率={} | QPS={} | 最大延迟={} | BLOCKED={} | GC(5m)={}",
+    public void logNormal(Map<String, Object> metricsSnapshot, boolean degraded) {
+        log.info("[OpsScheduler] 巡检完成: {} | CPU={} | 堆使用率={} | QPS={} | 最大延迟={} | BLOCKED={} | GC(5m)={}",
+                degraded ? "降级正常（LLM 不可用，仅硬阈值判断）" : "正常",
                 metricsSnapshot.get("cpuUsage"),
                 metricsSnapshot.get("heapUsage"),
                 metricsSnapshot.get("qpsLast1m"),

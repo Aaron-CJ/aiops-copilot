@@ -78,7 +78,7 @@ class IncidentStoreTest {
         // 第 3 轮 normal：达到阈值 → RESOLVED
         List<Incident> r3 = store.bumpNormalAndResolve();
         assertEquals(1, r3.size(), "第 3 轮 normal 应有 1 个 RESOLVED");
-        assertEquals(IncidentStatus.RESOLVED, r3.get(0).status());
+        assertEquals(IncidentStatus.RESOLVED, r3.getFirst().status());
         assertEquals(0, store.activeCount(), "RESOLVED 后 activeCount 应为 0");
     }
 
@@ -112,7 +112,7 @@ class IncidentStoreTest {
         assertTrue(r.isEmpty(), "故障再次出现后 normal 计数应从头开始，不应立即 RESOLVED");
     }
 
-    // ==================== A2. 本次评审整改的针对性回归 ====================
+    // ==================== A2. IncidentStore 加固行为：durationOf、RESOLVED TTL、并发更新 ====================
 
     /** durationOf 应基于 lastSeen（首次到最后一次观测），而非 firstSeen→now。 */
     @Test
@@ -160,21 +160,22 @@ class IncidentStoreTest {
         String fp = "CRITICAL|RACE";
         store.recordOrUpdate(fp, "critical", "首次", "rc", "sg");
 
-        // 并发：一边 bump（推向 RESOLVED），一边 recordOrUpdate（重置计数回 ACTIVE）
-        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2);
-        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.Future<?> f1 = pool.submit(() -> {
-            await(start);
-            for (int i = 0; i < 50; i++) store.bumpNormalAndResolve();
-        });
-        java.util.concurrent.Future<?> f2 = pool.submit(() -> {
-            await(start);
-            for (int i = 0; i < 50; i++) store.recordOrUpdate(fp, "critical", "持续", "rc", "sg");
-        });
-        start.countDown();
-        f1.get();
-        f2.get();
-        pool.shutdown();
+        // 并发：一边 bump（推向 RESOLVED），一边 recordOrUpdate（重置计数回 ACTIVE）。
+        // try-with-resources：close() = shutdown + 等待终止，断言失败也不会泄漏线程池
+        try (java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.Future<?> f1 = pool.submit(() -> {
+                await(start);
+                for (int i = 0; i < 50; i++) store.bumpNormalAndResolve();
+            });
+            java.util.concurrent.Future<?> f2 = pool.submit(() -> {
+                await(start);
+                for (int i = 0; i < 50; i++) store.recordOrUpdate(fp, "critical", "持续", "rc", "sg");
+            });
+            start.countDown();
+            f1.get();
+            f2.get();
+        }
 
         // 无异常、map 中该键存在即通过——computeIfPresent 保证单键原子，
         // 不会出现 put 覆盖 compute 导致的"复活已 RESOLVED"或计数错乱
@@ -371,9 +372,9 @@ class IncidentStoreTest {
 
     private String invokeBackstop(OpsScheduler sched, String status, Map<String, Object> snap) throws Exception {
         Method m = OpsScheduler.class.getDeclaredMethod(
-                "applyThresholdBackstop", String.class, Map.class, String.class);
+                "applyThresholdBackstop", String.class, Map.class);
         m.setAccessible(true);
-        return (String) m.invoke(sched, status, snap, "original RC");
+        return (String) m.invoke(sched, status, snap);
     }
 
     private String invokeFallback(OpsScheduler sched, Map<String, Object> snap) throws Exception {

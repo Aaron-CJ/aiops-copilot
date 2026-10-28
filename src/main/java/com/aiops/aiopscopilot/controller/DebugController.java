@@ -150,7 +150,7 @@ public class DebugController {
      */
     @GetMapping("/memory-leak")
     public String memoryLeak(@RequestParam(defaultValue = "100") int mb) {
-        int safeMb = Math.max(1, Math.min(mb, 1024));
+        int safeMb = Math.clamp(mb, 1, 1024);
         try {
             byte[] chunk = new byte[safeMb * 1024 * 1024];
             synchronized (retainedMemory) {
@@ -195,7 +195,7 @@ public class DebugController {
      */
     @GetMapping("/slow-request")
     public String slowRequest(@RequestParam(defaultValue = "45") int seconds) throws InterruptedException {
-        int safeSeconds = Math.max(1, Math.min(seconds, 300));
+        int safeSeconds = Math.clamp(seconds, 1, 300);
         Thread.sleep(safeSeconds * 1000L);
         return "慢请求完成，耗时 " + safeSeconds + " 秒。maxRequestSeconds 已被推高"
                 + "（约维持 2 分钟），巡检应在窗口内识别慢接口信号。";
@@ -214,7 +214,7 @@ public class DebugController {
     @GetMapping("/cpu-spike")
     public String cpuSpike(@RequestParam(defaultValue = "5") int seconds,
                            @RequestParam(defaultValue = "0") int threads) {
-        int safeSeconds = Math.max(1, Math.min(seconds, 60));
+        int safeSeconds = Math.clamp(seconds, 1, 60);
         int n = threads <= 0 ? Runtime.getRuntime().availableProcessors() : Math.min(threads, 64);
         long generation = cpuSpikeGeneration.incrementAndGet();
         long deadline = System.nanoTime() + safeSeconds * 1_000_000_000L;

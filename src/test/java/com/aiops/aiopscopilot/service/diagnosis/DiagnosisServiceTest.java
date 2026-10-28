@@ -7,6 +7,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
@@ -164,7 +165,7 @@ class DiagnosisServiceTest {
 
         // G4：Prompt 必须包含快照、trigger 中文标签、空 note 占位符、不可信数据声明、五段式要求
         assertEquals(1, capturedPrompts.size());
-        String prompt = capturedPrompts.get(0);
+        String prompt = capturedPrompts.getFirst();
         assertTrue(prompt.contains("\"cpuUsage\":0.99"), "快照应序列化进 Prompt: " + prompt);
         assertTrue(prompt.contains("同一故障持续多个巡检周期未消除"), "PERSISTENT 标签缺失");
         assertTrue(prompt.contains("（无附加说明）"), "note=null 时应有占位符");
@@ -291,7 +292,6 @@ class DiagnosisServiceTest {
 
     /** 终态任务超过上限时淘汰一批，回到上限以内 */
     @Test
-    @SuppressWarnings("unchecked")
     void finishedTasksArePrunedBeyondLimit() throws Exception {
         service = newService(null, null);
         Map<String, DiagnosisTask> store = taskStore();
@@ -314,7 +314,6 @@ class DiagnosisServiceTest {
 
     /** G6：prune 只淘汰终态任务，绝不能误删在途（PENDING/RUNNING）任务 */
     @Test
-    @SuppressWarnings("unchecked")
     void pruneNeverEvictsInFlightTasks() throws Exception {
         service = newService(null, null);
         Map<String, DiagnosisTask> store = taskStore();
@@ -383,10 +382,10 @@ class DiagnosisServiceTest {
                                       RuntimeException[] failures) {
         Deque<Object> results = new ArrayDeque<>();
         if (failures != null) {
-            for (RuntimeException f : failures) results.add(f);
+            Collections.addAll(results, failures);
         }
         if (reports != null) {
-            for (String r : reports) results.add(r);
+            Collections.addAll(results, reports);
         }
         return fakeChatClient(capturedPrompts, results);
     }

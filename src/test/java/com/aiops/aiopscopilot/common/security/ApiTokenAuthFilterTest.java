@@ -26,15 +26,14 @@ class ApiTokenAuthFilterTest {
         return new MockHttpServletRequest("GET", "/api/agent/ops");
     }
 
-    private MockHttpServletResponse pass(MockHttpServletRequest request) throws Exception {
+    private void pass(MockHttpServletRequest request) throws Exception {
         MockHttpServletResponse response = new MockHttpServletResponse();
         MockFilterChain chain = new MockFilterChain();
         filter.doFilter(request, response, chain);
         assertNotNull(chain.getRequest(), "鉴权通过时必须放行到下游");
-        return response;
     }
 
-    private MockHttpServletResponse blocked(MockHttpServletRequest request) throws Exception {
+    private void blocked(MockHttpServletRequest request) throws Exception {
         MockHttpServletResponse response = new MockHttpServletResponse();
         MockFilterChain chain = new MockFilterChain();
         filter.doFilter(request, response, chain);
@@ -42,7 +41,6 @@ class ApiTokenAuthFilterTest {
         assertEquals(401, response.getStatus());
         assertTrue(response.getContentAsString().contains("\"code\":401"),
                 "401 响应体应沿用全局 Result 结构: " + response.getContentAsString());
-        return response;
     }
 
     /** 未携带任何凭据：401 且不放行 */

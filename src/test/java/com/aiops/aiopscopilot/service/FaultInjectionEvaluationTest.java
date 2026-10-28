@@ -129,7 +129,7 @@ class FaultInjectionEvaluationTest {
         assertTrue(store.bumpNormalAndResolve().isEmpty(), "第 2 轮 normal 不应 RESOLVED");
         List<Incident> resolved = store.bumpNormalAndResolve();
         assertEquals(1, resolved.size(), "第 3 轮 normal 应 RESOLVED——尖峰不升级为持续告警");
-        assertEquals(IncidentStatus.RESOLVED, resolved.get(0).status());
+        assertEquals(IncidentStatus.RESOLVED, resolved.getFirst().status());
         assertEquals(0, store.activeCount(), "RESOLVED 后不应残留活跃事件");
     }
 

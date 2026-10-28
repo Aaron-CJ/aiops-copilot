@@ -88,8 +88,8 @@ public class AiChatController {
     @GetMapping(value = "/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<String> chat(@RequestParam String message, HttpServletResponse response) {
         RequestLimits.checkMessage(message);
-        // SseEmitter 会把 Content-Type 硬编码为不带 charset 的 text/event-stream，
-        // 提前声明响应编码可让 Tomcat 提交响应头时追加 charset=UTF-8，避免浏览器乱码
+        // SSE 响应的 Content-Type 默认不带 charset；提前声明响应编码，
+        // 让 Tomcat 提交响应头时追加 charset=UTF-8，避免浏览器中文乱码
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
         AtomicBoolean thinkingOpened = new AtomicBoolean(false);
         return deepseekChatClient.prompt()

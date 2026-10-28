@@ -185,12 +185,11 @@ public class OpsScheduler {
                 log.error("[OpsScheduler] 指标拉取也失败，本轮巡检完全失败", e);
             }
         }
-        log.info("[OpsScheduler] 巡检周期结束");
     }
 
     /**
      * 调用 LLM 并强制超时。调用跑在专用虚拟线程执行器上——超时 cancel 后底层 HTTP 不会中断，
-     * 被占死的是廉价虚拟线程而非公共 ForkJoinPool 载体；本巡检周期不再等待。
+     * 被占死的是廉价虚拟线程而非 commonPool 的平台工作线程；本巡检周期不再等待。
      */
     private String callLlmWithTimeout(String prompt) throws TimeoutException, ExecutionException, InterruptedException {
         CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
@@ -398,7 +397,7 @@ public class OpsScheduler {
             String suggestion = node.path("suggestion").asString("N/A");
 
             // AI 漏报兜底：normal 但指标严重超阈值时强改 warning/critical
-            String finalStatus = applyThresholdBackstop(status, snapshot, rootCause);
+            String finalStatus = applyThresholdBackstop(status, snapshot);
             String finalRootCause = finalStatus.equals(status) ? rootCause
                     : rootCause + " [代码级兜底已介入：" + finalStatus + "]";
             status = finalStatus;
@@ -406,7 +405,7 @@ public class OpsScheduler {
             metricsService.recordInspection(degraded ? "degraded_" + status : status, durationMs);
 
             if ("normal".equalsIgnoreCase(status)) {
-                reporter.logNormal(snapshot);
+                reporter.logNormal(snapshot, degraded);
                 audit.inspectionFinished("normal", durationMs, "none");
                 // 通知所有 ACTIVE 事件递增 normal 计数，达到阈值自动 RESOLVED。
                 // 降级轮的 normal 只是硬阈值判断（语义置信度低），盲期不用于归档事件——
@@ -483,7 +482,7 @@ public class OpsScheduler {
      *
      * @return 应提交的 trigger；无需升级返回 null
      */
-    static String chooseEscalationTrigger(Incident incident, String confidence, java.time.Instant now) {
+    static String chooseEscalationTrigger(Incident incident, String confidence, Instant now) {
         if (incident.isNew()
                 && "critical".equalsIgnoreCase(incident.severity())
                 && containsWriteAction(incident.suggestion())) {
@@ -540,11 +539,12 @@ public class OpsScheduler {
     }
 
     /**
-     * AI 漏报兜底：AI 判 normal 但指标严重超阈值时强改级别，并在 rootCause 标注
-     * 兜底已介入——模型可能对明显异常过于保守，关键硬信号（死锁/堆爆/CPU 打满）
-     * 不允许被一句"正常"盖过去。每次介入都写审计，便于事后核对是 AI 对还是兜底对。
+     * AI 漏报兜底：AI 判 normal 但指标严重超阈值时强改级别——模型可能对明显异常
+     * 过于保守，关键硬信号（死锁/堆爆/CPU 打满）不允许被一句"正常"盖过去。
+     * 每次介入都写审计，便于事后核对是 AI 对还是兜底对；
+     * rootCause 的"[代码级兜底已介入：...]"标注由调用方 handleInspectionResult 追加。
      */
-    private String applyThresholdBackstop(String status, Map<String, Object> snapshot, String rootCause) {
+    private String applyThresholdBackstop(String status, Map<String, Object> snapshot) {
         if (!"normal".equalsIgnoreCase(status)) {
             return status;
         }
