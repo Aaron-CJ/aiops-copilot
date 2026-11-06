@@ -91,13 +91,12 @@ public class GlobalExceptionHandler {
         return Result.fail(ResultCode.INTERNAL_ERROR);
     }
 
+    /**
+     * 提取参数校验错误信息。{@link MethodArgumentNotValidException} 是 {@link BindException}
+     * 的子类（spring-web 7 实测），一个 instanceof 即覆盖两类，无需重复分支；
+     * 兜底返回仅为防御非 BindException 入参。
+     */
     private String extractValidationMessage(Exception e) {
-        if (e instanceof MethodArgumentNotValidException ex) {
-            return ex.getBindingResult().getFieldErrors().stream()
-                    .findFirst()
-                    .map(error -> error.getField() + ": " + error.getDefaultMessage())
-                    .orElse(ResultCode.BAD_REQUEST.getMessage());
-        }
         if (e instanceof BindException ex) {
             return ex.getBindingResult().getFieldErrors().stream()
                     .findFirst()

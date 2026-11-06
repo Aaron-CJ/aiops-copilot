@@ -1,5 +1,6 @@
 package com.aiops.aiopscopilot;
 
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -17,7 +18,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>
  * 注意：这是<b>演示型基准</b>而非严格性能测试——结论依赖墙钟计时，机器繁忙或调度抖动时
  * 下方"虚拟线程更快"的断言可能偶发失败，重跑即可；关注控制台打印的数量级差异（数倍）而非精确比值。
+ * <p>
+ * 划入 {@code @Tag("integration")}：墙钟断言在 CI 负载下偶发红，不适合秒级单测集，
+ * 与集成测试一同通过 {@code gradlew integrationTest} 按需触发（本类不依赖基础设施）。
  */
+@Tag("integration")
 class VirtualThreadVsThreadPoolBenchmarkTest {
 
     private static final int TASK_COUNT = 10_000;

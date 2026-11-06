@@ -118,21 +118,18 @@ public class HealthCheckController {
     }
 
     private Map<String, Object> checkMilvus() {
-        Map<String, Object> info = new LinkedHashMap<>();
-        try {
-            restClient.get().uri(milvusHealthUrl + "/healthz").retrieve().body(String.class);
-            info.put("status", "UP");
-        } catch (Exception e) {
-            info.put("status", "DOWN");
-            info.put("error", e.getMessage());
-        }
-        return info;
+        return probe(milvusHealthUrl + "/healthz");
     }
 
     private Map<String, Object> checkPrometheus() {
+        return probe(prometheusBaseUrl + "/-/healthy");
+    }
+
+    /** Milvus 与 Prometheus 的健康探测同构（GET 一次，不抛异常即 UP），提取公共实现 */
+    private Map<String, Object> probe(String url) {
         Map<String, Object> info = new LinkedHashMap<>();
         try {
-            restClient.get().uri(prometheusBaseUrl + "/-/healthy").retrieve().body(String.class);
+            restClient.get().uri(url).retrieve().body(String.class);
             info.put("status", "UP");
         } catch (Exception e) {
             info.put("status", "DOWN");

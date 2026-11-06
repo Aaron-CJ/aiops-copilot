@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -114,7 +115,10 @@ public class OpsScheduler {
     /** 连续解析失败计数：解析成功一轮即归零；达到 PARSE_FAILURE_LIMIT 触发深度升级 */
     private int consecutiveParseFailures = 0;
 
-    /** 连续 QPS=0 计数（仅降级路径维护）：QPS>0 一轮即归零；达到 ZERO_QPS_CONFIRM_ROUNDS 才判假死 critical */
+    /** 连续 QPS=0 计数：升计数仅由降级路径 fallbackByThreshold 维护；归零统一在
+     *  handleInspectionResult 入口——任一路径观测到 QPS&gt;0 都会打断"连续假死"序列
+     *  （否则"降级轮 QPS=0 → AI 轮 QPS&gt;0 → 再降级轮 QPS=0"会被误判为连续 2 轮假死）；
+     *  达到 ZERO_QPS_CONFIRM_ROUNDS 才判假死 critical */
     private int consecutiveZeroQpsRounds = 0;
 
     /** 连续降级轮数：LLM 正常返回即归零；达到 LLM_UNAVAILABLE_ROUNDS 触发显式告警 */
@@ -275,7 +279,8 @@ public class OpsScheduler {
         StringBuilder rootCause = new StringBuilder();
         String status = "normal";
 
-        // QPS=0 连续确认计数：本方法只被降级路径调用（巡检单线程串行），实例字段即轮次状态。
+        // QPS=0 连续确认计数：本方法只被降级路径调用（巡检单线程串行），实例字段即轮次状态，
+        // 只负责升计数；归零统一在 handleInspectionResult 入口（任一路径观测到 QPS>0）。
         // cpu>=0 表示指标拉取正常（不是 -1 哨兵），此时 QPS=0 才有判定意义
         boolean zeroQpsNow = qps == 0 && cpu >= 0;
         if (zeroQpsNow) {
@@ -386,6 +391,11 @@ public class OpsScheduler {
      */
     private void handleInspectionResult(String reply, Map<String, Object> snapshot, long start, boolean degraded) {
         long durationMs = System.currentTimeMillis() - start;
+        // QPS>0 的真实观测打断"连续 QPS=0"计数，与路径无关（AI 轮与降级轮都经本入口；
+        // 降级轮的升计数已由 fallbackByThreshold 先行处理），保证该计数只反映真实连续的零流量观测
+        if (asDouble(snapshot.get("qpsLast1m")) > 0) {
+            consecutiveZeroQpsRounds = 0;
+        }
         String json = extractJson(reply);
         try {
             JsonNode node = objectMapper.readTree(json);
@@ -507,7 +517,8 @@ public class OpsScheduler {
         if (suggestion == null) {
             return false;
         }
-        String lower = suggestion.toLowerCase();
+        // Locale.ROOT：无参 toLowerCase 在土耳其语等 locale 下会把 "KILL" 折叠成 "kıll"，导致漏检
+        String lower = suggestion.toLowerCase(Locale.ROOT);
         for (String keyword : WRITE_KEYWORDS) {
             int idx = lower.indexOf(keyword);
             while (idx >= 0) {

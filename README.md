@@ -46,8 +46,8 @@ curl http://localhost:8080/api/health/check
 ## 测试
 
 ```powershell
-./gradlew test              # 111 个单元测试，秒级、零基础设施依赖
-./gradlew integrationTest   # Spring 装配冒烟（1 个），需 Milvus 在线
+./gradlew test              # 110 个单元测试，秒级、零基础设施依赖
+./gradlew integrationTest   # Spring 装配冒烟（需 Milvus 在线）+ 虚拟线程演示基准
 ```
 
 测试分层见 [build.gradle](build.gradle)：`test` 排除 `@Tag("integration")`，干净 CI 不会因缺 Milvus 而红。

@@ -58,7 +58,8 @@ tasks.named('compileTestJava') {
 }
 
 // 测试分层：test 只跑单元测试（秒级反馈，无基础设施依赖）；
-// 集成测试（@Tag("integration")，需 Milvus/Ollama 在位）用 gradle integrationTest 单独触发
+// @Tag("integration") 用 gradle integrationTest 单独触发：Spring 装配冒烟（需 Milvus 在位，
+// Ollama 侧惰性连接不影响装配）与演示型基准（墙钟断言负载下偶发红，不适合秒级单测集）
 tasks.named('test') {
 	useJUnitPlatform {
 		excludeTags 'integration'
