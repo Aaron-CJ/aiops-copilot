@@ -1,7 +1,7 @@
 # 事件状态机、降级与深度诊断设计
 
 > 配套白皮书 §4.1（双模型路由 + 可靠性增强）、§4.2/4.3（异步深度诊断与升级路由）与 §5.1（事件生命周期管理）的详细设计文档。
-> 本文档的实现已通过 112 个测试（111 单测 + 1 集成，2026-10-14 clean test 全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
+> 本文档的实现已通过 112 个测试（110 单测 + 2 集成，2026-11-06 单测集全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
 >
 > 阅读路线：**§1** 讲两条硬约束（告警不刷屏、LLM 挂了巡检不能停）与 AI 漏报兜底，**§2** 事件状态机与指纹去重，**§3** Ollama 降级与阈值兜底，**§4** 单元与端到端验证，**§5** 审计日志，**§6** 异步深度诊断与升级路由全链路。
 
@@ -308,7 +308,7 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 | [KnowledgeIngesterTest](../src/test/java/com/aiops/aiopscopilot/service/KnowledgeIngesterTest.java) | 8 |
 | [OpsSchedulerExtractJsonTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerExtractJsonTest.java) | 9 |
 | [PrometheusToolTest](../src/test/java/com/aiops/aiopscopilot/tool/PrometheusToolTest.java) | 7 |
-| 其余 4 类（明细见下方列表） | 25 |
+| 其余 2 类（明细见下方列表） | 23 |
 
 **各测试类关键验证维度**：
 
@@ -341,7 +341,8 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 - **KnowledgeIngesterTest（8 个）**：标题提取纯函数（标准标题提取并剥离正文、无标题兜底文件名、文首空行跳过、英文冒号与 trim、单/双引号标题拒绝、空内容兜底）；ingest 接线（mock VectorStore + 真实语料）：新旧 source 双删、切片继承标题 source、标题不入正文
 - **OpsSchedulerExtractJsonTest（9 个）**：反射测 `extractJson`——纯 JSON 透传、```json/```围栏剥离、只有开头围栏、`</think>` 残留剥离、思考段+围栏组合、null→空串、散文原样返回（不做花括号扫描）、围栏后空白 trim
 - **PrometheusToolTest（7 个）**：反射测 `parseValue`——小数/整数/科学计数法正常解析，NaN（大小写）/空串/脏字符串/null 统一 -1 哨兵（全系统"查询失败"契约）
-- **其余 25 个**：IncidentStoreTest 18（指纹/状态机/反射兜底/durationOf/TTL 过期/并发防丢失更新）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）+ AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准，非断言型回归）
+- **其余 23 个**：IncidentStoreTest 18（指纹/状态机/反射兜底/durationOf/TTL 过期/并发防丢失更新）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）
+- **integration 集（2 个，`gradle integrationTest` 触发）**：AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准——墙钟断言在负载下偶发红，不进秒级单测集）
 
-> 合计 **112** 个用例（111 单测 + 1 集成；2026-10-14，clean test 全绿；除 contextLoads 需 Milvus 外均不依赖任何外部服务）。除 contextLoads 外全部是不起容器的纯单测（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法）。
+> 合计 **112** 个用例（110 单测 + 2 集成；2026-11-06 `gradlew test` 全绿）。单测集全部不起容器（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法），均不依赖外部服务；集成集含需 Milvus 的装配冒烟与不依赖基础设施的演示基准。
 

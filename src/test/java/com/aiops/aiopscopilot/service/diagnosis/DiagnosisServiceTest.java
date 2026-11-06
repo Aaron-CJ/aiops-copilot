@@ -75,7 +75,7 @@ class DiagnosisServiceTest {
         assertNull(second, "同指纹有 PENDING 在途任务，必须拒绝重复升级");
     }
 
-    /** G1：RUNNING 在途同样去重（isDeduplicated 对 PENDING/RUNNING 两个状态都要拦截） */
+    /** RUNNING 在途同样去重（isDeduplicated 对 PENDING/RUNNING 两个状态都要拦截） */
     @Test
     void escalatedWhileSameFingerprintRunningIsDeduplicated() throws Exception {
         service = newService(null, null);
@@ -119,7 +119,7 @@ class DiagnosisServiceTest {
         assertEquals(QUEUE_CAPACITY, taskStore().size());
     }
 
-    /** G5：手动提交绕过防抖，但绕不过有界队列——队列满时同样拒绝（防止手动接口打满 r1 队列） */
+    /** 手动提交绕过防抖，但绕不过有界队列——队列满时同样拒绝（防止手动接口打满 r1 队列） */
     @Test
     void manualSubmitAlsoRejectedWhenQueueFull() {
         SnapshotCollector collector = mock(SnapshotCollector.class);
@@ -163,7 +163,7 @@ class DiagnosisServiceTest {
         assertNotNull(done.startedAt());
         assertNotNull(done.finishedAt());
 
-        // G4：Prompt 必须包含快照、trigger 中文标签、空 note 占位符、不可信数据声明、五段式要求
+        // Prompt 必须包含快照、trigger 中文标签、空 note 占位符、不可信数据声明、五段式要求
         assertEquals(1, capturedPrompts.size());
         String prompt = capturedPrompts.getFirst();
         assertTrue(prompt.contains("\"cpuUsage\":0.99"), "快照应序列化进 Prompt: " + prompt);
@@ -190,7 +190,7 @@ class DiagnosisServiceTest {
         assertTrue(done.error().contains("simulated ollama down"));
     }
 
-    /** G3：前一个任务失败后 worker 不崩，继续消费后续任务（真正验证 keepsRunning） */
+    /** 前一个任务失败后 worker 不崩，继续消费后续任务（真正验证 keepsRunning） */
     @Test
     void workerContinuesConsumingAfterFailure() throws Exception {
         List<String> prompts = new ArrayList<>();
@@ -265,7 +265,7 @@ class DiagnosisServiceTest {
         assertNotEquals(m1.taskId(), m2.taskId());
     }
 
-    /** G2：任务完成后 10 分钟窗口内同指纹仍被拦截；窗口过期后放行（FINISHED 不算在途，时间窗兜底） */
+    /** 任务完成后 10 分钟窗口内同指纹仍被拦截；窗口过期后放行（FINISHED 不算在途，时间窗兜底） */
     @Test
     void dedupWindowBlocksAfterFinishThenAllowsAfterExpiry() throws Exception {
         ChatClient fakeClient = fakeChatClient(new ArrayList<>(),
@@ -312,7 +312,7 @@ class DiagnosisServiceTest {
         assertTrue(store.containsKey(fresh.taskId()));
     }
 
-    /** G6：prune 只淘汰终态任务，绝不能误删在途（PENDING/RUNNING）任务 */
+    /** prune 只淘汰终态任务，绝不能误删在途（PENDING/RUNNING）任务 */
     @Test
     void pruneNeverEvictsInFlightTasks() throws Exception {
         service = newService(null, null);

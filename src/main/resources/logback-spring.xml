@@ -42,7 +42,8 @@
         <logger name="com.aiops.aiopscopilot" level="DEBUG"/>
     </springProfile>
 
-    <!-- 生产环境：降低噪音，只保留 WARN+ 控制台输出，审计走文件 -->
+    <!-- 生产环境：框架日志降为 WARN+ 减噪，应用包（com.aiops）保留 INFO——
+         巡检完成/心跳/告警报告是运维必须控制台可见的输出；审计走文件 -->
     <springProfile name="prod">
         <root level="WARN">
             <appender-ref ref="CONSOLE"/>

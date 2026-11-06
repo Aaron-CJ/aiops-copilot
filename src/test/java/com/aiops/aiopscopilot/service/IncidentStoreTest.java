@@ -309,7 +309,7 @@ class IncidentStoreTest {
     /**
      * QPS=0 假死判定带连续确认（ZERO_QPS_CONFIRM_ROUNDS=2）：第 1 轮 warning"待确认"，
      * 同一实例连续第 2 轮仍 QPS=0 才升级 critical——空闲/低流量系统单轮 QPS=0 是常态，
-     * 旧的单轮 critical 会造成每分钟误报。
+     * 单轮直接判 critical 会让空闲环境每分钟误报。
      */
     @Test
     void fallback_qpsZero_requiresTwoConsecutiveRoundsForCritical() throws Exception {

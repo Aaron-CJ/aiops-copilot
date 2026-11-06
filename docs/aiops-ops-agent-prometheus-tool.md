@@ -36,7 +36,7 @@
 
 ### 新建 opsAgentClient Bean（而非复用 deepseekChatClient）
 
-复用 `deepseekChatClient` 会把巡检专属的 system prompt 和工具 schema 注入到所有对话调用里，污染 `AiChatController`、`ChatController` 等场景的 token 消耗。新建专用 Bean 隔离职责。
+复用 `deepseekChatClient` 会把 Agent 的系统提示词与工具 schema 注入到所有对话调用里，污染 `AiChatController`、`ChatController` 等场景的 token 消耗。新建专用 Bean 隔离职责。
 
 ### 自指监控的口径处理（2026-09-28 修复）
 

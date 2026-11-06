@@ -94,7 +94,7 @@ class EscalationRuleTest {
         assertTrue(OpsScheduler.containsWriteAction("建议重启，但不建议回滚配置"));
     }
 
-    // ==================== G7：持续时长边界值 ====================
+    // ==================== 持续时长边界值 ====================
 
     /** 恰好 5 分钟（>= 边界，包含等于）→ persistent */
     @Test
@@ -113,7 +113,7 @@ class EscalationRuleTest {
         assertNull(OpsScheduler.chooseEscalationTrigger(inc, "high", Instant.now()));
     }
 
-    // ==================== G8/G9：两条规则的 isNew 闸门 ====================
+    // ==================== 两条规则的 isNew 闸门 ====================
 
     /** NEW 事件即使 firstSeen 很旧也不走 persistent（NEW 只会是首次发现，旧时间戳属异常输入，按非持续处理） */
     @Test
@@ -132,7 +132,7 @@ class EscalationRuleTest {
                 OpsScheduler.chooseEscalationTrigger(inc, "high", Instant.now()));
     }
 
-    // ==================== G10：规则 1 优先级压过低置信度 ====================
+    // ==================== 规则 1 优先级压过低置信度 ====================
 
     /** NEW + critical + 写建议 + confidence=low：critical_write 必须赢（最危险组合优先） */
     @Test
@@ -142,7 +142,7 @@ class EscalationRuleTest {
                 OpsScheduler.chooseEscalationTrigger(inc, "low", Instant.now()));
     }
 
-    // ==================== G11：大小写/中文关键词/空值 ====================
+    // ==================== 大小写/中文关键词/空值 ====================
 
     /** severity 大小写不敏感 */
     @Test

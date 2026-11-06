@@ -136,8 +136,7 @@ public class IncidentStore {
      * 计算事件已持续时长（从 firstSeen 到 lastSeen）。
      * <p>
      * 用 lastSeen 而非 now：lastSeen 在每次 recordOrUpdate 中刷新，能反映故障实际最后
-     * 被观测到的时间；RESOLVED 事件不会在被查询时"持续增长"。此前方法用 now 但
-     * lastSeen 字段全类写而无人读，属于死字段。
+     * 被观测到的时间；RESOLVED 事件不会在被查询时"持续增长"。
      */
     public static Duration durationOf(Incident inc) {
         return Duration.between(inc.firstSeen, inc.lastSeen);
