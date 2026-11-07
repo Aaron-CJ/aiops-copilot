@@ -27,8 +27,10 @@ aiops:
     # list:
     #   - name: 订单服务
     #     application: order-service
-    #     metrics: {}                # JVM/Spring 目标留空用默认档；其它语言在这里配映射
-    #     # qpsLast1m: 'sum(rate(http_requests_total{app="pay"}[1m]))'
+    #     # JVM/Spring 目标可整体省略 metrics（用默认档）；其它语言在这里配"语义 → PromQL"映射，
+    #     # 留空的语义记 -1 哨兵被 AI 忽略；qpsLast1m 配了单查询即跳过内置的 Java 侧减法
+    #     metrics:
+    #       qpsLast1m: 'sum(rate(http_requests_total{app="pay"}[1m]))'
   inspection:
     # 巡检 LLM 调用超时（秒）。默认 45 = 单目标（60s 周期的 75%）；
     # 多目标部署 Prompt 与输出都更长，实测 2 目标 + 机器负载下 45s 不够（llm_timeout 连发），
@@ -38,7 +40,7 @@ aiops:
     # 深度诊断任务队列（DiagnosisService，白皮书 4.2），均可用环境变量覆盖
     queue-capacity: ${AIOPS_DIAGNOSIS_QUEUE_CAPACITY:20}          # 有界队列容量，满则拒绝并记审计
     dedup-window-minutes: ${AIOPS_DIAGNOSIS_DEDUP_WINDOW_MINUTES:10}   # 同一指纹自动升级的最小间隔
-    worker-timeout-minutes: ${AIOPS_DIAGNOSIS_WORKER_TIMEOUT_MINUTES:15} # r1 单次推理硬超时（实测最长 8.8 分钟）
+    worker-timeout-minutes: ${AIOPS_DIAGNOSIS_WORKER_TIMEOUT_MINUTES:15} # r1 单次推理硬超时（长思考链纯 CPU 推理可超 15 分钟，超时按设计收敛为 FAILED）
     max-finished-tasks: ${AIOPS_DIAGNOSIS_MAX_FINISHED_TASKS:100} # 终态任务内存保留条数
 
 spring:

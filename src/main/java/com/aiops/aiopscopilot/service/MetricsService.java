@@ -71,7 +71,7 @@ public class MetricsService {
      *
      * @param trigger    升级触发原因（manual / parse_fail / low_confidence / persistent / critical_write）
      * @param result     终态：succeeded / failed
-     * @param durationMs 任务耗时（毫秒，RUNNING 起点到终态）
+     * @param durationMs 任务耗时（毫秒，worker 开始处理到终态，含 Prompt 构建）
      */
     public void recordDiagnosis(String trigger, String result, long durationMs) {
         meterRegistry.counter("aiops_diagnosis_total",

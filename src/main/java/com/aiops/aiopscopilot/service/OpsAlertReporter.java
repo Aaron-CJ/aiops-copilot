@@ -80,8 +80,9 @@ public class OpsAlertReporter {
      */
     public void logHeartbeat(Incident incident) {
         Duration dur = IncidentStore.durationOf(incident);
+        String target = IncidentStore.targetOf(incident.fingerprint());
         log.info("[AIOps 心跳] 故障持续中 | 目标={} | 指纹={} | 已持续 {}min | 首次摘要={} | 最新根因={}",
-                IncidentStore.targetOf(incident.fingerprint()),
+                target == null ? "全局" : target,
                 incident.fingerprint(),
                 dur.toMinutes(),
                 incident.summary(),
@@ -94,8 +95,9 @@ public class OpsAlertReporter {
      */
     public void logResolved(Incident incident) {
         Duration dur = IncidentStore.durationOf(incident);
+        String target = IncidentStore.targetOf(incident.fingerprint());
         log.info("[AIOps 恢复] 故障已恢复 | 目标={} | 指纹={} | 总持续 {}min | 历史根因={}",
-                IncidentStore.targetOf(incident.fingerprint()),
+                target == null ? "全局" : target,
                 incident.fingerprint(),
                 dur.toMinutes(),
                 incident.rootCause());

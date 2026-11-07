@@ -61,7 +61,8 @@ public class PrometheusTool {
      * JVM/Spring 默认指标档：语义 → PromQL 模板，{application} 占位符在采集时替换为目标标签值。
      * 指标名是 Micrometer/JVM 标准，任何 Spring Boot 目标零配置兼容；其它语言目标经
      * aiops.targets.list[].metrics 覆盖映射接入（配什么查询得什么值，语言无关）。
-     * qpsLast1m 不在本档（需要两条查询 + Java 侧减法，见 querySnapshot 内的专属处理）。
+     * qpsLast1m 不在本档（需要两条查询 + Java 侧减法，见 querySnapshot 内的专属处理；
+     * 目标也可用 metrics.qpsLast1m 覆盖改写为单条查询）。
      * <p>
      * 各条的关键取舍（均为踩坑后的最终版）：
      * <ul>
@@ -142,7 +143,8 @@ public class PrometheusTool {
      * 主动模式：采集单个目标的指标快照（语义键 → 数值，-1 = 查询失败/无数据）。
      * 每条查询带 application 标签过滤（跨应用隔离的关键——共享 Prometheus 会同时抓
      * 多个应用，不过滤会串数据）。目标的 metrics 覆盖优先于 JVM 默认档：
-     * 非空覆盖原样使用（过滤由配置者负责），空白覆盖 = 该目标无此语义 → -1 哨兵。
+     * 非空覆盖原样使用（过滤由配置者负责），空白覆盖 = 该目标无此语义 → -1 哨兵；
+     * qpsLast1m 也支持覆盖（配了单条查询就跳过 Java 侧减法，语义与其它键一致）。
      */
     public Map<String, Object> querySnapshot(MonitoredTarget target) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
@@ -159,6 +161,15 @@ public class PrometheusTool {
             snapshot.put(key, "heapMemoryByGen".equals(key)
                     ? queryHeapMemoryByGen(promql)
                     : queryScalar(promql));
+        }
+        // QPS 覆盖：目标可声明自己的 QPS 表达式（非 JVM 指标如 http_requests_total），
+        // 语义与其它键一致——非空原样使用，空白表示该目标无此语义（-1 哨兵）
+        String qpsOverride = target.metrics().get("qpsLast1m");
+        if (qpsOverride != null) {
+            snapshot.put("qpsLast1m", qpsOverride.isBlank()
+                    ? -1.0
+                    : queryScalar(resolvePromql(qpsOverride, "", target.application())));
+            return snapshot;
         }
         // QPS = 总速率 - actuator 抓取基线，减法在 Java 侧完成而非 PromQL（实测踩坑）：
         // sum() 产出无标签向量，rate() 产出带标签向量，PromQL 算术逐标签匹配不相等 →

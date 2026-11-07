@@ -4,7 +4,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.springframework.stereotype.Component;
@@ -17,13 +19,14 @@ import org.springframework.stereotype.Component;
  * <p>
  * 状态机：{@link IncidentStatus#NEW}（首次发现）→
  * {@link IncidentStatus#ACTIVE}（持续中）→
- * {@link IncidentStatus#RESOLVED}（连续 {@value #RESOLVED_NORMAL_ROUNDS} 轮 normal 后自动标记）。
+ * {@link IncidentStatus#RESOLVED}（所属目标连续 {@value #RESOLVED_NORMAL_ROUNDS} 轮 normal 后自动标记；
+ * 无目标前缀的全局事件按连续 N 轮未降级标记）。
  * <p>
  * 去重规则：同一 fingerprint 未关闭前，后续巡检周期不再走 log.error 全量报告，
  * 改由 {@link OpsAlertReporter#logHeartbeat} 输出 INFO 级心跳。
  * <p>
- * Fingerprint 构造见 {@link #fingerprintOf}：{@code status + "|" + 指标特征串}
- * （如 {@code CRITICAL|DEADLOCK;BLOCKED=2;}），基于指标快照而非 LLM 文本：
+ * Fingerprint 构造见 {@link #fingerprintOf}：{@code STATUS|APP=<目标名>;指标特征串}
+ * （如 {@code CRITICAL|APP=aiops-copilot;DEADLOCK;BLOCKED=2;}），基于指标快照而非 LLM 文本：
  * 同一故障即使 LLM 每轮措辞不同、数值轻微波动，也稳定合并为同一事件；
  * 又不细到用完整指标快照做 hash——那会把 0.91/0.92 这类微波动拆成不同事件，
  * 同一故障反复 NEW、去重失效。
@@ -82,9 +85,13 @@ public class IncidentStore {
     }
 
     /**
-     * 巡检结果为 normal 时调用：所有 NEW/ACTIVE 事件递增 normal 计数，
-     * 达到 {@value #RESOLVED_NORMAL_ROUNDS} 轮后标记 RESOLVED；
-     * 顺带清除超过 {@link #RESOLVED_TTL} 的过期 RESOLVED 记录。
+     * 巡检结果为正常时调用：对 {@code normalTargets} 所辖事件（按指纹 APP 前缀识别）递增 normal
+     * 计数，达到 {@value #RESOLVED_NORMAL_ROUNDS} 轮后标记 RESOLVED；
+     * 无 APP 前缀的全局事件（如 {@code LLM_UNAVAILABLE}）挂在巡检链路本身，不受单个目标状态影响，
+     * 每轮未降级巡检递增（LLM 恢复即为恢复，与各目标是否异常无关）。顺带清除超过 {@link #RESOLVED_TTL} 的过期 RESOLVED 记录。
+     * <p>
+     * 必须按目标过滤：多目标下 A 持续异常、B 已恢复时，若只在"整轮全 normal"时递增，
+     * B 的事件会永远停在 ACTIVE（A 恢复前无法归档）。
      * <p>
      * 用 {@link ConcurrentHashMap#computeIfPresent} 而非 forEach+put：
      * 后者是 get-then-put，若与 {@link #recordOrUpdate} 并发会发生丢失更新
@@ -92,22 +99,40 @@ public class IncidentStore {
      * 当前调用方是单线程调度器、竞态本不可达，但这是隐式依赖调度器并发模型的
      * 脆弱正确性——computeIfPresent 让单键原子性不依赖外部约定。
      *
+     * @param normalTargets 本轮判定为 normal 的目标名集合；降级/让路轮不调用本方法（盲期不归档）
      * @return 本轮被标记为 RESOLVED 的事件列表（可能为空；非空时调用方应输出"故障已恢复"日志）
      */
-    public List<Incident> bumpNormalAndResolve() {
+    public List<Incident> bumpNormalAndResolve(Set<String> normalTargets) {
         List<Incident> resolved = new ArrayList<>();
         Instant now = Instant.now();
         Instant expiryCutoff = now.minus(RESOLVED_TTL);
         // 收集键再逐个 computeIfPresent：compute 内不能再写同一 map，先确定候选键
         List<String> keys = new ArrayList<>(incidents.keySet());
         for (String fp : keys) {
+            Incident current = incidents.get(fp);
+            if (current == null) {
+                continue;
+            }
+            // 过期清理对所有指纹生效，不受"目标本轮是否 normal"影响（否则长期异常目标的旧记录永不清理）
+            if (current.status == IncidentStatus.RESOLVED && current.lastSeen.isBefore(expiryCutoff)) {
+                incidents.remove(fp, current);
+                continue;
+            }
+            String target = targetOf(fp);
+            if (target != null && !normalTargets.contains(target)) {
+                continue;
+            }
+            // 用局部标记判定"本轮刚归档"：不能拿 lastSeen.equals(now) 判断——那是靠
+            // "归档时恰好把 lastSeen 写成 now"的副作用识别，语义耦合且时钟精度依赖隐式；
+            // 归档时 lastSeen 写成 now（故障总持续算到确认恢复的时点，RESOLVED 的 TTL 也从此刻起算）
+            boolean[] justResolved = new boolean[1];
             Incident result = incidents.computeIfPresent(fp, (k, inc) -> {
-                // 过期 RESOLVED：返回 null 即从 map 移除
                 if (inc.status == IncidentStatus.RESOLVED) {
-                    return inc.lastSeen.isBefore(expiryCutoff) ? null : inc;
+                    return inc;
                 }
                 int newCount = inc.consecutiveNormalRounds + 1;
                 if (newCount >= RESOLVED_NORMAL_ROUNDS) {
+                    justResolved[0] = true;
                     return new Incident(fp, IncidentStatus.RESOLVED,
                             inc.firstSeen, now, newCount,
                             inc.severity, inc.summary, inc.rootCause, inc.suggestion);
@@ -116,9 +141,7 @@ public class IncidentStore {
                 return new Incident(fp, inc.status, inc.firstSeen, inc.lastSeen,
                         newCount, inc.severity, inc.summary, inc.rootCause, inc.suggestion);
             });
-            if (result != null && result.status == IncidentStatus.RESOLVED
-                    && result.consecutiveNormalRounds >= RESOLVED_NORMAL_ROUNDS
-                    && result.lastSeen.equals(now)) {
+            if (result != null && justResolved[0]) {
                 resolved.add(result);
             }
         }
@@ -135,8 +158,8 @@ public class IncidentStore {
     /**
      * 计算事件已持续时长（从 firstSeen 到 lastSeen）。
      * <p>
-     * 用 lastSeen 而非 now：lastSeen 在每次 recordOrUpdate 中刷新，能反映故障实际最后
-     * 被观测到的时间；RESOLVED 事件不会在被查询时"持续增长"。
+     * 用 lastSeen 而非 now：lastSeen 在每次 recordOrUpdate 中刷新，归档时写为确认恢复的时刻，
+     * 能反映故障从首次发现到确认恢复的观测时长；RESOLVED 事件不会在被查询时"持续增长"。
      */
     public static Duration durationOf(Incident inc) {
         return Duration.between(inc.firstSeen, inc.lastSeen);
@@ -153,7 +176,8 @@ public class IncidentStore {
      * 指纹都一致，从而正确合并到同一事件。
      * <p>
      * APP 前缀：目标名进指纹第一位——状态机按指纹字符串去重，
-     * 不同应用的故障天然分成独立事件，心跳/防抖窗口/升级计时互不干扰，状态机零改动。
+     * 不同应用的故障天然分成独立事件；归档时按 APP 前缀逐目标推进 normal 计数，
+     * 心跳/防抖窗口/升级计时互不干扰。
      * <p>
      * 例：{@code ("aiops-copilot", "critical", {blockedThreads=2, deadlockDiagnosis=...})} →
      *     {@code "CRITICAL|APP=aiops-copilot;DEADLOCK;BLOCKED=2;"}
@@ -188,18 +212,22 @@ public class IncidentStore {
         if (qps == 0 && cpu >= 0 && body.isEmpty()) {
             body.append("ZERO_QPS;");
         }
-        return status.toUpperCase() + "|APP=" + targetName + ";" + body;
+        return status.toUpperCase(Locale.ROOT) + "|APP=" + targetName + ";" + body;
     }
 
-    /** 从指纹解析目标名（APP= 前缀约定）；无前缀的指纹（如 LLM_UNAVAILABLE 专用指纹）返回 null */
+    /** 从指纹解析目标名（APP= 前缀约定，如 {@code CRITICAL|APP=aiops-copilot;...}）；
+     *  无前缀的指纹（如 LLM_UNAVAILABLE 专用指纹）返回 null */
     public static String targetOf(String fingerprint) {
-        if (fingerprint != null && fingerprint.startsWith("APP=")) {
-            int end = fingerprint.indexOf(';', 4);
-            if (end > 4) {
-                return fingerprint.substring(4, end);
-            }
+        if (fingerprint == null) {
+            return null;
         }
-        return null;
+        int marker = fingerprint.indexOf("APP=");
+        if (marker < 0 || (marker > 0 && fingerprint.charAt(marker - 1) != '|')) {
+            return null;
+        }
+        int start = marker + "APP=".length();
+        int end = fingerprint.indexOf(';', start);
+        return end > start ? fingerprint.substring(start, end) : null;
     }
 
     /** 把指标值安全转为 double；非数字或 null 返回 -1 */

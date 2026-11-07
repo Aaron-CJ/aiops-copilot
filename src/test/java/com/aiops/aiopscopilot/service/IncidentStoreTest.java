@@ -9,6 +9,7 @@ import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -68,15 +69,15 @@ class IncidentStoreTest {
         store.recordOrUpdate(fp, "warning", "CPU 高", "CPU 92%", "扩容");
 
         // 第 1 轮 normal：未达阈值（需 3 轮）
-        List<Incident> r1 = store.bumpNormalAndResolve();
+        List<Incident> r1 = store.bumpNormalAndResolve(Set.of());
         assertTrue(r1.isEmpty(), "第 1 轮 normal 不应 RESOLVED");
 
         // 第 2 轮 normal：未达阈值
-        List<Incident> r2 = store.bumpNormalAndResolve();
+        List<Incident> r2 = store.bumpNormalAndResolve(Set.of());
         assertTrue(r2.isEmpty(), "第 2 轮 normal 不应 RESOLVED");
 
         // 第 3 轮 normal：达到阈值 → RESOLVED
-        List<Incident> r3 = store.bumpNormalAndResolve();
+        List<Incident> r3 = store.bumpNormalAndResolve(Set.of());
         assertEquals(1, r3.size(), "第 3 轮 normal 应有 1 个 RESOLVED");
         assertEquals(IncidentStatus.RESOLVED, r3.getFirst().status());
         assertEquals(0, store.activeCount(), "RESOLVED 后 activeCount 应为 0");
@@ -90,7 +91,7 @@ class IncidentStoreTest {
         // 首次 → NEW
         store.recordOrUpdate(fp, "critical", "首次", "死锁", "重启");
         // 3 轮 normal → RESOLVED
-        for (int i = 0; i < 3; i++) store.bumpNormalAndResolve();
+        for (int i = 0; i < 3; i++) store.bumpNormalAndResolve(Set.of());
         // 复发：同指纹再次出现，应作为新事件 NEW
         Incident recur = store.recordOrUpdate(fp, "critical", "复发", "死锁", "重启");
 
@@ -105,14 +106,35 @@ class IncidentStoreTest {
         String fp = "WARNING|CPU";
 
         store.recordOrUpdate(fp, "warning", "CPU", "CPU 91%", "扩容");
-        store.bumpNormalAndResolve(); // 1 轮 normal
+        store.bumpNormalAndResolve(Set.of()); // 1 轮 normal
         // 故障再次出现：recordOrUpdate 把计数重置为 0
         store.recordOrUpdate(fp, "warning", "CPU", "CPU 92%", "扩容");
-        List<Incident> r = store.bumpNormalAndResolve();
+        List<Incident> r = store.bumpNormalAndResolve(Set.of());
         assertTrue(r.isEmpty(), "故障再次出现后 normal 计数应从头开始，不应立即 RESOLVED");
     }
 
     // ==================== A2. IncidentStore 加固行为：durationOf、RESOLVED TTL、并发更新 ====================
+
+    /**
+     * 多目标按目标归档：只有本轮 normal 的目标所辖事件递增计数，
+     * 另一目标持续异常时其事件必须保持 ACTIVE（否则 multi-target 下永不恢复）。
+     */
+    @Test
+    void bumpNormalAndResolve_onlyMatchingTarget() {
+        IncidentStore store = new IncidentStore();
+        String fpA = IncidentStore.fingerprintOf("app-a", "critical", Map.of());
+        String fpB = IncidentStore.fingerprintOf("app-b", "critical", Map.of());
+        store.recordOrUpdate(fpA, "critical", "A", "rc", "sg");
+        store.recordOrUpdate(fpB, "critical", "B", "rc", "sg");
+
+        // app-b 连续 3 轮 normal；app-a 仍异常（不在 normalTargets 中）
+        assertTrue(store.bumpNormalAndResolve(Set.of("app-b")).isEmpty());
+        assertTrue(store.bumpNormalAndResolve(Set.of("app-b")).isEmpty());
+        List<Incident> resolved = store.bumpNormalAndResolve(Set.of("app-b"));
+        assertEquals(1, resolved.size(), "只有 app-b 的事件应被归档");
+        assertEquals(fpB, resolved.getFirst().fingerprint());
+        assertEquals(1, store.activeCount(), "app-a 的事件必须保持 ACTIVE");
+    }
 
     /** durationOf 应基于 lastSeen（首次到最后一次观测），而非 firstSeen→now。 */
     @Test
@@ -132,7 +154,7 @@ class IncidentStoreTest {
 
         // 造一个 RESOLVED 且 lastSeen 远早于 TTL 的记录
         store.recordOrUpdate(fp, "critical", "首次", "rc", "sg");
-        for (int i = 0; i < 3; i++) store.bumpNormalAndResolve(); // → RESOLVED
+        for (int i = 0; i < 3; i++) store.bumpNormalAndResolve(Set.of()); // → RESOLVED
         assertEquals(0, store.activeCount());
 
         // 手动把 lastSeen 改到 2 小时前（超过 1h TTL），通过反射塞回 map 模拟陈旧记录
@@ -145,7 +167,7 @@ class IncidentStoreTest {
         injectIncident(store, fp, backdated);
 
         // 下一轮 normal 应把它清掉（返回空 resolved 列表，因它早就是 RESOLVED）
-        store.bumpNormalAndResolve();
+        store.bumpNormalAndResolve(Set.of());
         assertNull(findIncident(store, fp), "过期 RESOLVED 应被清除");
 
         // 同指纹复发：因旧记录已删，按全新 NEW 处理
@@ -166,7 +188,7 @@ class IncidentStoreTest {
             java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
             java.util.concurrent.Future<?> f1 = pool.submit(() -> {
                 await(start);
-                for (int i = 0; i < 50; i++) store.bumpNormalAndResolve();
+                for (int i = 0; i < 50; i++) store.bumpNormalAndResolve(Set.of());
             });
             java.util.concurrent.Future<?> f2 = pool.submit(() -> {
                 await(start);

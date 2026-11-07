@@ -4,6 +4,7 @@ import com.aiops.aiopscopilot.common.result.Result;
 import com.aiops.aiopscopilot.common.web.RequestLimits;
 import com.aiops.aiopscopilot.service.MetricsService;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -22,7 +23,7 @@ public class ChatController {
     private final MetricsService metricsService;
     private final String reasoningModel;
 
-    public ChatController(ChatClient deepseekChatClient,
+    public ChatController(@Qualifier("deepseekChatClient") ChatClient deepseekChatClient,
                           MetricsService metricsService,
                           @Value("${spring.ai.ollama.chat.model}") String reasoningModel) {
         this.deepseekChatClient = deepseekChatClient;

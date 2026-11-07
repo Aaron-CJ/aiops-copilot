@@ -28,18 +28,6 @@ import com.aiops.aiopscopilot.tool.SystemHealthTools;
 public class AiConfig {
 
     /**
-     * 巡检输出契约：多目标判定数组 {@code {targets:[{name,status,confidence,summary,rootCause,suggestion}]}}。
-     * 形状由 Prompt（OpsScheduler.buildInspectionPrompt）与宽容解析（parseJudgments，兼容旧单对象）保障。
-     * <p>
-     * 输出形状刻意不走 Ollama 的 JSON Schema 解码期约束：语法约束显著拖慢生成速度
-     * （叠加多目标更长的输出与机器负载，45s 预算内无法完成，实测连续 llm_timeout），
-     * 延迟是每轮的确定性成本，而解析失败只是偶发且自愈（parse_error 通道 + 下一轮重试）。
-     */
-    static final String INSPECTION_OUTPUT_CONTRACT =
-            "{\"targets\":[{\"name\":\"...\",\"status\":\"normal|warning|critical\",\"confidence\":\"high|medium|low\","
-                    + "\"summary\":\"...\",\"rootCause\":\"...\",\"suggestion\":\"...\"}]}";
-
-    /**
      * 深度通道：使用 yml 默认模型 deepseek-r1:8b（思考链默认开启），
      * 服务 RAG 问答与 DiagnosisService 异步深度诊断。
      * 显式命名 Bean，三个 ChatClient 并存时各处用 @Qualifier 精确注入。

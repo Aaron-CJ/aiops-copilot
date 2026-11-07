@@ -23,7 +23,8 @@ import tools.jackson.databind.ObjectMapper;
  * <p>
  * 检查维度：
  * <ol>
- *   <li>Ollama（LLM 推理服务）——GET /api/tags，并校验巡检/交互/RAG 三个模型已拉取
+ *   <li>Ollama（LLM 推理服务）——GET /api/tags，并校验快通道（巡检/交互）、深度诊断、embedding
+ *       三个模型已拉取
  *       （进程活着但模型缺失时巡检会全走降级，部署自检必须暴露，报 WARN）</li>
  *   <li>Milvus（向量数据库）——GET /healthz（9091 端口）</li>
  *   <li>Prometheus（指标采集）——GET /-/healthy</li>

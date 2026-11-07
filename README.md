@@ -18,10 +18,10 @@ Prometheus ──抓取── /actuator/prometheus（自指监控：AI 能查到
 SnapshotCollector（每 60s：对目标列表并行采集 7 条核心指标/目标；self 的
                    BLOCKED>0 时 ThreadMXBean 死锁二级诊断；self 永远在列）
      ▼
-OpsScheduler ── qwen3:8b 关思考链（45s 超时）── 严格 JSON：逐目标 status/rootCause/suggestion
+OpsScheduler ── qwen3:8b 关思考链（默认 45s 超时，可配置）── 严格 JSON：逐目标 status/rootCause/suggestion
      ├─ LLM 超时/挂掉 → 硬阈值降级兜底（连续 3 轮 → 显式 LLM_UNAVAILABLE 告警）
      ├─ 深度诊断运行 → 主动让路（跳过 LLM 走兜底，不计时失效）
-     ├─ normal → 事件连续 3 轮 normal 自动 RESOLVED 归档
+     ├─ normal → 该目标事件连续 3 轮 normal 自动 RESOLVED 归档
      └─ warning/critical → IncidentStore 状态机（NEW 全量报告 / ACTIVE 心跳 / RESOLVED）
              └─ 命中升级规则 → DiagnosisService 有界队列 → deepseek-r1 深度诊断（15min 硬超时）
 
@@ -71,7 +71,7 @@ curl http://localhost:8080/api/health/check
 ## 测试
 
 ```powershell
-./gradlew test              # 120 个单元测试，秒级、零基础设施依赖
+./gradlew test              # 142 个单元测试，秒级、零基础设施依赖
 ./gradlew integrationTest   # Spring 装配冒烟（需 Milvus 在线）+ 虚拟线程演示基准
 ```
 

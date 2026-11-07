@@ -25,7 +25,7 @@
 
 | 用例 | 注入命令 | 期望行为（确定性层） | 期望根因关键词（LLM 层） |
 |------|----------|---------------------|--------------------------|
-| F1 死锁 | `curl --max-time 3 http://localhost:8080/api/debug/deadlock/a & curl --max-time 3 http://localhost:8080/api/debug/deadlock/b`（两条并发发） | 指纹 `CRITICAL\|DEADLOCK;BLOCKED=2;`（伴随 QPS=0 也不再附加 `ZERO_QPS;`——ZERO_QPS 已降为兜底特征，指纹跨轮稳定）；NEW 全量报告 → ACTIVE 心跳；LLM 不可用时兜底判 critical。只注入一对——重复注入会让 blockedThreads 计数漂移产生不同指纹（BLOCKED=N 分桶） | 死锁、deadlock-worker、锁 |
+| F1 死锁 | `curl --max-time 3 http://localhost:8080/api/debug/deadlock/a & curl --max-time 3 http://localhost:8080/api/debug/deadlock/b`（两条并发发） | 指纹 `CRITICAL\|APP=aiops-copilot;DEADLOCK;BLOCKED=2;`（伴随 QPS=0 也不再附加 `ZERO_QPS;`——ZERO_QPS 已降为兜底特征，指纹跨轮稳定）；NEW 全量报告 → ACTIVE 心跳；LLM 不可用时兜底判 critical。只注入一对——重复注入会让 blockedThreads 计数漂移产生不同指纹（BLOCKED=N 分桶） | 死锁、deadlock-worker、锁 |
 | F2 内存泄漏 | 多次 `curl "http://localhost:8080/api/debug/memory-leak?mb=200"`，直到 `堆使用率` > 0.90 | `heapUsage>0.95` 兜底 critical；指纹含 `HIGH_HEAP` / `FREQUENT_GC`；release 后 3 轮 normal 自动 RESOLVED | 堆、Old、内存泄漏、GC |
 | F3 应用假死 | 先访问一次 `/api/test` 产生真实流量建立基线（**基线门控**：从未有流量的实例不判假死），再停止全部业务流量（actuator 抓取不计入 QPS） | `qpsLast1m=0` 且指标可拉取且已有流量基线 → 降级路径**连续 2 轮确认**：第 1 轮 warning"待确认"（空闲/低流量系统单轮 QPS=0 是常态，避免每分钟误报 critical），同一实例连续第 2 轮仍 QPS=0 才升级 critical 假死；QPS 恢复 >0 计数归零。LLM 判异常时 `ZERO_QPS` 进指纹（LLM 判 normal 不强改，见第 5 节边界 2；Prompt 已含"CPU 极低且无其他异常时可能为合法空闲"边界） | 假死、QPS 为零、端口在 |
 | F4 慢接口/依赖卡死 | `curl "http://localhost:8080/api/debug/slow-request?seconds=45"`（可并发多笔） | 无硬阈值兜底（设计边界 2）；依赖 LLM 关联 maxRequestSeconds 与 QPS 趋势 | 慢、延迟、maxRequestSeconds、挂起 |

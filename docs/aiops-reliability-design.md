@@ -1,7 +1,7 @@
 # 事件状态机、降级与深度诊断设计
 
 > 配套白皮书 §4.1（双模型路由 + 可靠性增强）、§4.2/4.3（异步深度诊断与升级路由）与 §5.1（事件生命周期管理）的详细设计文档。
-> 本文档的实现已通过 122 个测试（120 单测 + 2 集成，2026-11-08 clean test 与 integrationTest 全量全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
+> 本文档的实现已通过 144 个测试（142 单测 + 2 集成；2026-11-08 本地 Milvus/Ollama 环境 `clean test` 与 `integrationTest` 全量全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
 >
 > 阅读路线：**§1** 讲两条硬约束（告警不刷屏、LLM 挂了巡检不能停）与 AI 漏报兜底，**§2** 事件状态机与指纹去重，**§3** Ollama 降级与阈值兜底，**§4** 单元与端到端验证，**§5** 审计日志，**§6** 异步深度诊断与升级路由全链路。
 
@@ -22,14 +22,14 @@
 
 ```
 NEW（首次发现）→ ACTIVE（持续中，第二周期起改走 INFO 心跳日志）
-   → RESOLVED（连续 3 轮 normal 后自动归档）
+   → RESOLVED（该目标连续 3 轮 normal 后自动归档；LLM_UNAVAILABLE 等全局事件按连续 3 轮未降级归档）
 ```
 
 | 状态 | 触发条件 | 输出 |
 |------|----------|------|
 | NEW | 当前轮 fingerprint 在 store 中不存在或上次已 RESOLVED | [OpsAlertReporter.report](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java) — ERROR + ASCII 框线全量报告 |
 | ACTIVE | 同 fingerprint 仍在（未 RESOLVED） | [OpsAlertReporter.logHeartbeat](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java) — INFO 一行心跳 |
-| RESOLVED | 连续 3 轮巡检 normal 后自动标记 | [OpsAlertReporter.logResolved](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java) — INFO 一行恢复 |
+| RESOLVED | 同一目标连续 3 轮巡检 normal（全局事件为连续 3 轮未降级）后自动标记 | [OpsAlertReporter.logResolved](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java) — INFO 一行恢复 |
 
 ### 2.2 Fingerprint 构造（基于指标快照，不基于 LLM 文本）
 
@@ -42,7 +42,7 @@ NEW（首次发现）→ ACTIVE（持续中，第二周期起改走 INFO 心跳�
 实现：[IncidentStore.fingerprintOf](../src/main/java/com/aiops/aiopscopilot/service/IncidentStore.java)
 
 ```
-fingerprint = 异常级别 + "|" + 指标特征串
+fingerprint = 异常级别 + "|APP=" + 目标名 + ";" + 指标特征串
 ```
 
 指标特征串的构造规则（按优先级）：
@@ -67,7 +67,7 @@ fingerprint = 异常级别 + "|" + 指标特征串
 - 实现：`ConcurrentHashMap<String, Incident>`，重启丢失
 - 取舍：与"自治诊断"能力边界一致——死锁等故障应用重启后也会消失，持久化的旧事件反而是噪音
 - 零依赖、零外部状态，部署简单
-- **RESOLVED 保留窗口 1 小时**：已归档记录不再无限期驻留，超过 1 小时的 RESOLVED 由下一轮 `bumpNormalAndResolve` 顺带清除（`computeIfPresent` 返回 null 即移出 map）。理由：复发判定依赖"同指纹的旧 RESOLVED 记录还在"，但无限期保留既让内存单调增长、又会把数月前的同指纹误判成 relapse；1 小时覆盖同一次故障的合理复发周期，过期后同指纹按全新 NEW 处理
+- **RESOLVED 保留窗口 1 小时**：已归档记录不再无限期驻留，超过 1 小时的 RESOLVED 由下一轮 `bumpNormalAndResolve` 顺带清除（过期判定显式 `remove(key, value)`，不依赖 `compute` 返回 null）。理由：复发判定依赖"同指纹的旧 RESOLVED 记录还在"，但无限期保留既让内存单调增长、又会把数月前的同指纹误判成 relapse；1 小时覆盖同一次故障的合理复发周期，过期后同指纹按全新 NEW 处理
 
 ### 2.4 Incident 不可变性
 
@@ -75,7 +75,7 @@ fingerprint = 异常级别 + "|" + 指标特征串
 
 状态流转统一走 `compute` / `computeIfPresent`（单键原子），不用 `forEach + put` 的 get-then-put——后者与 `recordOrUpdate` 并发时会丢失更新（`put` 静默覆盖刚写入的 ACTIVE 版本，复活已 RESOLVED 的事件）。当前调用方是单线程调度器、竞态本不可达，改用原子方法是为了让正确性不依赖外部并发约定。
 
-`durationOf` 取 `firstSeen → lastSeen`（而非 `firstSeen → now`）：`lastSeen` 每轮刷新，心跳里的"已持续 N min"反映故障实际被观测到的时间，RESOLVED 事件被查询时也不会"持续增长"。
+`durationOf` 取 `firstSeen → lastSeen`（而非 `firstSeen → now`）：`lastSeen` 每轮刷新，归档时写为确认恢复的时刻，心跳里的"已持续 N min"反映从首次发现到确认恢复的观测时长，RESOLVED 事件被查询时也不会"持续增长"。
 
 ## 3. Ollama 降级与阈值兜底
 
@@ -147,7 +147,7 @@ catch (TimeoutException | Exception):
 Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标——"AI 瞎了"这样重要的故障不能只活在日志里。设计（`OpsScheduler.trackLlmUnavailable`）：
 
 - **触发**：连续 3 轮降级（`handleDegraded` 被调用）即登记独立指纹 `CRITICAL|LLM_UNAVAILABLE;` 的 critical 事件，复用 5.1 状态机——后续降级轮走 INFO 心跳；偶发 1-2 轮降级（瞬时抖动）不告警
-- **恢复**：LLM 正常返回即重置计数；事件由连续 3 轮 normal 自动 RESOLVED
+- **恢复**：LLM 正常返回即重置计数；事件由连续 3 轮未降级自动 RESOLVED（不受单个目标长期异常影响——它挂在巡检链路本身，不挂在目标上）
 - **配套规则一（盲期不归档）**：降级轮的 normal 只是硬阈值判断、语义置信度低，不调用 `bumpNormalAndResolve`——否则 Ollama 长挂时事件会被"降级 normal"轮错误归档，随后又被下一轮降级登记为 NEW，反复震荡
 - **配套规则二（降级不升级）**：降级路径不触发任何 4.3 深度诊断升级——r1 与快通道共用同一个 Ollama，挂了就都调不动，排队只会产出一串注定 FAILED 的任务
 
@@ -157,11 +157,11 @@ Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标�
 
 ### 4.1 单元测试
 
-[IncidentStoreTest](../src/test/java/com/aiops/aiopscopilot/service/IncidentStoreTest.java) 覆盖 18 个用例：
+[IncidentStoreTest](../src/test/java/com/aiops/aiopscopilot/service/IncidentStoreTest.java) 覆盖 19 个用例：
 
 | 维度 | 用例数 | 关键验证 |
 |------|--------|---------|
-| IncidentStore 状态机 | 8 | NEW→ACTIVE→RESOLVED 流转、复发重新置 NEW、normal 重置计数、durationOf 用 lastSeen、RESOLVED 超 TTL 清除、并发 record/bump 不丢更新 |
+| IncidentStore 状态机 | 9 | NEW→ACTIVE→RESOLVED 流转、复发重新置 NEW、normal 重置计数、按目标归档隔离（另一目标异常时本目标正常事件仍可归档）、durationOf 用 lastSeen、RESOLVED 超 TTL 清除、并发 record/bump 不丢更新 |
 | AI 漏报兜底 | 5 | normal+CPU>90→warning、normal+BLOCKED>0→critical、normal+堆>95→critical、warning 不变、全正常不变 |
 | Ollama 降级路径 | 5 | BLOCKED>0→critical、CPU>90→warning、QPS=0 连续 2 轮才 critical（首轮 warning 待确认）、GC>10→warning、全正常→normal |
 
@@ -175,7 +175,7 @@ Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标�
 |------|------|----------|
 | Round 1 baseline | CPU=0、BLOCKED=0 → 正常 | INFO |
 | Round 2（NEW） | 发现死锁，全量 ASCII 报告 + 根因 | ERROR |
-| Round 3（ACTIVE） | `故障持续中 \| 指纹=CRITICAL\|DEADLOCK;BLOCKED=2; \| 已持续 1min` | INFO 心跳 |
+| Round 3（ACTIVE） | `故障持续中 \| 指纹=CRITICAL\|APP=aiops-copilot;DEADLOCK;BLOCKED=2; \| 已持续 1min` | INFO 心跳 |
 | Round 4（ACTIVE） | `已持续 3min` | INFO 心跳 |
 
 **Ollama 降级**（kill ollama 进程后）：
@@ -185,10 +185,10 @@ Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标�
 17:48:08 WARN Spring AI Retry count 1
 17:48:18 WARN Spring AI Retry count 2
 17:48:51 WARN [OpsScheduler] LLM 推理超过 45s 未返回，启用阈值兜底
-17:48:51 INFO [AIOps 心跳] 故障持续中 | 指纹=CRITICAL|DEADLOCK;BLOCKED=2;  ← fallbackByThreshold 识别死锁
+17:48:51 INFO [AIOps 心跳] 故障持续中 | 指纹=CRITICAL|APP=aiops-copilot;DEADLOCK;BLOCKED=2;  ← fallbackByThreshold 识别死锁
 ```
 
-降级路径与 LLM 路径生成同一指纹（`CRITICAL|DEADLOCK;BLOCKED=2;`），正确合并到同一事件，输出 INFO 心跳而非 ERROR 全量报告。
+降级路径与 LLM 路径生成同一指纹（`CRITICAL|APP=aiops-copilot;DEADLOCK;BLOCKED=2;`），正确合并到同一事件，输出 INFO 心跳而非 ERROR 全量报告。
 
 ## 5. 审计日志
 
@@ -208,7 +208,7 @@ Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标�
 | 方法 | 触发时机 | 示例输出 |
 |------|----------|----------|
 | `inspectionStarted()` | 每轮巡检开始 | `巡检\|START` |
-| `inspectionFinished()` | 巡检结束 | `巡检\|END\|status=critical\|elapsedMs=3500\|fingerprint=CRITICAL\|DEADLOCK;BLOCKED=2;` |
+| `inspectionFinished()` | 巡检结束 | `巡检\|END\|status=critical\|elapsedMs=3500\|fingerprint=CRITICAL\|APP=aiops-copilot;DEADLOCK;BLOCKED=2;` |
 | `degradedPathTriggered()` | LLM 超时/异常降级 | `巡检\|DEGRADED\|reason=llm_timeout\|elapsedMs=45000` |
 | `backstopTriggered()` | AI 漏报兜底介入 | `巡检\|BACKSTOP\|target=aiops-copilot\|aiStatus=normal\|forcedStatus=warning\|metric=cpuUsage\|value=0.92` |
 | `incidentNew()` | 事件首次发现 | `事件\|NEW\|fingerprint=...\|status=critical\|summary=...` |
@@ -224,7 +224,7 @@ Ollama 长期挂掉时每轮只留下一条 WARN 日志与 `degraded_*` 指标�
 
 ### 6.1 为什么必须异步
 
-deepseek-r1:8b 启用思考链后单次推理实测 1.7-6.6 分钟（见白皮书双模型表），是巡检 60 秒预算的 2-7 倍、同步 HTTP 120 秒超时的 1-3 倍。同步等待会同时拖垮巡检周期与交互请求；但 r1 的长链推理在复合故障与 SOP 决策上的能力是关闭思考链的 qwen3:8b 不具备的。解法是**任务队列 + 轮询**，把"等待"从请求线程移走。
+deepseek-r1:8b 启用思考链后单次推理实测 1.7-6.6 分钟（见白皮书双模型表），是巡检 60 秒预算的 2-7 倍，也远超任何合理的同步 HTTP 超时预算。同步等待会同时拖垮巡检周期与交互请求；但 r1 的长链推理在复合故障与 SOP 决策上的能力是关闭思考链的 qwen3:8b 不具备的。解法是**任务队列 + 轮询**，把"等待"从请求线程移走。
 
 ### 6.2 组件与数据流
 
@@ -315,12 +315,14 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 | [ApiTokenAuthFilterTest](../src/test/java/com/aiops/aiopscopilot/common/security/ApiTokenAuthFilterTest.java) | 9 |
 | [KnowledgeIngesterTest](../src/test/java/com/aiops/aiopscopilot/service/KnowledgeIngesterTest.java) | 8 |
 | [OpsSchedulerExtractJsonTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerExtractJsonTest.java) | 9 |
-| [PrometheusToolTest](../src/test/java/com/aiops/aiopscopilot/tool/PrometheusToolTest.java) | 7 |
-| 其余 2 类（明细见下方列表） | 23 |
+| [PrometheusToolTest](../src/test/java/com/aiops/aiopscopilot/tool/PrometheusToolTest.java) | 15 |
+| [TargetsPropertiesTest](../src/test/java/com/aiops/aiopscopilot/config/TargetsPropertiesTest.java) | 9 |
+| [OpsAlertReporterTest](../src/test/java/com/aiops/aiopscopilot/service/OpsAlertReporterTest.java) | 4 |
+| 其余 1 类（明细见下方列表） | 24 |
 
 **各测试类关键验证维度**：
 
-- **DiagnosisServiceTest（16 个）**
+- **DiagnosisServiceTest（17 个）**
   - 同指纹 PENDING/RUNNING 在途防抖、窗口内终态防抖与窗口过期放行、不同指纹放行
   - 队列满时自动与手动任务均被拒绝
   - 15 分钟硬超时按注入阈值（200ms）快速 FAILED 且 error 标明硬超时；`cancel(true)` 中断挂死调用后 worker 继续消费
@@ -350,9 +352,11 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 - **ApiTokenAuthFilterTest（9 个）**：MockHttpServletRequest 纯单测——无凭据/错 token→401 且不放行；Bearer（scheme 大小写不敏感、值首尾空白容忍）、X-API-Key、`?token=`（仅两个 SSE 端点放行，普通端点拒绝）三种方式；空 Bearer 值→401
 - **KnowledgeIngesterTest（8 个）**：标题提取纯函数（标准标题提取并剥离正文、无标题兜底文件名、文首空行跳过、英文冒号与 trim、单/双引号标题拒绝、空内容兜底）；ingest 接线（mock VectorStore + 真实语料）：新旧 source 双删、切片继承标题 source、标题不入正文
 - **OpsSchedulerExtractJsonTest（9 个）**：反射测 `extractJson`——纯 JSON 透传、```json/```围栏剥离、只有开头围栏、`</think>` 残留剥离、思考段+围栏组合、null→空串、散文原样返回（不做花括号扫描）、围栏后空白 trim
-- **PrometheusToolTest（7 个）**：反射测 `parseValue`——小数/整数/科学计数法正常解析，NaN（大小写）/空串/脏字符串/null 统一 -1 哨兵（全系统"查询失败"契约）
-- **其余 23 个**：IncidentStoreTest 18（指纹/状态机/反射兜底/durationOf/TTL 过期/并发防丢失更新）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）
+- **PrometheusToolTest（15 个）**：QPS 减法（正常/基线大于总量钳零/总量缺失哨兵/基线缺失按 0）、`resolvePromql`（默认模板替换 application、覆盖优先且支持占位符、无占位符原样用）、JVM 默认档覆盖除 qpsLast1m 外的全部语义键；反射测 `parseValue`——小数/整数/科学计数法正常解析，NaN（大小写）/空串/脏字符串/null 统一 -1 哨兵（全系统"查询失败"契约）
+- **TargetsPropertiesTest（9 个）**：self 自动在列且不重复、重名/重复 application/指纹分隔符/破坏 PromQL 的字符/空白字段拒绝、自定义目标保留、metrics 防御性不可变拷贝
+- **OpsAlertReporterTest（4 个）**：normal 摘要逐目标列出关键指标（多目标带分隔、单目标无分隔）、缺 targets 块退化为空、error 块透传
+- **其余 24 个**：IncidentStoreTest 19（指纹/状态机/按目标归档隔离/反射兜底/durationOf/TTL 过期/并发防丢失更新）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）
 - **integration 集（2 个，`gradle integrationTest` 触发）**：AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准——墙钟断言在负载下偶发红，不进秒级单测集）
 
-> 合计 **122** 个用例（120 单测 + 2 集成；2026-11-08 `clean test` 与 `integrationTest` 全量全绿）。单测集全部不起容器（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法），均不依赖外部服务；集成集含需 Milvus 的装配冒烟与不依赖基础设施的演示基准。
+> 合计 **144** 个用例（142 单测 + 2 集成；2026-11-08 `clean test` 与 `integrationTest` 全量全绿）。单测集全部不起容器（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法），均不依赖外部服务；集成集含需 Milvus 的装配冒烟与不依赖基础设施的演示基准。
 

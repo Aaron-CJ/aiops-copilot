@@ -35,6 +35,6 @@ for col_name in collections:
     if state_name == "NotLoaded":
         print(f"正在加载 {col_name} ...")
         client.load_collection(col_name)
-        print(f"{col_name} 加载完成")
+        print(f"{col_name} 已提交加载（load 异步完成，需要确认可等待后再查 get_load_state）")
 
 client.close()

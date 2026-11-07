@@ -10,6 +10,7 @@ import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -151,9 +152,9 @@ class FaultInjectionEvaluationTest {
                 "warning", "CPU 尖峰", "CPU 92%", "观察");
         assertTrue(first.isNew(), "被单轮巡检捕获的尖峰应为 NEW");
 
-        assertTrue(store.bumpNormalAndResolve().isEmpty(), "毛刺消失后第 1 轮 normal 不应 RESOLVED");
-        assertTrue(store.bumpNormalAndResolve().isEmpty(), "第 2 轮 normal 不应 RESOLVED");
-        List<Incident> resolved = store.bumpNormalAndResolve();
+        assertTrue(store.bumpNormalAndResolve(Set.of("aiops-copilot")).isEmpty(), "毛刺消失后第 1 轮 normal 不应 RESOLVED");
+        assertTrue(store.bumpNormalAndResolve(Set.of("aiops-copilot")).isEmpty(), "第 2 轮 normal 不应 RESOLVED");
+        List<Incident> resolved = store.bumpNormalAndResolve(Set.of("aiops-copilot"));
         assertEquals(1, resolved.size(), "第 3 轮 normal 应 RESOLVED——尖峰不升级为持续告警");
         assertEquals(IncidentStatus.RESOLVED, resolved.getFirst().status());
         assertEquals(0, store.activeCount(), "RESOLVED 后不应残留活跃事件");

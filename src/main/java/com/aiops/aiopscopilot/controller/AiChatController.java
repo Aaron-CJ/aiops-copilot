@@ -35,7 +35,7 @@ import reactor.core.publisher.Flux;
  *   <li>{@code GET /chat} — 自由对话，SSE 流式；把 Ollama 的 thinking 字段
  *       重新包成 {@code </think>} 段推给前端，与正式回答区分渲染</li>
  *   <li>{@code GET /rag} / {@code /rag/stream} — RAG 问答（同步/SSE）：
- *       先 Milvus 相似度检索 knowledge.txt 片段，无命中直接回复"未找到"省一次模型调用，
+ *       先 Milvus 相似度检索知识库片段（source 元数据为文档标题），无命中直接回复"未找到"省一次模型调用，
  *       有命中才带片段提问，系统 Prompt 强约束"只能依据知识库作答 + 注明来源"抗幻觉</li>
  *   <li>{@code POST /ingest} — 知识库重新摄入（切片→bge-m3 向量化→写 Milvus；
  *       写副作用操作用 POST，不挂在 GET 上）</li>
