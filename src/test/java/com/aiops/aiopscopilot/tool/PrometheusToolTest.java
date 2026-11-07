@@ -6,6 +6,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * PrometheusTool.parseValue 私有方法的反射单测。
@@ -23,6 +25,70 @@ class PrometheusToolTest {
 
     /** 解析失败哨兵，必须与 queryScalar 的失败返回值一致 */
     private static final double SENTINEL = -1.0d;
+
+    // ==================== qpsFrom：Java 侧 QPS 减法（多目标快照的 QPS 语义） ====================
+
+    @Test
+    void qpsFrom_normalSubtraction() {
+        assertEquals(4.0, PrometheusTool.qpsFrom(5.0, 1.0), 1e-9, "总速率 - actuator 基线");
+    }
+
+    @Test
+    void qpsFrom_actuatorExceedsTotal_clampsToZero() {
+        assertEquals(0.0, PrometheusTool.qpsFrom(0.067, 0.067), 1e-9,
+                "两侧相等（只有抓取流量）→ 0，不是负数");
+        assertTrue(PrometheusTool.qpsFrom(0.05, 0.067) >= 0, "结果钳到 ≥0");
+    }
+
+    @Test
+    void qpsFrom_totalMissing_sentinel() {
+        assertEquals(-1.0, PrometheusTool.qpsFrom(-1.0, 0.0), 1e-9,
+                "总速率查询失败（-1）→ 整体 -1，AI 按'查询失败'忽略而非误读为 0 流量");
+    }
+
+    @Test
+    void qpsFrom_actuatorMissing_treatedAsZero() {
+        assertEquals(5.0, PrometheusTool.qpsFrom(5.0, -1.0), 1e-9,
+                "基线查询失败按 0 处理（总速率侧已有值，不算整轮失败）");
+    }
+
+    @Test
+    void resolvePromql_defaultTemplateSubstitutesApplication() {
+        String out = PrometheusTool.resolvePromql(null,
+                "process_cpu_usage{application=\"{application}\"}", "aiops-copilot");
+        assertEquals("process_cpu_usage{application=\"aiops-copilot\"}", out);
+    }
+
+    @Test
+    void resolvePromql_overrideWinsAndSupportsPlaceholder() {
+        String out = PrometheusTool.resolvePromql(
+                "sum(rate(http_requests_total{app=\"{application}\"}[1m]))",
+                "process_cpu_usage{application=\"{application}\"}", "order-service");
+        assertEquals("sum(rate(http_requests_total{app=\"order-service\"}[1m]))", out);
+    }
+
+    @Test
+    void resolvePromql_overrideWithoutPlaceholderUsedAsIs() {
+        String out = PrometheusTool.resolvePromql(
+                "my_custom_metric", "process_cpu_usage{application=\"{application}\"}", "any");
+        assertEquals("my_custom_metric", out);
+    }
+
+    @Test
+    void jvmDefaultProfile_coversAllSemanticsExceptQps() {
+        // 默认档覆盖除 qpsLast1m（Java 侧减法专属处理）外的全部语义键，
+        // 且每条模板都带 {application} 占位符（多目标过滤的前提）
+        for (String key : PrometheusTool.SNAPSHOT_SEMANTICS) {
+            if (key.equals("qpsLast1m")) {
+                assertFalse(PrometheusTool.jvmDefaultProfile().containsKey(key),
+                        "qpsLast1m 走 querySnapshot 的 Java 侧减法专属处理");
+                continue;
+            }
+            assertTrue(PrometheusTool.jvmDefaultProfile().containsKey(key), key + " 缺失");
+            assertTrue(PrometheusTool.jvmDefaultProfile().get(key).contains("{application}"),
+                    key + " 模板未参数化 application");
+        }
+    }
 
     private static Method parseValue;
     private static PrometheusTool tool;

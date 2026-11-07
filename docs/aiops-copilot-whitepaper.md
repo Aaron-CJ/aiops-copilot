@@ -34,9 +34,10 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 - **做法**：不部署 Grafana 可视化面板。Agent 通过 Prometheus 原生 HTTP API（`/api/v1/query`）按需抓取指标。
 - **落地实现**（`PrometheusTool`）：一份查询能力，两条路径复用——
   - **被动模式**：`queryMetric(promql)` 带 `@Tool` 注解，交互问答时模型自主构造 PromQL；
-  - **主动模式**：`queryFixedMetrics()` 由调度器每分钟预拉 7 条核心指标（CPU、堆总使用率、堆内存分代、QPS、最大请求延迟、BLOCKED 线程数、5 分钟 GC 次数）直接塞 Prompt，**不让模型在巡检中自主查**（实测 2026-09-17，qwen3:8b 交互 Agent：自主查在单轮内并行发起 5-6 次 queryMetric、零 PromQL 重试，但开放式提问只查 5 项、维度覆盖不确定——预拉保证每轮 7 条指标确定性到齐，且巡检 ChatClient 不挂工具 schema、不承担工具编排开销与覆盖不确定性）。
+  - **主动模式**：`querySnapshot(target)` 由调度器每分钟对目标列表（self 永远在列）**并行预拉 7 条核心指标/目标**（CPU、堆总使用率、堆内存分代、QPS、最大请求延迟、BLOCKED 线程数、5 分钟 GC 次数，全部带 application 标签过滤）直接塞 Prompt，**不让模型在巡检中自主查**（实测 2026-09-17，qwen3:8b 交互 Agent：自主查在单轮内并行发起 5-6 次 queryMetric、零 PromQL 重试，但开放式提问只查 5 项、维度覆盖不确定——预拉保证每轮每个目标 7 条指标确定性到齐，且巡检 ChatClient 不挂工具 schema、不承担工具编排开销与覆盖不确定性）。
 
 **工程细节**：PromQL 含双引号（如 `{state="blocked"}`）必须 `URLEncoder.encode` 后以 `java.net.URI` 对象发起请求，绕过 RestClient 的二次编码；查询失败返回 `-1` 而非 `0`，让模型区分"无数据"与"值为零"。
+- **多目标感知（2026-11-08）**：巡检对目标列表（self 永远在列）并行采集、逐目标判定——每条 PromQL 带 `application="<标签>"` 过滤（共享 Prometheus 抓多个应用时不串数据），指纹带 `APP=<目标名>;` 前缀让状态机按应用隔离事件；非 JVM 目标经"语义 → PromQL"覆盖映射接入（配什么查询得什么值，缺的语义记 -1 哨兵），**语言无关**。目标列表配置见 application.yml 的 `aiops.targets`。
 
 主动模式的 QPS 查询单独处理（详见 [PrometheusTool 双路径设计](aiops-ops-agent-prometheus-tool.md)）：用 Java 侧减法排除 `/actuator/prometheus` 抓取产生的 ≈0.067 QPS 基线污染（该污染曾静默屏蔽"qps==0 应用假死"判定）：`sum(rate(全部[1m])) - rate({uri="/actuator/prometheus"}[1m])`。注意不能在 PromQL 中直接写 `!=`——`URI.create` 会把 `%21(!)` 规范化为字面量 `!`，导致 Prometheus parse error；两条子查询都只用 `=` 规避此坑。
 
@@ -124,7 +125,7 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 
 #### 4.3 升级触发条件 ✅
 
-快速通道 → 深度通道的升级规则（[OpsScheduler.chooseEscalationTrigger](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 纯函数，单测覆盖），避免"事事惊动大模型"也避免"大病小治"，一轮巡检最多升级一个 trigger：
+快速通道 → 深度通道的升级规则（[OpsScheduler.chooseEscalationTrigger](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 纯函数，单测覆盖），避免"事事惊动大模型"也避免"大病小治"，一轮内每个目标的判定最多各升级一个 trigger（多目标下两个应用可同时各升一个）：
 
 1. **低置信度 / 解析失败**：快通道 JSON 新增 `confidence` 字段，自报 low 即升级；正常路径连续 2 轮 JSON 解析失败升级
 2. **人工显式发起**：`POST /api/diagnosis` 手动提交，现场采集快照并可附带关注点

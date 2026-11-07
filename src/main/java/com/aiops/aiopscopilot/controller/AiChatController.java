@@ -119,6 +119,7 @@ public class AiChatController {
                     }
                     return chunks;
                 })
+                .doOnError(e -> log.error("[AiChatController] /api/ai/chat 流式输出异常", e))
                 .onErrorResume(e -> Flux.just("[ERROR] " + e.getMessage()));
     }
 
@@ -185,6 +186,7 @@ public class AiChatController {
                 // 流式输出成功完成时补记一次 AI 调用耗时（取消/错误不计）
                 .doOnComplete(() -> metricsService.recordAIRequest(reasoningModel,
                         "/api/ai/rag/stream", System.currentTimeMillis() - aiStart))
+                .doOnError(e -> log.error("[AiChatController] /api/ai/rag/stream 流式输出异常", e))
                 .onErrorResume(e -> Flux.just("[ERROR] " + e.getMessage()));
     }
 

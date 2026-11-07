@@ -28,11 +28,11 @@
 同一个工具类的查询能力被两条路径复用，避免重复实现：
 
 - **路径 A（被动）**：`@Tool` 注解的 `queryMetric(String promql)` 方法暴露给 `opsAgentClient`，用户提问时模型自主决定查什么 PromQL
-- **路径 B（主动）**：巡检调度器直接调用 `PrometheusTool` 的普通 public 方法 `queryFixedMetrics()`，**预拉固定指标塞进 Prompt**，不让模型自己查（实测 2026-09-17：模型自主查在单轮内并行发起 5-6 次 queryMetric、无重试，但开放式提问只查 5 项、会漏维度；预拉保证每分钟 7 条指标覆盖确定）
+- **路径 B（主动）**：巡检调度器直接调用 `PrometheusTool` 的普通 public 方法 `querySnapshot(target)`，**对目标列表逐个预拉固定指标塞进 Prompt**（多目标：self 永远在列，每条查询带 application 标签过滤；非 JVM 目标经"语义→PromQL"覆盖映射接入），不让模型自己查（实测 2026-09-17：模型自主查在单轮内并行发起 5-6 次 queryMetric、无重试，但开放式提问只查 5 项、会漏维度；预拉保证每分钟 7 条指标覆盖确定）
 
 这个分工对应"Agent 主动出击"——巡检不是让模型当查询工，而是让模型当"判断工"。
 
-两条路径共用同一个 RestClient 实例，显式配置**连接 2s / 读取 5s 超时**（`JdkClientHttpRequestFactory`，2026-09-30 评审补充）：RestClient 默认请求工厂不设超时，Prometheus 挂起（接受连接但不响应）时查询会永久阻塞，`@Scheduled` 单线程 + fixedDelay 语义下整个巡检链路静默停摆。快照 8 条串行查询最坏约 40s，仍在 60s 巡检预算内；模型自主查询单次最多 5s 超时返回 -1 哨兵，Agent 拿到 -1 会如实告知"指标不可用"而非无限等待。
+两条路径共用同一个 RestClient 实例，显式配置**连接 2s / 读取 5s 超时**（`JdkClientHttpRequestFactory`，2026-09-30 评审补充）：RestClient 默认请求工厂不设超时，Prometheus 挂起（接受连接但不响应）时查询会永久阻塞，`@Scheduled` 单线程 + fixedDelay 语义下整个巡检链路静默停摆。多目标下每目标一个虚拟线程并行采集，最坏耗时 = 单目标的 8 条串行查询（约 40s），不随目标数放大，仍在 60s 巡检预算内；模型自主查询单次最多 5s 超时返回 -1 哨兵，Agent 拿到 -1 会如实告知"指标不可用"而非无限等待。
 
 ### 新建 opsAgentClient Bean（而非复用 deepseekChatClient）
 
@@ -45,7 +45,7 @@
 ≈0.067 的恒定基线污染——后果不只是数字不准：**空闲系统永远看不到 qps=0**，"qps==0 且
 cpu>=0 → 应用假死"的兜底判定被静默屏蔽。
 
-`queryFixedMetrics()` 的 QPS 查询因此排除自指流量。**注意不能直接写 `{uri!="/actuator/prometheus"}`**：
+巡检快照的 QPS 因此排除自指流量（减法在 Java 侧完成：PromQL 里 sum() 的无标签向量与 rate() 的带标签向量逐标签匹配不相等，直接相减得空集——2026-11-08 双实例实测踩坑）。**注意不能直接写 `{uri!="/actuator/prometheus"}`**：
 `URI.create` 会把 `%21`（`!`）规范化为字面量 `!`，但保留 `%3D`（`=`），Prometheus 收到后报
 `unexpected character after '!' inside braces`。实际方案是 Java 侧减法：
 `sum(rate(http_server_requests_seconds_count[1m])) - rate(http_server_requests_seconds_count{uri="/actuator/prometheus"}[1m])`，

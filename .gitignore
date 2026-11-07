@@ -54,3 +54,6 @@ __pycache__/
 
 ### JVM crash 日志（hs_err_pid*.log） ###
 hs_err_pid*.log
+
+### ZCode 会话产物（不属于项目） ###
+.zcode/

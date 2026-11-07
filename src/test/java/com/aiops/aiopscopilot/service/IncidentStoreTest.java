@@ -49,7 +49,7 @@ class IncidentStoreTest {
         snap.put("heapUsage", 0.4);
         snap.put("qpsLast1m", 100.0);
         snap.put("gcCountLast5m", 0.0);
-        String fp = IncidentStore.fingerprintOf("critical", snap);
+        String fp = IncidentStore.fingerprintOf("aiops-copilot", "critical", snap);
 
         Incident first = store.recordOrUpdate(fp, "critical", "首次", "存在死锁", "重启");
         Incident second = store.recordOrUpdate(fp, "critical", "持续中", "存在死锁", "重启");
@@ -285,10 +285,10 @@ class IncidentStoreTest {
         snap.put("qpsLast1m", 100.0);
         snap.put("gcCountLast5m", 0.0);
 
-        String json = invokeFallback(sched, snap);
+        OpsScheduler.TargetJudgment j = invokeFallback(sched, snap);
 
-        assertTrue(json.contains("\"status\":\"critical\""), "BLOCKED>0 应降级为 critical: " + json);
-        assertTrue(json.contains("代码级兜底"), "rootCause 应含代码级兜底标注");
+        assertEquals("critical", j.status(), "BLOCKED>0 应降级为 critical");
+        assertTrue(j.rootCause().contains("代码级兜底"), "rootCause 应含代码级兜底标注");
     }
 
     @Test
@@ -301,9 +301,9 @@ class IncidentStoreTest {
         snap.put("qpsLast1m", 50.0);
         snap.put("gcCountLast5m", 2.0);
 
-        String json = invokeFallback(sched, snap);
+        OpsScheduler.TargetJudgment j = invokeFallback(sched, snap);
 
-        assertTrue(json.contains("\"status\":\"warning\""), "CPU>90% 应降级为 warning: " + json);
+        assertEquals("warning", j.status(), "CPU>90% 应降级为 warning");
     }
 
     /**
@@ -322,22 +322,20 @@ class IncidentStoreTest {
         snap.put("qpsLast1m", 0.0);
         snap.put("gcCountLast5m", 0.0);
 
-        String idleFromStart = invokeFallback(sched, snap);
-        assertTrue(idleFromStart.contains("\"status\":\"normal\""),
-                "从未有流量的空闲实例 QPS=0 是常态，不应判假死: " + idleFromStart);
+        String idleFromStart = invokeFallback(sched, snap).status();
+        assertEquals("normal", idleFromStart,
+                "从未有流量的空闲实例 QPS=0 是常态，不应判假死");
 
         // 先观测一轮真实流量建立基线，后续 QPS=0 才是"从有流量跌到零"的假死信号
         Map<String, Object> traffic = new HashMap<>(snap);
         traffic.put("qpsLast1m", 50.0);
         invokeFallback(sched, traffic);
 
-        String firstRound = invokeFallback(sched, snap);
-        assertTrue(firstRound.contains("\"status\":\"warning\""),
-                "第 1 轮 QPS=0 应判 warning 待确认: " + firstRound);
+        String firstRound = invokeFallback(sched, snap).status();
+        assertEquals("warning", firstRound, "第 1 轮 QPS=0 应判 warning 待确认");
 
-        String secondRound = invokeFallback(sched, snap);
-        assertTrue(secondRound.contains("\"status\":\"critical\""),
-                "连续第 2 轮 QPS=0 应升级 critical（应用假死）: " + secondRound);
+        String secondRound = invokeFallback(sched, snap).status();
+        assertEquals("critical", secondRound, "连续第 2 轮 QPS=0 应升级 critical（应用假死）");
     }
 
     @Test
@@ -350,9 +348,9 @@ class IncidentStoreTest {
         snap.put("qpsLast1m", 50.0);
         snap.put("gcCountLast5m", 1.0);
 
-        String json = invokeFallback(sched, snap);
+        String json = invokeFallback(sched, snap).status();
 
-        assertTrue(json.contains("\"status\":\"normal\""), "所有指标正常应返回 normal: " + json);
+        assertEquals("normal", json, "所有指标正常应返回 normal");
     }
 
     @Test
@@ -365,9 +363,9 @@ class IncidentStoreTest {
         snap.put("qpsLast1m", 50.0);
         snap.put("gcCountLast5m", 15.0);
 
-        String json = invokeFallback(sched, snap);
+        String json = invokeFallback(sched, snap).status();
 
-        assertTrue(json.contains("\"status\":\"warning\""), "5min GC>10 应降级为 warning: " + json);
+        assertEquals("warning", json, "5min GC>10 应降级为 warning");
     }
 
     // ==================== 辅助方法 ====================
@@ -377,19 +375,28 @@ class IncidentStoreTest {
      * audit 传真实实例（AuditLogger 无 Spring 依赖，可直接 new），避免 NPE。
      */
     private OpsScheduler newSchedulerWithNulls() {
-        return new OpsScheduler(null, null, null, null, null, new AuditLogger(), null);
+        return new OpsScheduler(null, null, null, null, null, new AuditLogger(), null, 45);
     }
 
-    private String invokeBackstop(OpsScheduler sched, String status, Map<String, Object> snap) throws Exception {
+    private String invokeBackstop(OpsScheduler sched, String aiStatus, Map<String, Object> block) throws Exception {
         Method m = OpsScheduler.class.getDeclaredMethod(
-                "applyThresholdBackstop", String.class, Map.class);
+                "applyThresholdBackstop", String.class, String.class, Map.class);
         m.setAccessible(true);
-        return (String) m.invoke(sched, status, snap);
+        return (String) m.invoke(sched, "aiops-copilot", aiStatus, block);
     }
 
-    private String invokeFallback(OpsScheduler sched, Map<String, Object> snap) throws Exception {
+    private OpsScheduler.TargetJudgment invokeFallback(OpsScheduler sched, Map<String, Object> block) throws Exception {
         Method m = OpsScheduler.class.getDeclaredMethod("fallbackByThreshold", Map.class);
         m.setAccessible(true);
-        return (String) m.invoke(sched, snap);
+        @SuppressWarnings("unchecked")
+        java.util.List<OpsScheduler.TargetJudgment> judgments =
+                (java.util.List<OpsScheduler.TargetJudgment>) m.invoke(sched, wrap(block));
+        assertEquals(1, judgments.size(), "单目标块应产出恰好一条判定");
+        return judgments.getFirst();
+    }
+
+    /** 把单目标指标块包装成生产形态的多目标快照（与 SnapshotCollector.collect 结构一致） */
+    private static Map<String, Object> wrap(Map<String, Object> block) {
+        return Map.of("targets", Map.of("aiops-copilot", block));
     }
 }

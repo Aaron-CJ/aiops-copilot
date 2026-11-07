@@ -279,7 +279,7 @@ public class DiagnosisService {
             long elapsed = System.currentTimeMillis() - start;
             audit.deepDiagnosisFinished(taskId, task.trigger(), task.fingerprint(), "failed", elapsed);
             metricsService.recordDiagnosis(task.trigger(), "failed", elapsed);
-            log.warn("[DiagnosisService] 深度诊断失败 taskId={} reason={}", taskId, reason);
+            log.warn("[DiagnosisService] 深度诊断失败 taskId={} reason={}", taskId, reason, e);
         } finally {
             tasks.put(taskId, task);
             reporter.logDeepReport(task, System.currentTimeMillis() - start);

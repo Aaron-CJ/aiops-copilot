@@ -13,18 +13,43 @@
 
 ```text
 Prometheus ──抓取── /actuator/prometheus（自指监控：AI 能查到自己报过几次告警）
-     ▲ 查询 API
+     ▲ 查询 API（每条查询带 application 标签过滤）
      │
-SnapshotCollector（每 60s：7 条核心指标 + BLOCKED>0 时 ThreadMXBean 死锁二级诊断）
+SnapshotCollector（每 60s：对目标列表并行采集 7 条核心指标/目标；self 的
+                   BLOCKED>0 时 ThreadMXBean 死锁二级诊断；self 永远在列）
      ▼
-OpsScheduler ── qwen3:8b 关思考链（45s 超时）── 严格 JSON：status/rootCause/suggestion...
+OpsScheduler ── qwen3:8b 关思考链（45s 超时）── 严格 JSON：逐目标 status/rootCause/suggestion
      ├─ LLM 超时/挂掉 → 硬阈值降级兜底（连续 3 轮 → 显式 LLM_UNAVAILABLE 告警）
+     ├─ 深度诊断运行 → 主动让路（跳过 LLM 走兜底，不计时失效）
      ├─ normal → 事件连续 3 轮 normal 自动 RESOLVED 归档
      └─ warning/critical → IncidentStore 状态机（NEW 全量报告 / ACTIVE 心跳 / RESOLVED）
              └─ 命中升级规则 → DiagnosisService 有界队列 → deepseek-r1 深度诊断（15min 硬超时）
 
 旁路：GET /api/agent/ops（Function Calling 交互）· GET /api/ai/rag(/stream)（Milvus RAG）· POST /api/diagnosis（人工触发）
 ```
+
+**多目标**：巡检默认只监控自己；要纳管其它应用，两步接入（Prometheus 抓到哪就能看到哪，语言无关——非 JVM 目标经指标映射接入）：
+
+```yaml
+# ① docker/prometheus.yml：为目标加抓取任务
+scrape_configs:
+  - job_name: 'order-service'
+    static_configs:
+      - targets: ['host.docker.internal:8081']
+
+# ② 应用 application.yml：把目标加入巡检列表
+aiops:
+  targets:
+    list:
+      - name: 订单服务
+        application: order-service   # 目标应用需配置 management.metrics.tags.application=<同值>
+      - name: 支付网关                # 非 JVM 目标：metrics 覆盖映射接入（配什么 PromQL 得什么值）
+        application: payment-gateway
+        metrics:
+          qpsLast1m: 'sum(rate(http_requests_duration_seconds_count{app="pay"}[1m]))'
+```
+
+纳管前提：目标应用需暴露 Prometheus 指标端点（Spring Boot 加 actuator + micrometer 即可；非 JVM 用 exporter/javaagent），并配置同名 `application` 标签。
 
 ## 快速开始
 
@@ -46,7 +71,7 @@ curl http://localhost:8080/api/health/check
 ## 测试
 
 ```powershell
-./gradlew test              # 112 个单元测试，秒级、零基础设施依赖
+./gradlew test              # 120 个单元测试，秒级、零基础设施依赖
 ./gradlew integrationTest   # Spring 装配冒烟（需 Milvus 在线）+ 虚拟线程演示基准
 ```
 

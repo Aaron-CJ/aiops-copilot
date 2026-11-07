@@ -3,6 +3,7 @@ package com.aiops.aiopscopilot.config;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.ollama.api.OllamaChatOptions;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -23,7 +24,20 @@ import com.aiops.aiopscopilot.tool.SystemHealthTools;
  * （base-url、默认模型），这里只做按通道差异化的覆盖。
  */
 @Configuration
+@EnableConfigurationProperties(TargetsProperties.class)
 public class AiConfig {
+
+    /**
+     * 巡检输出契约：多目标判定数组 {@code {targets:[{name,status,confidence,summary,rootCause,suggestion}]}}。
+     * 形状由 Prompt（OpsScheduler.buildInspectionPrompt）与宽容解析（parseJudgments，兼容旧单对象）保障。
+     * <p>
+     * 输出形状刻意不走 Ollama 的 JSON Schema 解码期约束：语法约束显著拖慢生成速度
+     * （叠加多目标更长的输出与机器负载，45s 预算内无法完成，实测连续 llm_timeout），
+     * 延迟是每轮的确定性成本，而解析失败只是偶发且自愈（parse_error 通道 + 下一轮重试）。
+     */
+    static final String INSPECTION_OUTPUT_CONTRACT =
+            "{\"targets\":[{\"name\":\"...\",\"status\":\"normal|warning|critical\",\"confidence\":\"high|medium|low\","
+                    + "\"summary\":\"...\",\"rootCause\":\"...\",\"suggestion\":\"...\"}]}";
 
     /**
      * 深度通道：使用 yml 默认模型 deepseek-r1:8b（思考链默认开启），
@@ -41,7 +55,7 @@ public class AiConfig {
      * 1) {@code defaultOptions} 覆盖为配置的快速模型并 disableThinking()（混合思考模型默认开思考链，
      *    巡检只要结构化结论，关闭后响应快数倍）；
      * 2) <b>刻意不注册任何工具</b>：巡检指标由调度器通过
-     *    {@code PrometheusTool.queryFixedMetrics()} 预拉后直接塞进 Prompt，
+     *    {@code PrometheusTool.querySnapshot(target)} 对目标列表逐个预拉后直接塞进 Prompt，
      *    模型只负责"看快照→判异常→输出 JSON"。挂工具 schema 会让每次巡检平白多带
      *    几百 token 的工具描述，还可能诱导模型发起多余的工具调用往返。
      *    工具能力只挂在 {@link #opsAgentClient} 上。
@@ -91,10 +105,13 @@ public class AiConfig {
                         - 某接口 QPS：rate(http_server_requests_seconds_count{uri="/api/xxx"}[1m])
                         - 请求最大延迟（秒）：max(http_server_requests_seconds_max)
                         - JVM 堆内存（字节，按 id 分代 Eden/Survivor/Old）：jvm_memory_used_bytes{area="heap"}
+                        - JVM 堆内存上限（字节）：jvm_memory_max_bytes{area="heap"}
+                        - JVM 堆内存使用率（0~1）：sum(jvm_memory_used_bytes{area="heap"}) / sum(jvm_memory_max_bytes{area="heap"} > 0)
                         - 进程 CPU 使用率（0~1）：process_cpu_usage
                         - 阻塞线程数：jvm_threads_states_threads{state="blocked"}
                         - 近 5 分钟 GC 总次数：sum(increase(jvm_gc_pause_seconds_count[5m]))
                         注意：http_server_requests 与 jvm_gc_pause 指标按 uri/action/cause 带标签、是多条时间序列，问"总量"必须用 sum/max 聚合，否则每次只会读到其中一个接口或一种 GC 的值。
+                        查询特定应用（而非 aiops-copilot 自身）时，所有指标必须加 application="<目标标签>" 过滤——共享的 Prometheus 抓取了多个应用，不过滤会串数据。
                         若查询返回 count=0，通常是指标名写错，应改用上面的正确指标名重试。""")
                 .build();
     }

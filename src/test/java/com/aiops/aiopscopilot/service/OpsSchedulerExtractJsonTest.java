@@ -32,7 +32,7 @@ class OpsSchedulerExtractJsonTest {
 
     private static String extract(String reply) {
         try {
-            OpsScheduler scheduler = new OpsScheduler(null, null, null, null, null, new AuditLogger(), null);
+            OpsScheduler scheduler = new OpsScheduler(null, null, null, null, null, new AuditLogger(), null, 45);
             return (String) extractJson.invoke(scheduler, reply);
         } catch (java.lang.reflect.InvocationTargetException e) {
             throw new RuntimeException(e.getCause());

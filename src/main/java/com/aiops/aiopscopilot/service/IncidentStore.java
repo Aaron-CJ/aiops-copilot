@@ -143,7 +143,7 @@ public class IncidentStore {
     }
 
     /**
-     * 根据指标快照构造事件指纹。
+     * 根据目标名与指标快照构造事件指纹。
      * <p>
      * 基于"指标特征"而非 LLM rootCause 文本——LLM 对同一故障的描述每次会略有不
      * 同（"存在死锁，死锁线程为..." vs "存在死锁，deadlockedThreads 列出了..."），
@@ -152,40 +152,54 @@ public class IncidentStore {
      * 指标特征是稳定的：只要同一类指标异常（如 BLOCKED&gt;0），无论 LLM 怎么描述，
      * 指纹都一致，从而正确合并到同一事件。
      * <p>
-     * 例：{@code ("critical", {blockedThreads=2, deadlockDiagnosis=...})} →
-     *     {@code "CRITICAL|DEADLOCK;BLOCKED=2;"}
+     * APP 前缀：目标名进指纹第一位——状态机按指纹字符串去重，
+     * 不同应用的故障天然分成独立事件，心跳/防抖窗口/升级计时互不干扰，状态机零改动。
+     * <p>
+     * 例：{@code ("aiops-copilot", "critical", {blockedThreads=2, deadlockDiagnosis=...})} →
+     *     {@code "CRITICAL|APP=aiops-copilot;DEADLOCK;BLOCKED=2;"}
      */
-    public static String fingerprintOf(String status, Map<String, Object> snapshot) {
-        StringBuilder features = new StringBuilder();
+    public static String fingerprintOf(String targetName, String status, Map<String, Object> snapshot) {
+        StringBuilder body = new StringBuilder();
         // 死锁诊断字段优先（已经在 OpsScheduler 中按 BLOCKED>0 触发 ThreadMXBean 二级诊断）
         if (snapshot.get("deadlockDiagnosis") != null) {
-            features.append("DEADLOCK;");
+            body.append("DEADLOCK;");
         }
         double blocked = asDouble(snapshot.get("blockedThreads"));
         if (blocked > 0) {
-            features.append("BLOCKED=").append((int) blocked).append(";");
+            body.append("BLOCKED=").append((int) blocked).append(";");
         }
         double cpu = asDouble(snapshot.get("cpuUsage"));
         if (cpu > CPU_BUCKET_THRESHOLD) {
             // 分桶避免轻微波动（0.91 vs 0.92）产生不同指纹
-            features.append("HIGH_CPU=").append((int) (cpu * 10)).append(";");
+            body.append("HIGH_CPU=").append((int) (cpu * 10)).append(";");
         }
         double heap = asDouble(snapshot.get("heapUsage"));
         if (heap > HEAP_BUCKET_THRESHOLD) {
-            features.append("HIGH_HEAP=").append((int) (heap * 10)).append(";");
+            body.append("HIGH_HEAP=").append((int) (heap * 10)).append(";");
         }
         double gc5m = asDouble(snapshot.get("gcCountLast5m"));
         if (gc5m > GC_BUCKET_THRESHOLD) {
-            features.append("FREQUENT_GC;");
+            body.append("FREQUENT_GC;");
         }
         // ZERO_QPS 只作为兜底特征：已有死锁/阻塞/CPU/堆/GC 等更具体信号时不再附加。
         // 否则同一故障会因"最近一分钟恰好有没有流量"在两种指纹间抖动，被状态机拆成两条
         // 并发 ACTIVE 事件，心跳、防抖窗口与 5 分钟升级计时全部按指纹分裂
         double qps = asDouble(snapshot.get("qpsLast1m"));
-        if (qps == 0 && cpu >= 0 && features.length() == 0) {
-            features.append("ZERO_QPS;");
+        if (qps == 0 && cpu >= 0 && body.isEmpty()) {
+            body.append("ZERO_QPS;");
         }
-        return status.toUpperCase() + "|" + features;
+        return status.toUpperCase() + "|APP=" + targetName + ";" + body;
+    }
+
+    /** 从指纹解析目标名（APP= 前缀约定）；无前缀的指纹（如 LLM_UNAVAILABLE 专用指纹）返回 null */
+    public static String targetOf(String fingerprint) {
+        if (fingerprint != null && fingerprint.startsWith("APP=")) {
+            int end = fingerprint.indexOf(';', 4);
+            if (end > 4) {
+                return fingerprint.substring(4, end);
+            }
+        }
+        return null;
     }
 
     /** 把指标值安全转为 double；非数字或 null 返回 -1 */

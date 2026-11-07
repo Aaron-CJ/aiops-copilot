@@ -3,6 +3,7 @@ package com.aiops.aiopscopilot.service;
 import com.aiops.aiopscopilot.common.audit.AuditLogger;
 import com.aiops.aiopscopilot.service.IncidentStore.Incident;
 import com.aiops.aiopscopilot.service.IncidentStore.IncidentStatus;
+import com.aiops.aiopscopilot.service.OpsScheduler.TargetJudgment;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Method;
@@ -22,6 +23,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 阈值兜底（OpsScheduler#fallbackByThreshold）、瞬时尖峰的状态机抑制。
  * LLM 根因层（根因关键词命中）需真实 Ollama，按评估手册人工执行。
  * <p>
+ * 多目标：兜底按目标评估，测试快照经 wrap() 包装成
+ * {targets:{aiops-copilot:块}} 形态——与生产快照结构一致。
+ * <p>
  * 用例编号 F1-F5 与评估手册表格一一对应；改 prompt/模型/工具后先跑本类，
  * 绿了再进入手册第 3 节的 LLM 层回归。
  */
@@ -35,18 +39,20 @@ class FaultInjectionEvaluationTest {
         snap.put("blockedThreads", 2.0);
         snap.put("deadlockDiagnosis", Map.of("deadlockDetected", true, "deadlockedThreadCount", 2));
 
-        assertEquals("CRITICAL|DEADLOCK;BLOCKED=2;", IncidentStore.fingerprintOf("critical", snap),
-                "死锁快照应产出 DEADLOCK+BLOCKED 特征指纹");
+        assertEquals("CRITICAL|APP=aiops-copilot;DEADLOCK;BLOCKED=2;",
+                IncidentStore.fingerprintOf("aiops-copilot", "critical", snap),
+                "死锁快照应产出 APP+DEADLOCK+BLOCKED 特征指纹");
 
         // QPS 归零只是死锁的伴随症状：若把它也编进指纹，同一死锁会在"有流量/无流量"两轮之间
         // 来回切换身份，被拆成两条并发事件，心跳与升级计时全部分裂
         snap.put("qpsLast1m", 0.0);
-        assertEquals("CRITICAL|DEADLOCK;BLOCKED=2;", IncidentStore.fingerprintOf("critical", snap),
+        assertEquals("CRITICAL|APP=aiops-copilot;DEADLOCK;BLOCKED=2;",
+                IncidentStore.fingerprintOf("aiops-copilot", "critical", snap),
                 "已有更具体信号时，ZERO_QPS 不应改变同一死锁的指纹");
 
-        String json = invokeFallback(snap);
-        assertTrue(json.contains("\"status\":\"critical\""), "BLOCKED>0 兜底应判 critical: " + json);
-        assertTrue(json.contains("死锁"), "根因应含死锁关键词: " + json);
+        TargetJudgment j = invokeFallback(snap);
+        assertEquals("critical", j.status(), "BLOCKED>0 兜底应判 critical");
+        assertTrue(j.rootCause().contains("死锁"), "根因应含死锁关键词: " + j.rootCause());
     }
 
     // ==================== F2 内存泄漏：堆超限 + GC 频繁 ====================
@@ -57,13 +63,14 @@ class FaultInjectionEvaluationTest {
         snap.put("heapUsage", 0.96);
         snap.put("gcCountLast5m", 15.0);
 
-        assertEquals("CRITICAL|HIGH_HEAP=9;FREQUENT_GC;", IncidentStore.fingerprintOf("critical", snap),
+        assertEquals("CRITICAL|APP=aiops-copilot;HIGH_HEAP=9;FREQUENT_GC;",
+                IncidentStore.fingerprintOf("aiops-copilot", "critical", snap),
                 "内存泄漏快照应产出 HIGH_HEAP+FREQUENT_GC 特征指纹");
 
-        String json = invokeFallback(snap);
-        assertTrue(json.contains("\"status\":\"critical\""), "堆>0.95 兜底应判 critical: " + json);
-        assertTrue(json.contains("堆内存"), "根因应含堆内存关键词: " + json);
-        assertTrue(json.contains("内存泄漏"), "GC 频繁应指向内存泄漏: " + json);
+        TargetJudgment j = invokeFallback(snap);
+        assertEquals("critical", j.status(), "堆>0.95 兜底应判 critical");
+        assertTrue(j.rootCause().contains("堆内存"), "根因应含堆内存关键词: " + j.rootCause());
+        assertTrue(j.rootCause().contains("内存泄漏"), "GC 频繁应指向内存泄漏: " + j.rootCause());
     }
 
     // ==================== F3 应用假死：QPS=0 但指标可拉取（连续 2 轮确认） ====================
@@ -81,40 +88,35 @@ class FaultInjectionEvaluationTest {
         Map<String, Object> snap = baseSnapshot();
         snap.put("qpsLast1m", 0.0);
 
-        assertEquals("CRITICAL|ZERO_QPS;", IncidentStore.fingerprintOf("critical", snap),
+        assertEquals("CRITICAL|APP=aiops-copilot;ZERO_QPS;",
+                IncidentStore.fingerprintOf("aiops-copilot", "critical", snap),
                 "QPS=0 应产出 ZERO_QPS 特征指纹");
 
         OpsScheduler sched = newScheduler();
-        String idleFromStart = invokeFallback(sched, snap);
-        assertEquals("\"status\":\"normal\"", extractStatus(idleFromStart),
+        TargetJudgment idleFromStart = invokeFallback(sched, snap);
+        assertEquals("normal", idleFromStart.status(),
                 "从未观测到流量的空闲实例 QPS=0 是常态，不得判假死: " + idleFromStart);
 
         // 先观测一轮真实流量建立基线，后续 QPS=0 才是"从有流量跌到零"的假死信号
         invokeFallback(sched, baseSnapshot());
 
-        String firstRound = invokeFallback(sched, snap);
-        assertTrue(firstRound.contains("\"status\":\"warning\""),
+        TargetJudgment firstRound = invokeFallback(sched, snap);
+        assertEquals("warning", firstRound.status(),
                 "第 1 轮 QPS=0 应判 warning 待确认（空闲低流量单轮 QPS=0 是常态）: " + firstRound);
-        assertTrue(firstRound.contains("待确认"), "第 1 轮根因应含待确认说明: " + firstRound);
+        assertTrue(firstRound.rootCause().contains("待确认"),
+                "第 1 轮根因应含待确认说明: " + firstRound.rootCause());
 
-        String secondRound = invokeFallback(sched, snap);
-        assertTrue(secondRound.contains("\"status\":\"critical\""),
+        TargetJudgment secondRound = invokeFallback(sched, snap);
+        assertEquals("critical", secondRound.status(),
                 "连续第 2 轮 QPS=0 应升级 critical 假死: " + secondRound);
-        assertTrue(secondRound.contains("假死"), "根因应含假死关键词: " + secondRound);
+        assertTrue(secondRound.rootCause().contains("假死"),
+                "根因应含假死关键词: " + secondRound.rootCause());
 
         // QPS 恢复后计数必须归零：下一轮 QPS=0 重新从 warning 起步
-        Map<String, Object> recovered = baseSnapshot();
-        invokeFallback(sched, recovered);
-        String reconfirm = invokeFallback(sched, snap);
-        assertTrue(reconfirm.contains("\"status\":\"warning\""),
+        invokeFallback(sched, baseSnapshot());
+        TargetJudgment reconfirm = invokeFallback(sched, snap);
+        assertEquals("warning", reconfirm.status(),
                 "QPS 恢复一轮后计数应归零，再次 QPS=0 从 warning 重新确认: " + reconfirm);
-    }
-
-    /** 从兜底 JSON 中提取 status 值（纯字符串比较，避免为一处断言引入 JSON 解析依赖） */
-    private static String extractStatus(String json) {
-        int start = json.indexOf("\"status\":\"");
-        int end = json.indexOf('"', start + 10);
-        return json.substring(start, end + 1);
     }
 
     // ==================== F4 慢接口：纯延迟无硬阈值（设计边界） ====================
@@ -124,13 +126,13 @@ class FaultInjectionEvaluationTest {
         Map<String, Object> snap = baseSnapshot();
         snap.put("maxRequestSeconds", 30.0);
 
-        String json = invokeFallback(snap);
-        assertTrue(json.contains("\"status\":\"normal\""),
-                "纯延迟不应触发硬阈值兜底——慢接口是 LLM 语义层用例: " + json);
+        TargetJudgment j = invokeFallback(snap);
+        assertEquals("normal", j.status(),
+                "纯延迟不应触发硬阈值兜底——慢接口是 LLM 语义层用例: " + j);
 
-        // 同时记录当前指纹行为：纯延迟无指标特征，指纹退化为裸级别，
+        // 同时记录当前指纹行为：纯延迟无指标特征，指纹退化为 APP 前缀 + 裸级别，
         // 同类 warning 会被合并为同一事件（LLM 层根因文本不参与指纹，设计如此）
-        assertEquals("WARNING|", IncidentStore.fingerprintOf("warning", snap));
+        assertEquals("WARNING|APP=aiops-copilot;", IncidentStore.fingerprintOf("aiops-copilot", "warning", snap));
     }
 
     // ==================== F5 瞬时尖峰：单轮捕获后自动 RESOLVED，不产生持续告警 ====================
@@ -139,12 +141,13 @@ class FaultInjectionEvaluationTest {
     void f5_transientCpuSpike_capturedThenAutoResolved() {
         Map<String, Object> spikeSnap = baseSnapshot();
         spikeSnap.put("cpuUsage", 0.92);
-        assertEquals("WARNING|HIGH_CPU=9;", IncidentStore.fingerprintOf("warning", spikeSnap),
+        assertEquals("WARNING|APP=aiops-copilot;HIGH_CPU=9;",
+                IncidentStore.fingerprintOf("aiops-copilot", "warning", spikeSnap),
                 "CPU 0.92 应产出分桶后的 HIGH_CPU=9 特征指纹");
 
         IncidentStore store = new IncidentStore();
         Incident first = store.recordOrUpdate(
-                IncidentStore.fingerprintOf("warning", spikeSnap),
+                IncidentStore.fingerprintOf("aiops-copilot", "warning", spikeSnap),
                 "warning", "CPU 尖峰", "CPU 92%", "观察");
         assertTrue(first.isNew(), "被单轮巡检捕获的尖峰应为 NEW");
 
@@ -160,7 +163,7 @@ class FaultInjectionEvaluationTest {
 
     /**
      * 构造"全部正常"形态的指标快照基底（各用例按需覆盖异常字段）。
-     * 键集合与 PrometheusTool.queryFixedMetrics 对齐。
+     * 键集合与 PrometheusTool.querySnapshot 对齐。
      */
     private static Map<String, Object> baseSnapshot() {
         Map<String, Object> snap = new HashMap<>();
@@ -173,18 +176,26 @@ class FaultInjectionEvaluationTest {
         return snap;
     }
 
+    /** 把单目标指标块包装成生产形态的多目标快照（与 SnapshotCollector.collect 输出结构一致） */
+    private static Map<String, Object> wrap(Map<String, Object> block) {
+        return Map.of("targets", Map.of("aiops-copilot", block));
+    }
+
     /** 与 IncidentStoreTest 相同的手法：依赖为 null 的 OpsScheduler 只测纯逻辑私有方法。 */
     private OpsScheduler newScheduler() {
-        return new OpsScheduler(null, null, null, null, null, new AuditLogger(), null);
+        return new OpsScheduler(null, null, null, null, null, new AuditLogger(), null, 45);
     }
 
-    private String invokeFallback(Map<String, Object> snap) throws Exception {
-        return invokeFallback(newScheduler(), snap);
+    private TargetJudgment invokeFallback(Map<String, Object> block) throws Exception {
+        return invokeFallback(newScheduler(), block);
     }
 
-    private String invokeFallback(OpsScheduler sched, Map<String, Object> snap) throws Exception {
+    private TargetJudgment invokeFallback(OpsScheduler sched, Map<String, Object> block) throws Exception {
         Method m = OpsScheduler.class.getDeclaredMethod("fallbackByThreshold", Map.class);
         m.setAccessible(true);
-        return (String) m.invoke(sched, snap);
+        @SuppressWarnings("unchecked")
+        List<TargetJudgment> judgments = (List<TargetJudgment>) m.invoke(sched, wrap(block));
+        assertEquals(1, judgments.size(), "单目标快照应产出恰好一条判定");
+        return judgments.getFirst();
     }
 }

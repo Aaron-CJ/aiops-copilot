@@ -40,9 +40,11 @@ public class AuditLogger {
         audit.warn("巡检|DEGRADED|reason={}|elapsedMs={}", reason, elapsedMs);
     }
 
-    /** AI 漏报兜底介入（AI 判 normal 但指标超阈值，代码强改 warning/critical） */
-    public void backstopTriggered(String aiStatus, String forcedStatus, String metric, double value) {
-        audit.warn("巡检|BACKSTOP|aiStatus={}|forcedStatus={}|metric={}|value={}", aiStatus, forcedStatus, metric, value);
+    /** AI 漏报兜底介入（AI 判 normal 但指标超阈值，代码强改 warning/critical）。
+     *  带目标名——多目标下审计必须能定位是哪个应用被强改 */
+    public void backstopTriggered(String targetName, String aiStatus, String forcedStatus, String metric, double value) {
+        audit.warn("巡检|BACKSTOP|target={}|aiStatus={}|forcedStatus={}|metric={}|value={}",
+                targetName, aiStatus, forcedStatus, metric, value);
     }
 
     /** 事件首次发现（NEW） */

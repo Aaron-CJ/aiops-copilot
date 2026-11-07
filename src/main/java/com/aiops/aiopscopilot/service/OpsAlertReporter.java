@@ -42,12 +42,12 @@ public class OpsAlertReporter {
     /**
      * 输出结构化告警报告（首次发现 NEW 时调用）。
      *
-     * @param fingerprint     事件指纹（基于指标快照，用于审计日志关联）
+     * @param fingerprint     事件指纹（基于指标快照，用于审计日志关联；APP= 前缀承载目标名）
      * @param status          异常级别：warning / critical
      * @param summary         一句话异常摘要（模型生成）
      * @param rootCause       根因分析（模型生成）
      * @param suggestion      处置建议（模型生成）
-     * @param metricsSnapshot 巡检时的指标快照
+     * @param metricsSnapshot 巡检时的指标快照（多目标时含全部目标块，给足上下文）
      * @param modelRawOutput  模型原始输出（DEBUG 级保留，便于调优 prompt）
      */
     public void report(String fingerprint, String status, String summary, String rootCause, String suggestion,
@@ -55,6 +55,10 @@ public class OpsAlertReporter {
         StringBuilder sb = new StringBuilder(512);
         sb.append("\n==================================================");
         sb.append("\n[AIOps 巡检告警] 级别: ").append(status.toUpperCase());
+        String target = IncidentStore.targetOf(fingerprint);
+        if (target != null) {
+            sb.append("\n目标: ").append(target);
+        }
         sb.append("\n--------------------------------------------------");
         sb.append("\n异常摘要: ").append(summary);
         sb.append("\n--------------------------------------------------");
@@ -76,7 +80,8 @@ public class OpsAlertReporter {
      */
     public void logHeartbeat(Incident incident) {
         Duration dur = IncidentStore.durationOf(incident);
-        log.info("[AIOps 心跳] 故障持续中 | 指纹={} | 已持续 {}min | 首次摘要={} | 最新根因={}",
+        log.info("[AIOps 心跳] 故障持续中 | 目标={} | 指纹={} | 已持续 {}min | 首次摘要={} | 最新根因={}",
+                IncidentStore.targetOf(incident.fingerprint()),
                 incident.fingerprint(),
                 dur.toMinutes(),
                 incident.summary(),
@@ -89,7 +94,8 @@ public class OpsAlertReporter {
      */
     public void logResolved(Incident incident) {
         Duration dur = IncidentStore.durationOf(incident);
-        log.info("[AIOps 恢复] 故障已恢复 | 指纹={} | 总持续 {}min | 历史根因={}",
+        log.info("[AIOps 恢复] 故障已恢复 | 目标={} | 指纹={} | 总持续 {}min | 历史根因={}",
+                IncidentStore.targetOf(incident.fingerprint()),
                 incident.fingerprint(),
                 dur.toMinutes(),
                 incident.rootCause());
@@ -97,7 +103,7 @@ public class OpsAlertReporter {
     }
 
     /**
-     * 巡检正常时输出 INFO 级一行摘要。
+     * 巡检正常时输出 INFO 级一行摘要（多目标：逐目标压缩列出关键指标）。
      * 设计原则：正常情况应该静默，运维同学不该被无意义日志打扰。
      *
      * @param degraded true 表示本轮未走 AI（LLM 不可用或深度诊断运行时主动让路）的硬阈值判定，
@@ -106,14 +112,38 @@ public class OpsAlertReporter {
      *                 DEGRADED 行（reason=llm_timeout / llm_error / diagnosis_running）
      */
     public void logNormal(Map<String, Object> metricsSnapshot, boolean degraded) {
-        log.info("[OpsScheduler] 巡检完成: {} | CPU={} | 堆使用率={} | QPS={} | 最大延迟={} | BLOCKED={} | GC(5m)={}",
+        log.info("[OpsScheduler] 巡检完成: {} | {}",
                 degraded ? "降级正常（本轮未走 AI，仅硬阈值判断）" : "正常",
-                metricsSnapshot.get("cpuUsage"),
-                metricsSnapshot.get("heapUsage"),
-                metricsSnapshot.get("qpsLast1m"),
-                metricsSnapshot.get("maxRequestSeconds"),
-                metricsSnapshot.get("blockedThreads"),
-                metricsSnapshot.get("gcCountLast5m"));
+                normalLine(metricsSnapshot));
+    }
+
+    /** 多目标巡检完成行的正文（逐目标压缩列出关键指标）——提取为纯函数便于单测 */
+    static String normalLine(Map<String, Object> metricsSnapshot) {
+        StringBuilder perTarget = new StringBuilder();
+        if (metricsSnapshot.get("targets") instanceof Map<?, ?> targets) {
+            for (Map.Entry<?, ?> e : targets.entrySet()) {
+                if (!perTarget.isEmpty()) {
+                    perTarget.append("  ;;  ");
+                }
+                perTarget.append('[').append(e.getKey()).append("] ");
+                if (e.getValue() instanceof Map<?, ?> b) {
+                    if (b.containsKey("error")) {
+                        // 采集失败的目标块：显示原因而非六个 null（见 SnapshotCollector.collectOne）
+                        perTarget.append("查询失败: ").append(b.get("error"));
+                        continue;
+                    }
+                    perTarget.append("CPU=").append(b.get("cpuUsage"))
+                            .append(" 堆=").append(b.get("heapUsage"))
+                            .append(" QPS=").append(b.get("qpsLast1m"))
+                            .append(" 最大延迟=").append(b.get("maxRequestSeconds"))
+                            .append(" BLOCKED=").append(b.get("blockedThreads"))
+                            .append(" GC(5m)=").append(b.get("gcCountLast5m"));
+                } else {
+                    perTarget.append(e.getValue());
+                }
+            }
+        }
+        return perTarget.toString();
     }
 
     /**

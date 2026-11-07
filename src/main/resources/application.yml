@@ -17,6 +17,23 @@ aiops:
     # 快速通道模型：定时巡检 + 交互 Agent（关闭思考链，追求低延迟）
     # 深度推理/RAG 模型直接复用下方 spring.ai.ollama.chat.model（deepseek-r1:8b）
     fast: qwen3:8b
+  targets:
+    # 多目标监控：巡检对列表内每个目标并行采集并逐一判定，
+    # 自己（application = spring.application.name）永远自动在列、不可删除。
+    # 缺省 list 为空 = 只监控自己（行为与单目标版一致）。
+    # 纳管其它应用：目标应用需自行配置 management.metrics.tags.application=<标签值>
+    # （Spring Boot 一行配置）；非 JVM 目标通过 metrics 覆盖映射接入（配什么 PromQL
+    # 得什么值，留空的语义记 -1 哨兵被 AI 忽略），语言无关。
+    # list:
+    #   - name: 订单服务
+    #     application: order-service
+    #     metrics: {}                # JVM/Spring 目标留空用默认档；其它语言在这里配映射
+    #     # qpsLast1m: 'sum(rate(http_requests_total{app="pay"}[1m]))'
+  inspection:
+    # 巡检 LLM 调用超时（秒）。默认 45 = 单目标（60s 周期的 75%）；
+    # 多目标部署 Prompt 与输出都更长，实测 2 目标 + 机器负载下 45s 不够（llm_timeout 连发），
+    # 建议按目标数上调至 90-150（fixedDelay 语义下轮次自动拉长，不会堆积）
+    llm-timeout-seconds: ${AIOPS_INSPECTION_LLM_TIMEOUT_SECONDS:45}
   diagnosis:
     # 深度诊断任务队列（DiagnosisService，白皮书 4.2），均可用环境变量覆盖
     queue-capacity: ${AIOPS_DIAGNOSIS_QUEUE_CAPACITY:20}          # 有界队列容量，满则拒绝并记审计
