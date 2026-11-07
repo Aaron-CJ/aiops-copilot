@@ -115,11 +115,20 @@ public class OpsScheduler {
     /** 连续解析失败计数：解析成功一轮即归零；达到 PARSE_FAILURE_LIMIT 触发深度升级 */
     private int consecutiveParseFailures = 0;
 
-    /** 连续 QPS=0 计数：升计数仅由降级路径 fallbackByThreshold 维护；归零统一在
-     *  handleInspectionResult 入口——任一路径观测到 QPS&gt;0 都会打断"连续假死"序列
-     *  （否则"降级轮 QPS=0 → AI 轮 QPS&gt;0 → 再降级轮 QPS=0"会被误判为连续 2 轮假死）；
-     *  达到 ZERO_QPS_CONFIRM_ROUNDS 才判假死 critical */
+    /** 连续 QPS=0 计数：升计数在降级路径 fallbackByThreshold 内维护，该路径在"非零流量或
+     *  指标不可观测"时归零；handleInspectionResult 入口另补充一条跨路径归零——任一路径观测
+     *  到 QPS&gt;0 都打断序列（否则"降级轮 QPS=0 → AI 轮 QPS&gt;0 → 再降级轮 QPS=0"会被
+     *  误判为连续 2 轮假死）；达到 ZERO_QPS_CONFIRM_ROUNDS 才判假死 critical */
     private int consecutiveZeroQpsRounds = 0;
+
+    /**
+     * 是否观测到过真实流量。
+     * <p>
+     * QPS=0 只有在"此前有流量、随后跌到零"时才是假死信号。全新启动或长期空闲的实例
+     * QPS 恒为 0，若不做基线门控，空闲环境会每分钟被误报为 critical 假死——
+     * 实测空闲演示环境即触发该误报。本标志一旦为 true 不再回退（重启才清零）。
+     */
+    private boolean observedTraffic = false;
 
     /** 连续降级轮数：LLM 正常返回即归零；达到 LLM_UNAVAILABLE_ROUNDS 触发显式告警 */
     private int consecutiveDegradedRounds = 0;
@@ -159,6 +168,14 @@ public class OpsScheduler {
         try {
             // 1. 预拉指标快照（7 条核心指标 + BLOCKED>0 时 ThreadMXBean 死锁二级诊断）
             snapshot = snapshotCollector.collect();
+            // 深度诊断正在占用同一个 Ollama（CPU 推理且 NUM_PARALLEL=1）：此时再发 qwen3 请求会
+            // 互相拖慢——实测 r1 被拖到 15 分钟硬超时，巡检也每轮 45 秒超时。主动让路：
+            // 本轮跳过 LLM、用阈值兜底保持监测；这是"让路"不是故障，不累计 LLM 失效计数
+            if (diagnosisService.hasInflightTask()) {
+                audit.degradedPathTriggered("diagnosis_running", System.currentTimeMillis() - start);
+                handleDegraded(snapshot, start, false);
+                return;
+            }
             // 2. 构造结构化 Prompt 让模型判断，加超时保护避免 Ollama 卡死拖垮巡检
             String prompt = buildInspectionPrompt(snapshot);
             String reply = callLlmWithTimeout(prompt);
@@ -216,8 +233,18 @@ public class OpsScheduler {
      * 同时跟踪 LLM 失效告警（{@link #trackLlmUnavailable}）。
      */
     private void handleDegraded(Map<String, Object> snapshot, long start) {
+        handleDegraded(snapshot, start, true);
+    }
+
+    /**
+     * @param trackUnavailable true＝LLM 真的超时/异常，需累计 {@link #trackLlmUnavailable}；
+     *                         false＝为深度诊断主动让路，不能记成 LLM 故障，否则会误报
+     */
+    private void handleDegraded(Map<String, Object> snapshot, long start, boolean trackUnavailable) {
         // 放在 try 之前：兜底自身异常也不能丢掉 LLM 失效这枚信号
-        trackLlmUnavailable(snapshot);
+        if (trackUnavailable) {
+            trackLlmUnavailable(snapshot);
+        }
         try {
             String degradedReply = fallbackByThreshold(snapshot);
             audit.fallbackResult("degraded", degradedReply, snapshot);
@@ -262,8 +289,9 @@ public class OpsScheduler {
      *   <li>CPU &gt; {@value #CPU_WARN_THRESHOLD} → warning</li>
      *   <li>BLOCKED &gt; 0 → critical（死锁强信号）</li>
      *   <li>堆内存 &gt; {@value #HEAP_CRITICAL_THRESHOLD} → critical</li>
-     *   <li>QPS=0：第 1 轮 → warning"待确认"，连续 {@value #ZERO_QPS_CONFIRM_ROUNDS} 轮 → critical
-     *       （应用假死信号；连续确认避免空闲/低流量系统被单轮误报）</li>
+     *   <li>QPS=0：需此前观测到过真实流量（基线门控，空闲实例不算假死）；第 1 轮 → warning"待确认"，
+     *       连续 {@value #ZERO_QPS_CONFIRM_ROUNDS} 轮 → critical（应用假死信号；连续确认避免
+     *       空闲/低流量系统被单轮误报）</li>
      *   <li>5min GC &gt; 10 → warning（疑似内存泄漏）</li>
      * </ul>
      * 同时这是"Ollama 不可用时的兜底"，不是首选路径。
@@ -279,10 +307,15 @@ public class OpsScheduler {
         StringBuilder rootCause = new StringBuilder();
         String status = "normal";
 
-        // QPS=0 连续确认计数：本方法只被降级路径调用（巡检单线程串行），实例字段即轮次状态，
-        // 只负责升计数；归零统一在 handleInspectionResult 入口（任一路径观测到 QPS>0）。
-        // cpu>=0 表示指标拉取正常（不是 -1 哨兵），此时 QPS=0 才有判定意义
-        boolean zeroQpsNow = qps == 0 && cpu >= 0;
+        // QPS=0 连续确认计数：本方法只被降级路径调用（巡检单线程串行），实例字段即轮次状态。
+        // 零流量轮升计数；其余情形（含指标不可观测 cpu<0）归零——"没观测到"不能当作"连续零流量"。
+        // handleInspectionResult 入口另补充跨路径归零：任一路径观测到 QPS>0 都会打断序列。
+        // cpu>=0 表示指标拉取正常（不是 -1 哨兵），此时 QPS=0 才有判定意义；
+        // 还要求此前观测到过流量——从未有流量的空闲实例 QPS=0 是常态，不是假死
+        if (qps > 0) {
+            observedTraffic = true;
+        }
+        boolean zeroQpsNow = qps == 0 && cpu >= 0 && observedTraffic;
         if (zeroQpsNow) {
             consecutiveZeroQpsRounds++;
         } else {
@@ -392,9 +425,11 @@ public class OpsScheduler {
     private void handleInspectionResult(String reply, Map<String, Object> snapshot, long start, boolean degraded) {
         long durationMs = System.currentTimeMillis() - start;
         // QPS>0 的真实观测打断"连续 QPS=0"计数，与路径无关（AI 轮与降级轮都经本入口；
-        // 降级轮的升计数已由 fallbackByThreshold 先行处理），保证该计数只反映真实连续的零流量观测
+        // 降级轮的升计数已由 fallbackByThreshold 先行处理），保证该计数只反映真实连续的零流量观测；
+        // 同时记录流量基线——只有"曾经有流量"的实例，QPS=0 才具备假死判定意义
         if (asDouble(snapshot.get("qpsLast1m")) > 0) {
             consecutiveZeroQpsRounds = 0;
+            observedTraffic = true;
         }
         String json = extractJson(reply);
         try {

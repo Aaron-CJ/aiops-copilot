@@ -377,6 +377,19 @@ class DiagnosisServiceTest {
         return f;
     }
 
+    /**
+     * 巡检让路信号：只要有 PENDING/RUNNING 的深度诊断任务，Ollama 就被 r1 占用，
+     * 巡检必须停止发 qwen3 请求（单 Ollama + NUM_PARALLEL=1 下两者会互相拖到超时）。
+     */
+    @Test
+    void hasInflightTask_trueForPendingTask() {
+        service = newService(mock(ChatClient.class), mock(SnapshotCollector.class));
+        assertFalse(service.hasInflightTask(), "初始无任务，不应让路");
+
+        service.submitManual("检查线程阻塞");
+        assertTrue(service.hasInflightTask(), "已入队的任务会占用 Ollama，巡检应让路");
+    }
+
     /** 固定结果（每次调用返回同一报告 / 抛同一异常）的伪造客户端 */
     private ChatClient fakeChatClient(List<String> capturedPrompts, String[] reports,
                                       RuntimeException[] failures) {

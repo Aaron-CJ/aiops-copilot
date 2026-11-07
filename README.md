@@ -46,7 +46,7 @@ curl http://localhost:8080/api/health/check
 ## 测试
 
 ```powershell
-./gradlew test              # 110 个单元测试，秒级、零基础设施依赖
+./gradlew test              # 112 个单元测试，秒级、零基础设施依赖
 ./gradlew integrationTest   # Spring 装配冒烟（需 Milvus 在线）+ 虚拟线程演示基准
 ```
 

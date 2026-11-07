@@ -310,6 +310,7 @@ class IncidentStoreTest {
      * QPS=0 假死判定带连续确认（ZERO_QPS_CONFIRM_ROUNDS=2）：第 1 轮 warning"待确认"，
      * 同一实例连续第 2 轮仍 QPS=0 才升级 critical——空闲/低流量系统单轮 QPS=0 是常态，
      * 单轮直接判 critical 会让空闲环境每分钟误报。
+     * 另做基线门控：从未观测到流量的实例 QPS 恒为 0，不构成假死。
      */
     @Test
     void fallback_qpsZero_requiresTwoConsecutiveRoundsForCritical() throws Exception {
@@ -320,6 +321,15 @@ class IncidentStoreTest {
         snap.put("heapUsage", 0.5);
         snap.put("qpsLast1m", 0.0);
         snap.put("gcCountLast5m", 0.0);
+
+        String idleFromStart = invokeFallback(sched, snap);
+        assertTrue(idleFromStart.contains("\"status\":\"normal\""),
+                "从未有流量的空闲实例 QPS=0 是常态，不应判假死: " + idleFromStart);
+
+        // 先观测一轮真实流量建立基线，后续 QPS=0 才是"从有流量跌到零"的假死信号
+        Map<String, Object> traffic = new HashMap<>(snap);
+        traffic.put("qpsLast1m", 50.0);
+        invokeFallback(sched, traffic);
 
         String firstRound = invokeFallback(sched, snap);
         assertTrue(firstRound.contains("\"status\":\"warning\""),

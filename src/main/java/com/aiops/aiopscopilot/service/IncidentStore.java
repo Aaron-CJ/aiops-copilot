@@ -174,13 +174,16 @@ public class IncidentStore {
         if (heap > HEAP_BUCKET_THRESHOLD) {
             features.append("HIGH_HEAP=").append((int) (heap * 10)).append(";");
         }
-        double qps = asDouble(snapshot.get("qpsLast1m"));
-        if (qps == 0 && cpu >= 0) {
-            features.append("ZERO_QPS;");
-        }
         double gc5m = asDouble(snapshot.get("gcCountLast5m"));
         if (gc5m > GC_BUCKET_THRESHOLD) {
             features.append("FREQUENT_GC;");
+        }
+        // ZERO_QPS 只作为兜底特征：已有死锁/阻塞/CPU/堆/GC 等更具体信号时不再附加。
+        // 否则同一故障会因"最近一分钟恰好有没有流量"在两种指纹间抖动，被状态机拆成两条
+        // 并发 ACTIVE 事件，心跳、防抖窗口与 5 分钟升级计时全部按指纹分裂
+        double qps = asDouble(snapshot.get("qpsLast1m"));
+        if (qps == 0 && cpu >= 0 && features.length() == 0) {
+            features.append("ZERO_QPS;");
         }
         return status.toUpperCase() + "|" + features;
     }

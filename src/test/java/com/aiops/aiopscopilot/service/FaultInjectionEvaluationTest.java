@@ -38,6 +38,12 @@ class FaultInjectionEvaluationTest {
         assertEquals("CRITICAL|DEADLOCK;BLOCKED=2;", IncidentStore.fingerprintOf("critical", snap),
                 "死锁快照应产出 DEADLOCK+BLOCKED 特征指纹");
 
+        // QPS 归零只是死锁的伴随症状：若把它也编进指纹，同一死锁会在"有流量/无流量"两轮之间
+        // 来回切换身份，被拆成两条并发事件，心跳与升级计时全部分裂
+        snap.put("qpsLast1m", 0.0);
+        assertEquals("CRITICAL|DEADLOCK;BLOCKED=2;", IncidentStore.fingerprintOf("critical", snap),
+                "已有更具体信号时，ZERO_QPS 不应改变同一死锁的指纹");
+
         String json = invokeFallback(snap);
         assertTrue(json.contains("\"status\":\"critical\""), "BLOCKED>0 兜底应判 critical: " + json);
         assertTrue(json.contains("死锁"), "根因应含死锁关键词: " + json);
@@ -66,6 +72,9 @@ class FaultInjectionEvaluationTest {
      * QPS=0 假死判定带连续确认（ZERO_QPS_CONFIRM_ROUNDS=2）：空闲/低流量系统单轮 QPS=0
      * 是常态，第 1 轮只判 warning"待确认"，同一实例连续第 2 轮仍 QPS=0 才升级 critical。
      * 用同一个 OpsScheduler 实例连调两次验证计数器语义。
+     * <p>
+     * 另做基线门控：从未观测到流量的实例 QPS 恒为 0，此时不能判假死——否则空闲环境
+     * 会每分钟误报 critical（实测空闲演示环境即出现过该误报）。
      */
     @Test
     void f3_appStall_zeroQps_fingerprintAndFallback() throws Exception {
@@ -76,6 +85,13 @@ class FaultInjectionEvaluationTest {
                 "QPS=0 应产出 ZERO_QPS 特征指纹");
 
         OpsScheduler sched = newScheduler();
+        String idleFromStart = invokeFallback(sched, snap);
+        assertEquals("\"status\":\"normal\"", extractStatus(idleFromStart),
+                "从未观测到流量的空闲实例 QPS=0 是常态，不得判假死: " + idleFromStart);
+
+        // 先观测一轮真实流量建立基线，后续 QPS=0 才是"从有流量跌到零"的假死信号
+        invokeFallback(sched, baseSnapshot());
+
         String firstRound = invokeFallback(sched, snap);
         assertTrue(firstRound.contains("\"status\":\"warning\""),
                 "第 1 轮 QPS=0 应判 warning 待确认（空闲低流量单轮 QPS=0 是常态）: " + firstRound);
@@ -92,6 +108,13 @@ class FaultInjectionEvaluationTest {
         String reconfirm = invokeFallback(sched, snap);
         assertTrue(reconfirm.contains("\"status\":\"warning\""),
                 "QPS 恢复一轮后计数应归零，再次 QPS=0 从 warning 重新确认: " + reconfirm);
+    }
+
+    /** 从兜底 JSON 中提取 status 值（纯字符串比较，避免为一处断言引入 JSON 解析依赖） */
+    private static String extractStatus(String json) {
+        int start = json.indexOf("\"status\":\"");
+        int end = json.indexOf('"', start + 10);
+        return json.substring(start, end + 1);
     }
 
     // ==================== F4 慢接口：纯延迟无硬阈值（设计边界） ====================

@@ -1,7 +1,7 @@
 # 事件状态机、降级与深度诊断设计
 
 > 配套白皮书 §4.1（双模型路由 + 可靠性增强）、§4.2/4.3（异步深度诊断与升级路由）与 §5.1（事件生命周期管理）的详细设计文档。
-> 本文档的实现已通过 112 个测试（110 单测 + 2 集成，2026-11-06 单测集全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
+> 本文档的实现已通过 114 个测试（112 单测 + 2 集成，2026-11-07 clean test 与 integrationTest 全量全绿；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
 >
 > 阅读路线：**§1** 讲两条硬约束（告警不刷屏、LLM 挂了巡检不能停）与 AI 漏报兜底，**§2** 事件状态机与指纹去重，**§3** Ollama 降级与阈值兜底，**§4** 单元与端到端验证，**§5** 审计日志，**§6** 异步深度诊断与升级路由全链路。
 
@@ -53,10 +53,12 @@ fingerprint = 异常级别 + "|" + 指标特征串
 | `blockedThreads > 0` | `BLOCKED=N;` | N 是具体数量（同数量合并） |
 | `cpuUsage > 0.8` | `HIGH_CPU=X;` | X = `(int)(cpu * 10)`，分桶避免轻微波动（0.91 vs 0.92）产生不同指纹 |
 | `heapUsage > 0.85` | `HIGH_HEAP=X;` | 同 CPU 分桶逻辑 |
-| `qpsLast1m == 0 且 cpu >= 0` | `ZERO_QPS;` | 应用假死信号；cpu>=0 排除指标拉取失败的 -1 哨兵 |
 | `gcCountLast5m > 10` | `FREQUENT_GC;` | 疑似内存泄漏 |
+| 以上均无且 `qpsLast1m == 0 且 cpu >= 0` | `ZERO_QPS;` | 应用假死信号（兜底特征）；cpu>=0 排除指标拉取失败的 -1 哨兵 |
 
-**示例**：死锁场景 → `CRITICAL|DEADLOCK;BLOCKED=2;`
+> **ZERO_QPS 只作兜底特征**（2026-11-07 加固）：已有死锁/阻塞/CPU/堆/GC 等更具体信号时不再附加——否则同一故障会因"最近一分钟恰好有没有流量"在两种指纹间抖动，被状态机拆成两条并发 ACTIVE 事件，心跳、防抖窗口与 5 分钟升级计时全部按指纹分裂。
+
+**示例**：死锁场景 → `CRITICAL|DEADLOCK;BLOCKED=2;`（伴随 QPS=0 也不改变指纹）
 
 ### 2.3 存储选型：内存级
 
@@ -109,6 +111,8 @@ catch (TimeoutException | Exception):
 - 仍接入 IncidentStore 状态机去重（同一指纹的 NEW→ACTIVE 流转不变）
 - `metricsService.recordInspection("degraded_" + status, ...)` 标记降级路径，便于运维区分
 
+**推理让路（2026-11-07 新增，实测验证）**：深度诊断有 PENDING/RUNNING 任务时，巡检跳过 LLM 直接走阈值兜底（审计 `DEGRADED|reason=diagnosis_running`，实测单轮让路仅耗时 66ms）。动机：单 Ollama（CPU 推理且 NUM_PARALLEL=1）下 qwen3 巡检与 r1 深度推理并发会互相拖慢——实测 r1 被拖到 15 分钟硬超时、巡检也每轮 45 秒超时（对应 §6.3 的 530 秒争抢实测）。让路是主动调度不是故障：`handleDegraded` 增加 `trackUnavailable` 参数，让路轮**不计入** `trackLlmUnavailable` 的连续失效计数，避免把"r1 在忙"误报成"Ollama 挂了"。控制台的降级行文案因此写"本轮未走 AI"而非"LLM 不可用"（具体原因看审计的 reason）。
+
 ### 3.3 阈值兜底规则
 
 [OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 的硬阈值判断（优先级：死锁 > OOM > 假死 > GC > CPU）：
@@ -117,12 +121,14 @@ catch (TimeoutException | Exception):
 |------|------|---------------|
 | `blockedThreads > 0` | critical | `代码级兜底：存在 BLOCKED 线程（N），疑似死锁` |
 | `heapUsage > 0.95` | critical | `代码级兜底：堆内存使用率 X > 0.95` |
-| `qpsLast1m == 0 且 cpu >= 0`（连续第 1 轮） | warning | `QPS=0（第 1 轮，待确认——可能为空闲低流量，连续 2 轮后升级 critical）` |
-| `qpsLast1m == 0 且 cpu >= 0`（连续 ≥ 2 轮） | critical | `QPS=0 已持续 N 轮，端口在但无请求，应用可能假死` |
+| `qpsLast1m == 0 且 cpu >= 0 且此前观测到过流量`（连续第 1 轮） | warning | `QPS=0（第 1 轮，待确认——可能为空闲低流量，连续 2 轮后升级 critical）` |
+| `qpsLast1m == 0 且 cpu >= 0 且此前观测到过流量`（连续 ≥ 2 轮） | critical | `QPS=0 已持续 N 轮，端口在但无请求，应用可能假死` |
 | `gcCountLast5m > 10` | warning（若未达 critical） | `代码级兜底：5min GC 次数 N > 10，疑似内存泄漏` |
 | `cpuUsage > 0.90` | warning（若未达 critical） | `代码级兜底：CPU 使用率 X > 0.90` |
 
 **QPS=0 连续确认（ZERO_QPS_CONFIRM_ROUNDS=2）**：actuator 抓取已从 QPS 基线中扣除，合法空闲/低流量系统每轮 QPS 都是严格 0——单轮 critical 会让空闲环境每分钟误报一次"应用假死"（告警狼来了效应）。改为连续 2 轮确认：第 1 轮 warning"待确认"，QPS 恢复 >0 即归零计数，连续 2 轮才升级 critical。真实假死只多等 1 分钟确认，换来空闲系统零误报（2026-09-30 实测：空闲系统兜底第 1 轮正确输出 warning 待确认）。AI 路径的巡检 Prompt 同步增加了"CPU 极低且无其他异常时 QPS=0 可能为合法空闲"的边界说明，双路径口径一致。兜底输出改用 ObjectMapper 序列化（原手写 JSON 拼接的转义器漏控制字符，已删除）。
+
+**QPS=0 基线门控（observedTraffic，2026-11-07 新增）**：连续确认之上再加一道——QPS=0 只有在"此前观测到过真实流量、随后跌到零"时才构成假死信号。全新启动或长期空闲的实例 QPS 恒为 0，没有基线门控时仍会被连续 2 轮确认误判成 critical 假死（2026-11-07 实测空闲演示环境即触发该误报）。实现：`OpsScheduler.observedTraffic` 在任一路径观测到 QPS>0 时置 true 且不回退（重启才清零）；`fallbackByThreshold` 的零流量计数与 `handleInspectionResult` 的跨路径归零共同维护该语义。
 
 ### 3.4 AI 漏报兜底（applyThresholdBackstop）
 
@@ -299,9 +305,9 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 
 | 测试类 | 用例数 |
 |--------|--------|
-| [DiagnosisServiceTest](../src/test/java/com/aiops/aiopscopilot/service/diagnosis/DiagnosisServiceTest.java) | 16 |
+| [DiagnosisServiceTest](../src/test/java/com/aiops/aiopscopilot/service/diagnosis/DiagnosisServiceTest.java) | 17 |
 | [EscalationRuleTest](../src/test/java/com/aiops/aiopscopilot/service/EscalationRuleTest.java) | 17 |
-| [OpsSchedulerEscalationWiringTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerEscalationWiringTest.java) | 12 |
+| [OpsSchedulerEscalationWiringTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerEscalationWiringTest.java) | 13 |
 | [SnapshotCollectorTest](../src/test/java/com/aiops/aiopscopilot/service/SnapshotCollectorTest.java) | 2 |
 | [DiagnosisControllerTest](../src/test/java/com/aiops/aiopscopilot/controller/DiagnosisControllerTest.java) | 7 |
 | [ApiTokenAuthFilterTest](../src/test/java/com/aiops/aiopscopilot/common/security/ApiTokenAuthFilterTest.java) | 9 |
@@ -344,5 +350,5 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 - **其余 23 个**：IncidentStoreTest 18（指纹/状态机/反射兜底/durationOf/TTL 过期/并发防丢失更新）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）
 - **integration 集（2 个，`gradle integrationTest` 触发）**：AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准——墙钟断言在负载下偶发红，不进秒级单测集）
 
-> 合计 **112** 个用例（110 单测 + 2 集成；2026-11-06 `gradlew test` 全绿）。单测集全部不起容器（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法），均不依赖外部服务；集成集含需 Milvus 的装配冒烟与不依赖基础设施的演示基准。
+> 合计 **114** 个用例（112 单测 + 2 集成；2026-11-07 `clean test` 与 `integrationTest` 全量全绿）。单测集全部不起容器（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法），均不依赖外部服务；集成集含需 Milvus 的装配冒烟与不依赖基础设施的演示基准。
 

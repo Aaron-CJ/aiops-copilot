@@ -60,6 +60,12 @@ class OpsSchedulerEscalationWiringTest {
         }
     }
 
+    private String fallback(Map<String, Object> snapshot) throws Exception {
+        Method fallbackMethod = OpsScheduler.class.getDeclaredMethod("fallbackByThreshold", Map.class);
+        fallbackMethod.setAccessible(true);
+        return (String) fallbackMethod.invoke(scheduler, snapshot);
+    }
+
     private static String json(String status, String confidence, String summary,
                                String rootCause, String suggestion) {
         return "{\"status\":\"" + status + "\",\"confidence\":\"" + confidence + "\","
@@ -170,6 +176,32 @@ class OpsSchedulerEscalationWiringTest {
         verify(reporter, times(2)).logHeartbeat(any());
         verify(reporter, never()).logResolved(any());
         verify(diagnosisService, never()).submitEscalated(anyString(), anyString(), any(), any());
+    }
+
+    /**
+     * QPS=0 计数跨路径归零：降级轮 QPS=0（第 1 轮 warning）→ AI 轮 QPS>0（打断序列）
+     * → 再降级轮 QPS=0 仍应是第 1 轮 warning，不能累计成"连续 2 轮"critical。
+     * 先以一轮 AI normal（有流量）建立流量基线，否则从未有流量的空闲实例不参与假死判定。
+     */
+    @Test
+    void aiRoundWithTrafficBreaksZeroQpsStreak() throws Exception {
+        Map<String, Object> zeroQpsSnap = Map.of(
+                "cpuUsage", 0.1, "heapUsage", 0.2, "qpsLast1m", 0.0,
+                "blockedThreads", 0.0, "gcCountLast5m", 0.0, "maxRequestSeconds", 0.1);
+
+        // 建立流量基线（NORMAL_SNAP 的 qpsLast1m=5.0）
+        handle(json("normal", "high", "各项指标正常", "N/A", "N/A"), NORMAL_SNAP, false);
+
+        String firstDegraded = fallback(zeroQpsSnap);
+        assertTrue(firstDegraded.contains("\"status\":\"warning\""),
+                "第 1 轮 QPS=0 应为 warning: " + firstDegraded);
+
+        // AI 路径再次观测到 QPS>0，handleInspectionResult 入口必须把计数归零
+        handle(json("normal", "high", "各项指标正常", "N/A", "N/A"), NORMAL_SNAP, false);
+
+        String secondDegraded = fallback(zeroQpsSnap);
+        assertTrue(secondDegraded.contains("\"status\":\"warning\""),
+                "AI 轮已有流量，再降级轮不应被判为连续假死: " + secondDegraded);
     }
 
     /** critical NEW + 写操作建议：提交 CRITICAL_WRITE 升级，指纹对应 BLOCKED=2 */

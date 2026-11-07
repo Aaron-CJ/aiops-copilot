@@ -201,6 +201,17 @@ public class DiagnosisService {
         }
     }
 
+    /**
+     * 是否有待执行或执行中的深度诊断任务。
+     * <p>
+     * 供慢通道让路：单 Ollama（CPU 推理且 NUM_PARALLEL=1）下，qwen3 巡检与 r1 深度推理并发会
+     * 互相拖慢——实测 r1 被拖到 15 分钟硬超时，巡检也每轮 45 秒超时。巡检侧据此跳过本轮 LLM。
+     */
+    public boolean hasInflightTask() {
+        return tasks.values().stream().anyMatch(t ->
+                t.status() == DiagnosisTask.Status.PENDING || t.status() == DiagnosisTask.Status.RUNNING);
+    }
+
     private boolean isDeduplicated(String fingerprint) {
         for (DiagnosisTask t : tasks.values()) {
             if (fingerprint.equals(t.fingerprint())
