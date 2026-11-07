@@ -116,9 +116,17 @@ public class PrometheusTool {
                 "rate(http_server_requests_seconds_count{uri=\"/actuator/prometheus\"}[1m])");
         double qps = totalQps < 0 ? -1 : Math.max(0, totalQps - Math.max(0, actuatorQps));
         snapshot.put("qpsLast1m", qps);
-        // maxRequestSeconds 不过滤：actuator 抓取耗时通常 <0.5s，远低于 5s 慢请求阈值，基线无害；
-        // 且空闲时返回 -1（无请求可测）符合"指标缺失"语义，不触发误判。
-        snapshot.put("maxRequestSeconds", queryScalar("http_server_requests_seconds_max"));
+        // maxRequestSeconds 用 max(max_over_time(...[2m])) 双层聚合，两层原因（2026-11-07 实测踩坑）：
+        // 1) 原始指标带 uri/method/status 标签，是多时间序列（每个 uri 一条）；queryScalar 只取
+        //    第一个样本，而排序后的第一个恰好常是 /api/health/check≈0——45s 慢请求后巡检仍读到
+        //    0.0，慢接口信号完全失效。外层 max 跨系列取最大，修掉这层"系列彩票"；
+        // 2) 内层 max_over_time 在 2 分钟窗口内回看每个系列，吸收 Prometheus 每 15s 抓取的滞后
+        //    （请求刚完成时最近样本可能还是旧值，实测 ≤16s 后才出现）。窗口长度与
+        //    "慢请求推高约维持 2 分钟"的既定语义一致。
+        // actuator 抓取耗时 <0.5s，远低于 5s 慢请求阈值，计入无害；无任何请求时结果为空
+        // → queryScalar 返回 -1，仍符合"指标缺失"语义。
+        snapshot.put("maxRequestSeconds", queryScalar(
+                "max(max_over_time(http_server_requests_seconds_max[2m]))"));
         snapshot.put("blockedThreads", queryScalar(
                 "jvm_threads_states_threads{state=\"blocked\"}"));
         snapshot.put("gcCountLast5m", queryScalar(

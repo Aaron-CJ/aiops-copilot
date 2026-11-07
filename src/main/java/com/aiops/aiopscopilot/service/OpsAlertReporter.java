@@ -100,12 +100,14 @@ public class OpsAlertReporter {
      * 巡检正常时输出 INFO 级一行摘要。
      * 设计原则：正常情况应该静默，运维同学不该被无意义日志打扰。
      *
-     * @param degraded true 表示本轮是 LLM 不可用时的阈值兜底判定，控制台必须与 AI 正常判定区分，
-     *                 否则 Ollama 挂掉期间运维会误以为巡检仍在 AI 路径正常执行
+     * @param degraded true 表示本轮未走 AI（LLM 不可用或深度诊断运行时主动让路）的硬阈值判定，
+     *                 控制台必须与 AI 正常判定区分，否则运维会误以为巡检仍在 AI 路径正常执行；
+     *                 文案刻意不写"LLM 不可用"——让路轮 Ollama 是健康的，具体原因看审计的
+     *                 DEGRADED 行（reason=llm_timeout / llm_error / diagnosis_running）
      */
     public void logNormal(Map<String, Object> metricsSnapshot, boolean degraded) {
         log.info("[OpsScheduler] 巡检完成: {} | CPU={} | 堆使用率={} | QPS={} | 最大延迟={} | BLOCKED={} | GC(5m)={}",
-                degraded ? "降级正常（LLM 不可用，仅硬阈值判断）" : "正常",
+                degraded ? "降级正常（本轮未走 AI，仅硬阈值判断）" : "正常",
                 metricsSnapshot.get("cpuUsage"),
                 metricsSnapshot.get("heapUsage"),
                 metricsSnapshot.get("qpsLast1m"),
