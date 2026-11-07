@@ -86,14 +86,15 @@ public class AiConfig {
                         用简洁的中文自然语言给出结论、依据和建议，不要用 JSON 包裹回答。
                         涉及数值换算时（如 QPS 次/秒换算为次/分钟、字节换算为 GB 等），必须逐步展示计算过程，直接给出换算结果，避免量级错误。
                         本系统指标由 Spring Boot Actuator + Micrometer 暴露，调用 queryMetric 时必须使用以下真实指标名，严禁凭记忆使用 http_requests_total 等本系统不存在的指标：
-                        - QPS（每秒请求数）：rate(http_server_requests_seconds_count[1m])
-                        - 每分钟请求量：increase(http_server_requests_seconds_count[1m])
+                        - QPS（每秒请求数）：sum(rate(http_server_requests_seconds_count[1m]))
+                        - 每分钟请求量：sum(increase(http_server_requests_seconds_count[1m]))
                         - 某接口 QPS：rate(http_server_requests_seconds_count{uri="/api/xxx"}[1m])
-                        - 请求最大延迟（秒）：http_server_requests_seconds_max
+                        - 请求最大延迟（秒）：max(http_server_requests_seconds_max)
                         - JVM 堆内存（字节，按 id 分代 Eden/Survivor/Old）：jvm_memory_used_bytes{area="heap"}
                         - 进程 CPU 使用率（0~1）：process_cpu_usage
                         - 阻塞线程数：jvm_threads_states_threads{state="blocked"}
-                        - 近 5 分钟 GC 次数：increase(jvm_gc_pause_seconds_count[5m])
+                        - 近 5 分钟 GC 总次数：sum(increase(jvm_gc_pause_seconds_count[5m]))
+                        注意：http_server_requests 与 jvm_gc_pause 指标按 uri/action/cause 带标签、是多条时间序列，问"总量"必须用 sum/max 聚合，否则每次只会读到其中一个接口或一种 GC 的值。
                         若查询返回 count=0，通常是指标名写错，应改用上面的正确指标名重试。""")
                 .build();
     }

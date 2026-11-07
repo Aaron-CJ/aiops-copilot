@@ -97,12 +97,13 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 
 > 用真实故障换来的约束：qwen2.5:14b 因 16G 内存门槛加载失败；r1 因思考链过长拖垮同步链路。任何模型上生产前必须先过延迟与内存预算。
 
-**（b）可靠性增强（已实现，五条防线）**
+**（b）可靠性增强（已实现，六条防线）**
 - **LLM 超时保护**：[OpsScheduler.callLlmWithTimeout](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 用 `CompletableFuture.get(45s)` 包裹 LLM 调用，Ollama 卡死时不会拖垮巡检调度
 - **指标拉取超时**：[PrometheusTool](../src/main/java/com/aiops/aiopscopilot/tool/PrometheusTool.java) 的 RestClient 显式配置连接 2s/读取 5s 超时——Prometheus 挂起时巡检不会永久阻塞（`@Scheduled` 单线程 + fixedDelay 语义下无超时等于整个巡检链路静默停摆）；实测黑洞场景快照 40s 超时返回、巡检正常轮转
 - **阈值降级路径**：[OpsScheduler.fallbackByThreshold](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 在 LLM 超时/异常时基于硬阈值（CPU>0.90 / BLOCKED>0 / 堆>0.95 / QPS=0 连续 2 轮确认 / GC>10）做兜底判断，仍接入状态机去重；QPS=0 首轮仅 warning"待确认"，连续 2 轮才升级 critical 假死（空闲/低流量系统单轮 QPS=0 是常态，单轮 critical 会让空闲环境每分钟误报）
 - **AI 漏报兜底**：[OpsScheduler.applyThresholdBackstop](../src/main/java/com/aiops/aiopscopilot/service/OpsScheduler.java) 在 AI 判 normal 但 BLOCKED>0 / 堆>0.95 / CPU>90% 时强改 critical/critical/warning，rootCause 标注"代码级兜底"（刻意不覆盖 QPS=0：空闲系统 QPS 天然为 0，强改会每轮误报假死）
 - **LLM 失效显式告警**：连续 3 轮降级 → 登记独立指纹 `CRITICAL|LLM_UNAVAILABLE;` 的 critical 事件（**监控者自身失效必须可见**，不能只留每轮一条 WARN），复用状态机心跳/归档，恢复后随连续 3 轮 normal 自动 RESOLVED。配套规则：降级轮的 normal 只是硬阈值判断（语义置信度低），不用于归档任何事件——否则 Ollama 长挂时事件会被"降级 normal"轮反复错误归档
+- **推理让路**（2026-11-07）：深度诊断有 PENDING/RUNNING 任务时，巡检跳过 LLM 直接走阈值兜底（审计 `reason=diagnosis_running`，不计入 LLM 失效计数）——单 Ollama（CPU 推理且 NUM_PARALLEL=1）下 qwen3 巡检与 r1 并发会互相拖到超时，让路把"互相拖死"变成"主动调度"；QPS=0 假死判定同期增加基线门控（从未有流量的实例不判假死）
 
 #### 4.2 深度推理通道：异步任务架构 ✅
 
@@ -116,7 +117,7 @@ Alertmanager 只能回答"超没超"，Agent 能回答"为什么超、要不要�
 
 实现要点：
 - **有界队列**（容量 20）：r1 串行且单次数分钟，堆积无意义；队列满直接拒绝并记审计，不阻塞巡检线程
-- **15 分钟硬超时**：r1 独占 Ollama 实测最长 6.6 分钟；端到端实测（2026-09-17）深度 worker 与每分钟巡检 qwen3 并发争抢 Ollama 串行推理时单任务 530 秒（8.8 分钟），15 分钟超时覆盖该场景且不会误杀，超时标记 FAILED，防止调用永久挂死
+- **15 分钟硬超时**：r1 独占 Ollama 实测最长 6.6 分钟；端到端实测（2026-09-17）深度 worker 与每分钟巡检 qwen3 并发争抢 Ollama 串行推理时单任务 530 秒（8.8 分钟），15 分钟超时覆盖该场景且不会误杀，超时标记 FAILED，防止调用永久挂死（该争抢场景后由 4.1(b) 的推理让路机制消除：深度诊断运行时巡检不再发 qwen3 请求；2026-11-07 复测纯 CPU 下 r1 单次可超 15 分钟，硬超时按设计收敛为 FAILED）
 - **防抖**：同一指纹有在途任务、或 10 分钟窗口内已升级过，则拒绝重复提交（手动触发不受限）
 - **内存态**：与 IncidentStore 取舍一致，重启时未完成任务由下一轮巡检重新升级；终态任务保留最近 100 条
 - **送达渠道**：当前为 pull（轮询）+ 报告日志；5.2 接飞书/钉钉时 push 动作从 [OpsAlertReporter.logDeepReport](../src/main/java/com/aiops/aiopscopilot/service/OpsAlertReporter.java) 接出，任务机制不变

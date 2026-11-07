@@ -25,9 +25,9 @@
 
 | 用例 | 注入命令 | 期望行为（确定性层） | 期望根因关键词（LLM 层） |
 |------|----------|---------------------|--------------------------|
-| F1 死锁 | `curl --max-time 3 http://localhost:8080/api/debug/deadlock/a & curl --max-time 3 http://localhost:8080/api/debug/deadlock/b`（两条并发发） | 指纹 `CRITICAL\|DEADLOCK;BLOCKED=2;`（空闲环境因无背景流量会附加 `ZERO_QPS;`，属正常特征）；NEW 全量报告 → ACTIVE 心跳；LLM 不可用时兜底判 critical。只注入一对——重复注入会让 blockedThreads 计数漂移产生不同指纹（BLOCKED=N 分桶） | 死锁、deadlock-worker、锁 |
+| F1 死锁 | `curl --max-time 3 http://localhost:8080/api/debug/deadlock/a & curl --max-time 3 http://localhost:8080/api/debug/deadlock/b`（两条并发发） | 指纹 `CRITICAL\|DEADLOCK;BLOCKED=2;`（伴随 QPS=0 也不再附加 `ZERO_QPS;`——ZERO_QPS 已降为兜底特征，指纹跨轮稳定）；NEW 全量报告 → ACTIVE 心跳；LLM 不可用时兜底判 critical。只注入一对——重复注入会让 blockedThreads 计数漂移产生不同指纹（BLOCKED=N 分桶） | 死锁、deadlock-worker、锁 |
 | F2 内存泄漏 | 多次 `curl "http://localhost:8080/api/debug/memory-leak?mb=200"`，直到 `堆使用率` > 0.90 | `heapUsage>0.95` 兜底 critical；指纹含 `HIGH_HEAP` / `FREQUENT_GC`；release 后 3 轮 normal 自动 RESOLVED | 堆、Old、内存泄漏、GC |
-| F3 应用假死 | 停止全部业务流量（空闲应用即满足：actuator 抓取不计入 QPS） | `qpsLast1m=0` 且指标可拉取 → 降级路径**连续 2 轮确认**：第 1 轮 warning"待确认"（空闲/低流量系统单轮 QPS=0 是常态，避免每分钟误报 critical），同一实例连续第 2 轮仍 QPS=0 才升级 critical 假死；QPS 恢复 >0 计数归零。LLM 判异常时 `ZERO_QPS` 进指纹（LLM 判 normal 不强改，见第 5 节边界 2；Prompt 已含"CPU 极低且无其他异常时可能为合法空闲"边界） | 假死、QPS 为零、端口在 |
+| F3 应用假死 | 先访问一次 `/api/test` 产生真实流量建立基线（**基线门控**：从未有流量的实例不判假死），再停止全部业务流量（actuator 抓取不计入 QPS） | `qpsLast1m=0` 且指标可拉取且已有流量基线 → 降级路径**连续 2 轮确认**：第 1 轮 warning"待确认"（空闲/低流量系统单轮 QPS=0 是常态，避免每分钟误报 critical），同一实例连续第 2 轮仍 QPS=0 才升级 critical 假死；QPS 恢复 >0 计数归零。LLM 判异常时 `ZERO_QPS` 进指纹（LLM 判 normal 不强改，见第 5 节边界 2；Prompt 已含"CPU 极低且无其他异常时可能为合法空闲"边界） | 假死、QPS 为零、端口在 |
 | F4 慢接口/依赖卡死 | `curl "http://localhost:8080/api/debug/slow-request?seconds=45"`（可并发多笔） | 无硬阈值兜底（设计边界 2）；依赖 LLM 关联 maxRequestSeconds 与 QPS 趋势 | 慢、延迟、maxRequestSeconds、挂起 |
 | F5 瞬时尖峰 | `curl "http://localhost:8080/api/debug/cpu-spike?seconds=5"` | 毛刺落在巡检间隔内 → 不告警；被捕获 → NEW 后 3 轮 normal 自动 RESOLVED，不产生持续告警 | （若被捕获）CPU、瞬时、毛刺 |
 
@@ -59,7 +59,7 @@
 
 1. **虚拟线程死锁不可观测（JDK 21.0.12 实测）**：`ThreadMXBean.findDeadlockedThreads()` 与 `Thread.getAllStackTraces()`（Micrometer 线程状态指标数据源）均不覆盖虚拟线程——**虚拟请求线程上的 synchronized/ReentrantLock 死锁对 blockedThreads 指标与 detectDeadlock() 完全不可见**（本注入器最初直接在请求线程上加锁时实测发现，连续多轮巡检误报 normal）。因此死锁注入刻意把锁竞争放在平台 worker 线程上（对应真实系统 @Async/批处理 worker 池形态）。虚拟线程挂起需引入活跃请求数等业务信号识别，已列入白皮书路线图。
 
-2. **空闲即 QPS=0（实测修正）**：actuator 抓取请求**不计入** `http_server_requests`——本机实测空闲应用（仅 Prometheus 抓取）`qpsLast1m=0.0`。因此无业务流量完成时 ZERO_QPS 特征即成立（F1 实测指纹含 `ZERO_QPS;`）；但 LLM 路径下模型对空闲 QPS=0 多判 normal，且 AI 漏报兜底刻意不覆盖 QPS（强改会对空闲系统每轮误报假死）——ZERO_QPS 进指纹发生在模型判异常或降级路径时。真正的全进程假死（连 actuator 都不响应）表现为指标整体变 -1（Prometheus 抓取失败），依赖 LLM 按"-1=查询失败"规则忽略，属于更深的观测边界。
+2. **空闲即 QPS=0（实测修正）**：actuator 抓取请求**不计入** `http_server_requests`——本机实测空闲应用（仅 Prometheus 抓取）`qpsLast1m=0.0`。因此无业务流量完成时 ZERO_QPS 特征即成立（2026-11-07 起 ZERO_QPS 已降为兜底特征：死锁等更具体信号存在时指纹不再附加它）；但 LLM 路径下模型对空闲 QPS=0 多判 normal，且 AI 漏报兜底刻意不覆盖 QPS（强改会对空闲系统每轮误报假死）——ZERO_QPS 进指纹发生在模型判异常或降级路径时。真正的全进程假死（连 actuator 都不响应）表现为指标整体变 -1（Prometheus 抓取失败），依赖 LLM 按"-1=查询失败"规则忽略，属于更深的观测边界。
 
 3. **F4 无代码兜底是设计而非缺陷**：纯延迟属于语义信号，硬阈值会产生大量误报（定时任务同样推高 max）——这正是白皮书"语义判断替代静态阈值"要解决的场景。
 

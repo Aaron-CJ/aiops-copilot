@@ -129,8 +129,14 @@ public class PrometheusTool {
                 "max(max_over_time(http_server_requests_seconds_max[2m]))"));
         snapshot.put("blockedThreads", queryScalar(
                 "jvm_threads_states_threads{state=\"blocked\"}"));
+        // GC 次数用 sum(increase(...)) 跨系列求和：jvm_gc_pause_seconds_count 带 action/cause/gc
+        // 标签（G1 Young/Old Generation × 暂停成因各成一条系列），裸 increase 逐系列返回、
+        // queryScalar 只取第一个——发生 Old GC 后会把"5 分钟 GC 总次数"读成其中一条，恰在
+        // 内存泄漏、Old GC 频发的场景下漏计，与 FREQUENT_GC 信号本意相悖。与 maxRequestSeconds
+        // 同类的"多系列 + 取首样本"陷阱（2026-11-07 逐条审计 8 条查询时发现；当前实测窗口内
+        // 仅 minor GC 单系列，故此前未暴露）。无 GC 时结果为空 → -1 哨兵。
         snapshot.put("gcCountLast5m", queryScalar(
-                "increase(jvm_gc_pause_seconds_count[5m])"));
+                "sum(increase(jvm_gc_pause_seconds_count[5m]))"));
         return snapshot;
     }
 
