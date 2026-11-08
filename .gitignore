@@ -43,7 +43,11 @@ out/
 .continue/
 
 ### 审计日志与运行时日志（logback-spring.xml 写 logs/，不入库） ###
-logs/
+# logs/ 目录本身要随仓库存在（JVM 的 -XX:ErrorFile 不会自建目录，缺失时崩溃日志退回项目根），
+# 只忽略里面的文件，保留 .gitkeep
+/logs/*
+!/logs/.gitkeep
+*.log
 
 ### Docker Compose 数据卷（Milvus etcd/minio/数据文件，GB 级，勿入库） ###
 docker/volumes/
@@ -52,8 +56,10 @@ docker/volumes/
 __pycache__/
 *.py[cod]
 
-### JVM crash 日志（hs_err_pid*.log） ###
-hs_err_pid*.log
+### JVM crash / 堆转储产物（hs_err_pid* / replay_pid* / *.hprof） ###
+hs_err_pid*
+replay_pid*
+*.hprof
 
 ### ZCode 会话产物（不属于项目） ###
 .zcode/

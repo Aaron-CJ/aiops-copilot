@@ -1,0 +1,3 @@
+# 此文件仅用于让 logs/ 目录随仓库存在。
+# JVM 的 -XX:ErrorFile 不会自建目录，logs/ 缺失时崩溃日志会退回项目根目录。
+# .gitignore 规则：/logs/* 忽略内容，!/logs/.gitkeep 保留本文件。
