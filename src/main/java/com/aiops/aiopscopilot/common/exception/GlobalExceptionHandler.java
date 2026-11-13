@@ -5,7 +5,11 @@ import com.aiops.aiopscopilot.common.result.ResultCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.BindException;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -79,6 +83,41 @@ public class GlobalExceptionHandler {
     public Result<Void> handleNoResourceFoundException(NoResourceFoundException e) {
         log.debug("静态资源不存在: {}", e.getResourcePath());
         return Result.fail(ResultCode.NOT_FOUND);
+    }
+
+    /**
+     * HTTP 方法不支持（如对只读端点发 POST）——2026-11-13：此前与 406/415 一同落入
+     * 兜底 Exception handler 误报 500，污染错误监控与客户端重试判断。
+     */
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    @ResponseStatus(HttpStatus.METHOD_NOT_ALLOWED)
+    public Result<Void> handleMethodNotSupported(HttpRequestMethodNotSupportedException e) {
+        log.debug("HTTP 方法不支持: {}", e.getMessage());
+        return Result.fail(ResultCode.METHOD_NOT_ALLOWED);
+    }
+
+    /** 客户端 Accept 头与响应类型不匹配（如对 SSE 端点不接受 text/event-stream） */
+    @ExceptionHandler(HttpMediaTypeNotAcceptableException.class)
+    @ResponseStatus(HttpStatus.NOT_ACCEPTABLE)
+    public Result<Void> handleMediaTypeNotAcceptable(HttpMediaTypeNotAcceptableException e) {
+        log.debug("响应类型不可接受: {}", e.getMessage());
+        return Result.fail(ResultCode.NOT_ACCEPTABLE);
+    }
+
+    /** 请求体 Content-Type 不匹配（如 POST 缺 application/json） */
+    @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+    @ResponseStatus(HttpStatus.UNSUPPORTED_MEDIA_TYPE)
+    public Result<Void> handleMediaTypeNotSupported(HttpMediaTypeNotSupportedException e) {
+        log.debug("请求体类型不支持: {}", e.getMessage());
+        return Result.fail(ResultCode.UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /** 请求体不可读（JSON 格式坏/编码错）——参数类问题，回 400 而非 500 */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Result<Void> handleHttpMessageNotReadable(HttpMessageNotReadableException e) {
+        log.debug("请求体不可读: {}", e.getMessage());
+        return Result.fail(ResultCode.BAD_REQUEST, "请求体格式错误");
     }
 
     /**

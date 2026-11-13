@@ -55,8 +55,7 @@ class SnapshotCollectorTest {
 
     /** self 的 BLOCKED>0：挂 ThreadMXBean 二级诊断结果 */
     @Test
-    void selfDeadlockDiagnosisAttachedWhenBlockedPositive() {
-        PrometheusTool prometheusTool = mock(PrometheusTool.class);
+    void selfDeadlockDiagnosisAttachedWhenBlockedPositive() {        PrometheusTool prometheusTool = mock(PrometheusTool.class);
         SystemHealthTools systemHealthTools = mock(SystemHealthTools.class);
         SnapshotCollector collector = new SnapshotCollector(
                 prometheusTool, systemHealthTools, new TargetsProperties(), SELF);
@@ -89,6 +88,26 @@ class SnapshotCollectorTest {
         assertEquals(0.0, block.get("blockedThreads"));
         assertFalse(block.containsKey("deadlockDiagnosis"));
         verify(systemHealthTools, never()).detectDeadlock();
+    }
+
+    /**
+     * （2026-11-13）：pool.submit 的 Future 未检查——collectOne 已捕获 Exception，
+     * 但 Error 级（如 OOM）会逃逸到 lambda，此前异常被吞、目标块变 null、normalLine 打出
+     * "null"。修复后降级为 error 块，下游按 -1 哨兵与"不可信数据"处理。
+     */
+    @Test
+    void errorFromCollectorYieldsErrorBlockInsteadOfNull() {
+        PrometheusTool prometheusTool = mock(PrometheusTool.class);
+        when(prometheusTool.querySnapshot(any(MonitoredTarget.class)))
+                .thenThrow(new OutOfMemoryError("模拟堆溢出"));
+        SnapshotCollector collector = new SnapshotCollector(
+                prometheusTool, mock(SystemHealthTools.class), new TargetsProperties(), SELF);
+
+        Map<String, Object> result = collector.collect();
+        @SuppressWarnings("unchecked")
+        Map<String, Object> block = (Map<String, Object>) ((Map<?, ?>) result.get("targets")).get(SELF);
+        assertNotNull(block, "Error 级采集失败也不得留下 null 目标块");
+        assertTrue(block.containsKey("error"), "应降级为 error 块");
     }
 
     /** 多目标：业务目标的 BLOCKED>0 也**不**触发 ThreadMXBean（硬边界：只能看本 JVM），

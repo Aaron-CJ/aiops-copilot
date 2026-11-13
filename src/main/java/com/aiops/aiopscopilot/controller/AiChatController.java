@@ -28,6 +28,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 /**
  * 深度通道（deepseek-r1:8b）对外接口集，全部挂在 /api/ai 下：
@@ -119,8 +120,20 @@ public class AiChatController {
                     }
                     return chunks;
                 })
+                // 流结束在思考段（模型把全部输出放进 thinking、正文为空）时补闭合标签——
+                // 缺它前端会把思考块一直渲染下去（2026-11-13）。成功收尾与出错收尾都补
+                .concatWith(closeThinkingTagIfOpen(thinkingOpened))
                 .doOnError(e -> log.error("[AiChatController] /api/ai/chat 流式输出异常", e))
-                .onErrorResume(e -> Flux.just("[ERROR] " + e.getMessage()));
+                .onErrorResume(e -> Flux.concat(
+                        closeThinkingTagIfOpen(thinkingOpened),
+                        Flux.just("[ERROR] " + e.getMessage())));
+    }
+
+    /** 思考段已打开则补 {@code </think>}，未打开则什么都不发（幂等：compareAndSet 保证只发一次） */
+    private static Mono<String> closeThinkingTagIfOpen(AtomicBoolean thinkingOpened) {
+        return Mono.defer(() -> thinkingOpened.compareAndSet(true, false)
+                ? Mono.just("</think>")
+                : Mono.empty());
     }
 
     /**
@@ -200,8 +213,9 @@ public class AiChatController {
 
     /**
      * 从 Milvus 检索与问题相关的文本片段并拼装上下文（每片携带来源标注）。
-     * 两道闸门串联：先取 COSINE 排序后的前 {@value #RAG_TOP_K} 个候选，
-     * 再丢弃相似度低于 {@value #RAG_SIMILARITY_THRESHOLD} 的片段。
+     * 质量闸门是同一次检索调用内的两个参数：COSINE 排序取前 {@value #RAG_TOP_K} 个候选，
+     * 且相似度低于 {@value #RAG_SIMILARITY_THRESHOLD} 的候选不返回（similarityThreshold
+     * 下推到向量库执行，Java 侧无第二道过滤）。
      * 未命中时直接记录 miss 指标，命中时由调用方记录 hit（需区分同步/流式端点）。
      *
      * @return 检索结果（上下文文本、片段数、检索耗时）；无片段通过阈值时返回 null

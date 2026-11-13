@@ -86,10 +86,25 @@ public class ApiTokenAuthFilter extends OncePerRequestFilter {
         if (apiKey != null && !apiKey.isBlank()) {
             return apiKey.trim();
         }
-        if (SSE_QUERY_TOKEN_PATHS.contains(request.getRequestURI())) {
+        if (isSseQueryTokenPath(request)) {
             return request.getParameter(PARAM_TOKEN);
         }
         return null;
+    }
+
+    /**
+     * SSE 端点白名单匹配。用 servletPath（映射后路径）而非 getRequestURI：
+     * 带 context-path 部署时 requestURI 含上下文前缀（如 {@code /app/api/ai/chat}），
+     * 直接比对会静默失配 → SSE 端点收不到 ?token= 兜底（2026-11-13）。
+     * Mock 环境未显式设 servletPath 时回退 requestURI，纯单测与无 context-path
+     * 部署（二者相等）行为不变。
+     */
+    private static boolean isSseQueryTokenPath(HttpServletRequest request) {
+        String servletPath = request.getServletPath();
+        String path = (servletPath == null || servletPath.isEmpty())
+                ? request.getRequestURI()
+                : servletPath;
+        return SSE_QUERY_TOKEN_PATHS.contains(path);
     }
 
     /** 定长比较，避免计时侧信道。 */

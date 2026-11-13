@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -37,12 +38,17 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>
  * 注入后 OpsScheduler 下一轮巡检（最长 60 秒）会发现对应指标异常并给出分级报告。
  * <p>
- * 安全隔离：带 {@link Profile @Profile("dev")}，仅 dev profile 装配此 Bean；
- * 生产（prod）启动时 /api/debug/** 直接 404，杜绝生产环境被注入故障。
- * 若配置了 AIOPS_API_TOKEN，这些端点同其余 /api/** 一样需要鉴权。
+ * 安全隔离（双层，2026-11-13 收紧）：{@link Profile @Profile("dev")} +
+ * {@code aiops.debug.enabled=true}（环境变量 {@code AIOPS_DEBUG_ENABLED}）<b>同时满足</b>才装配。
+ * 单靠 profile 不够：默认 profile 是 dev（{@code SPRING_PROFILES_ACTIVE} 缺省 dev），
+ * 忘设环境变量的部署会以 dev 身份裸奔——这些端点能 OOM 自身（memory-leak 1GB）、
+ * 占死 4 个平台线程（deadlock）、打满 CPU（cpu-spike），且此时若 AIOPS_API_TOKEN
+ * 也未配置则零鉴权。默认关 + 显式开启后，"忘了"不再等于"暴露"。
+ * 生产（prod）即使误开开关，profile 不满足仍 404。
  */
 @RestController
 @Profile("dev")
+@ConditionalOnProperty(name = "aiops.debug.enabled", havingValue = "true")
 @RequestMapping("/api/debug")
 public class DebugController {
 

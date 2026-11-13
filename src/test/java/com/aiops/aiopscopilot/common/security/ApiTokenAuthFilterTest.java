@@ -119,4 +119,33 @@ class ApiTokenAuthFilterTest {
         request.addHeader("Authorization", "Bearer ");
         blocked(request);
     }
+
+    /**
+     * （2026-11-13）：带 context-path 部署时 requestURI 含前缀（如 /app/api/ai/chat），
+     * 白名单必须按 servletPath（映射后路径）匹配——否则 SSE 端点的 ?token= 兜底静默失效。
+     */
+    @Test
+    void sseQueryTokenPathMatchesUnderContextPathDeployment() throws Exception {
+        MockHttpServletRequest sseRequest = new MockHttpServletRequest("GET", "/app/api/ai/rag/stream");
+        sseRequest.setServletPath("/api/ai/rag/stream");
+        sseRequest.setParameter("token", TOKEN);
+        pass(sseRequest);
+    }
+
+    /** Mock 环境未设 servletPath 时回退 requestURI——无 context-path 部署二者相等，行为不变 */
+    @Test
+    void sseQueryTokenPathFallsBackToRequestUriWhenServletPathEmpty() throws Exception {
+        MockHttpServletRequest sseRequest = new MockHttpServletRequest("GET", "/api/ai/chat");
+        sseRequest.setParameter("token", TOKEN);
+        pass(sseRequest);
+    }
+
+    /** context-path 前缀本身不构成放行理由：非 SSE 路径带任何前缀照样 401 */
+    @Test
+    void nonSsePathWithContextPrefixStillBlocked() throws Exception {
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/app/api/agent/ops");
+        request.setServletPath("/api/agent/ops");
+        request.setParameter("token", TOKEN);
+        blocked(request);
+    }
 }

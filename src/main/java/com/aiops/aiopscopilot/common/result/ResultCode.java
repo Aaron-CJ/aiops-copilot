@@ -11,6 +11,12 @@ public enum ResultCode {
     UNAUTHORIZED(401, "未授权"),
     FORBIDDEN(403, "禁止访问"),
     NOT_FOUND(404, "资源不存在"),
+    /** HTTP 方法不支持（如对只读端点发 POST，2026-11-13：此前落入 500 兜底） */
+    METHOD_NOT_ALLOWED(405, "HTTP 方法不支持"),
+    /** 客户端 Accept 头与响应类型不匹配（如对 SSE 端点不接受 text/event-stream） */
+    NOT_ACCEPTABLE(406, "响应类型不可接受"),
+    /** 请求体 Content-Type 不匹配（如 POST 缺 application/json） */
+    UNSUPPORTED_MEDIA_TYPE(415, "请求体类型不支持"),
     /** 资源满/过载等暂不可用场景（如深度诊断任务队列已满） */
     SERVICE_UNAVAILABLE(503, "服务暂不可用"),
     INTERNAL_ERROR(500, "系统内部错误"),

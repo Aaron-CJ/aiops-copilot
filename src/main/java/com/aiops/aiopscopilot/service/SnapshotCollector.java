@@ -25,7 +25,8 @@ import com.aiops.aiopscopilot.tool.SystemHealthTools;
  * <p>
  * 多目标设计：
  * <ul>
- *   <li>每个目标一个虚拟线程并行采集——N 个目标不放大轮耗时（最坏 = 单目标的 8 条串行查询）；
+ *   <li>每个目标一个虚拟线程并行采集——N 个目标不放大轮耗时（单目标内的 8 条 PromQL
+ *       已在 PrometheusTool 中并行化，墙钟 = 最慢一条查询）；
  *       Prometheus 只能串行应答的部分由 Prometheus 侧自行排队，应用侧并行无副作用</li>
  *   <li>死锁二级诊断（ThreadMXBean）仅对 self 目标生效：它只能看本 JVM 的线程（硬边界）——
  *       业务目标的 BLOCKED 仍会被指标计数发现并升级，但精查不到对方栈帧，报告如实标注</li>
@@ -77,7 +78,17 @@ public class SnapshotCollector {
         Map<String, Map<String, Object>> collected = new ConcurrentHashMap<>();
         try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
             for (MonitoredTarget t : targets) {
-                pool.submit(() -> collected.put(t.name(), collectOne(t)));
+                pool.submit(() -> {
+                    try {
+                        collected.put(t.name(), collectOne(t));
+                    } catch (Throwable e) {
+                        // collectOne 已捕获 Exception；这里兜 Error 级（如 OOM）——
+                        // Future 未检查时异常被吞，目标块会是 null 并在 normalLine 里打出"null"
+                        // （2026-11-13）。降级为 error 块，下游按 -1 哨兵与"不可信数据"处理
+                        log.warn("[SnapshotCollector] 目标 {} 采集异常: {}", t.name(), e.toString());
+                        collected.put(t.name(), Map.of("error", String.valueOf(e)));
+                    }
+                });
             }
         } // close() 等待全部采集完成
         Map<String, Object> targetsBlock = new LinkedHashMap<>();
