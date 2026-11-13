@@ -41,7 +41,8 @@ public class DiagnosisController {
         RequestLimits.checkMessage(message);
         DiagnosisTask task = diagnosisService.submitManual(message.isBlank() ? null : message.trim());
         if (task == null) {
-            return Result.fail(ResultCode.SERVICE_UNAVAILABLE, "深度诊断队列已满，请稍后再试");
+            // 队列满，或空闲槽位不足为自动升级保留的份额（手动限流）——语义对调用方一致：稍后再试
+            return Result.fail(ResultCode.SERVICE_UNAVAILABLE, "深度诊断队列已满（或为自动升级保留中），请稍后再试");
         }
         return Result.success("深度诊断任务已提交，请用 taskId 轮询结果", TaskView.of(task));
     }

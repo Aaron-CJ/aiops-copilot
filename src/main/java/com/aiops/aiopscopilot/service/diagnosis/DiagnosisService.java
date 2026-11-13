@@ -42,9 +42,10 @@ import tools.jackson.databind.ObjectMapper;
  * 为什么是内存态：与 IncidentStore 的取舍一致——任务是进程内工作单元，重启时未完成的诊断
  * 让下一轮巡检重新升级即可；不引入数据库/消息队列等外部依赖。
  * <p>
- * 防抖（仅自动升级，手动不限制）：同一指纹有 PENDING/RUNNING 任务、或在防抖窗口内
+ * 防抖（仅自动升级）：同一指纹有 PENDING/RUNNING 任务、或在防抖窗口内
  * （默认 10 分钟，{@code aiops.diagnosis.dedup-window-minutes}）已提交过，则拒绝重复升级——
  * r1 单次 1.7-6.6 分钟，不能让同一起故障每分钟都排一个深度任务。
+ * 手动提交不走防抖，但受"自动升级预留槽位"限流（见 {@link #reservedAutoSlots}）。
  * <p>
  * 可调参数（{@code aiops.diagnosis.*}，见 application.yml）：队列容量、防抖窗口、
  * worker 硬超时、终态保留条数。
@@ -60,6 +61,18 @@ public class DiagnosisService {
     private final long dedupWindowMinutes;
     /** 终态任务在内存中最多保留条数（按完成时间淘汰最旧，默认 100） */
     private final int maxFinishedTasks;
+
+    /**
+     * 队列为自动升级预留的槽位数：容量的 1/4、至少 1（2026-11-13）。
+     * <p>
+     * 手动提交（POST /api/diagnosis）是无防抖、无频率限制的旁路，不预留时一个脚本
+     * 可瞬间填满队列，之后<b>所有自动升级被 queue_full 拒绝</b>——4.3 升级链路静默失效，
+     * 只剩 {@code aiops_diagnosis_rejected_total{reason="queue_full"}} 计数增长。
+     * 预留后手动提交在空闲槽位不足时先被拒（503），自动升级永远有槽可用。
+     */
+    private int reservedAutoSlots() {
+        return Math.max(1, queueCapacity / 4);
+    }
 
     private final ChatClient deepModel;
     private final SnapshotCollector snapshotCollector;
@@ -175,6 +188,14 @@ public class DiagnosisService {
             if (dedup && isDeduplicated(fingerprint)) {
                 metricsService.recordDiagnosisRejected(trigger, "dedup_window_or_inflight");
                 audit.deepDiagnosisRejected(trigger, fingerprint, "dedup_window_or_inflight");
+                return null;
+            }
+            // 手动旁路限流：空闲槽位不足预留数时手动先拒，自动升级链路不被手动刷屏饿死
+            if (!dedup && pendingTaskIds.size() >= queueCapacity - reservedAutoSlots()) {
+                metricsService.recordDiagnosisRejected(trigger, "manual_reserved_for_auto");
+                audit.deepDiagnosisRejected(trigger, fingerprint, "manual_reserved_for_auto");
+                log.warn("[DiagnosisService] 手动深度诊断被限流：需为自动升级保留 {} 个槽位（pending={}，容量={}）",
+                        reservedAutoSlots(), pendingTaskIds.size(), queueCapacity);
                 return null;
             }
             String taskId = UUID.randomUUID().toString().replace("-", "").substring(0, 12);

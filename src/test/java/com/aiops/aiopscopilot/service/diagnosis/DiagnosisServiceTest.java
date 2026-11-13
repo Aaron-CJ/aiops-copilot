@@ -133,6 +133,35 @@ class DiagnosisServiceTest {
         assertNull(service.submitManual("队列已满时手动也应被拒"));
     }
 
+    /**
+     * （2026-11-13）：手动提交为自动升级预留槽位——空闲槽位不足预留数（容量 1/4、至少 1）
+     * 时手动先被拒，自动升级永远有槽可用。修复前手动旁路（dedup=false）无任何频率限制，
+     * 一个脚本可瞬间填满队列，4.3 升级链路被 queue_full 静默饿死。
+     */
+    @Test
+    void manualSubmitIsRateLimitedToReserveSlotsForAutoEscalation() {
+        SnapshotCollector collector = mock(SnapshotCollector.class);
+        when(collector.collect()).thenReturn(Map.of("cpuUsage", 0.1));
+        service = newService(null, collector);
+
+        int manualAccepted = 0;
+        for (int i = 0; i < QUEUE_CAPACITY; i++) {
+            if (service.submitManual("手动 m" + i) != null) {
+                manualAccepted++;
+            }
+        }
+        assertEquals(QUEUE_CAPACITY - QUEUE_CAPACITY / 4, manualAccepted,
+                "手动提交最多占用 容量 - 预留（20-5=15）个槽位，之后必须被限流");
+
+        // 预留槽位在手：自动升级仍然入队成功（这是本修复要保住的链路）
+        assertNotNull(service.submitEscalated(
+                        DiagnosisTask.Trigger.PERSISTENT, "CRITICAL|AUTO;", Map.of(), "auto"),
+                "为自动升级预留的槽位必须可用");
+        // 后续自动升级按常规队列语义继续入队（此时 pending=16，还有 4 个空位）
+        assertNotNull(service.submitEscalated(
+                DiagnosisTask.Trigger.PERSISTENT, "CRITICAL|AUTO2;", Map.of(), "auto2"));
+    }
+
     /** get 查询：存在返回任务，不存在返回 null */
     @Test
     void getReturnsTaskOrNull() {
