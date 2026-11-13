@@ -32,7 +32,12 @@
 
 这个分工对应"Agent 主动出击"——巡检不是让模型当查询工，而是让模型当"判断工"。
 
-两条路径共用同一个 RestClient 实例，显式配置**连接 2s / 读取 5s 超时**（`JdkClientHttpRequestFactory`，2026-09-30 评审补充）：RestClient 默认请求工厂不设超时，Prometheus 挂起（接受连接但不响应）时查询会永久阻塞，`@Scheduled` 单线程 + fixedDelay 语义下整个巡检链路静默停摆。多目标下每目标一个虚拟线程并行采集，最坏耗时 = 单目标的 8 条串行查询（约 40s），不随目标数放大，仍在 60s 巡检预算内；模型自主查询单次最多 5s 超时返回 -1 哨兵，Agent 拿到 -1 会如实告知"指标不可用"而非无限等待。
+两条路径共用同一个 RestClient 实例，显式配置**连接 2s / 读取 5s 超时**（`JdkClientHttpRequestFactory`，2026-09-30 评审补充）：RestClient 默认请求工厂不设超时，Prometheus 挂起（接受连接但不响应）时查询会永久阻塞，`@Scheduled` 单线程 + fixedDelay 语义下整个巡检链路静默停摆。多目标下每目标一个虚拟线程并行采集，不随目标数放大；**同一目标的 8 条 PromQL 也并行发起**（2026-11-13 优化：此前串行时最坏耗时 = 8 × 5s ≈ 40s，采集阶段就吃掉整个 60s 巡检周期；改为并行后墙钟 = 最慢一条 ≈5-7s），因此仍在 60s 巡检预算内；模型自主查询单次最多 5s 超时返回 -1 哨兵，Agent 拿到 -1 会如实告知"指标不可用"而非无限等待。
+
+### 跨实例聚合与查询缓存（2026-11-13）
+
+- **多副本聚合**：`process_cpu_usage` 与 `jvm_threads_states_threads{state="blocked"}` 每个实例各一条序列，多副本目标不带聚合时 `queryScalar` 只读第一条——副本 B 死锁、副本 A 正常时 `blockedThreads` 读到 0，**死锁完全不可见**。默认档因此外层 `max(...)`（监控看最坏实例：任一副本异常即告警）；堆分代明细用 `max by (id)`（多副本同 id 序列在 Java 侧 Map 里会互相覆盖，聚合后只剩 id 标签）；actuator 基线用 `sum(rate(...))`（基线不聚合时 QPS 减法用的是"随机一个副本"的基线，多副本下口径错位）。单副本部署下 `max`/`sum` 语义与裸查询完全一致，行为无变化。
+- **被动模式查询缓存**：`queryMetric` 带 15s TTL 缓存（`aiops.prometheus.query-cache-ttl`，对齐 Prometheus 抓取间隔）——模型单轮自主并发 5-6 次 queryMetric 且多轮提问常重复同一查询，TTL 内相同 PromQL 不重复打 Prometheus；**失败结果同样入缓存**，故障期天然限流，避免模型重试风暴打挂半死的 Prometheus。主动模式 `querySnapshot` 不走缓存（巡检 60s 一轮 > TTL，缓存无收益）。
 
 ### 新建 opsAgentClient Bean（而非复用 deepseekChatClient）
 
@@ -60,6 +65,6 @@ maxRequestSeconds 不过滤：actuator 抓取耗时通常 <0.5s，远低于 5s �
 
 0. **编译通过**：`.\gradlew.bat compileJava`
 1. **首次巡检日志**：启动应用 30 秒后应看到 `[OpsScheduler] 开始巡检...` + `[OpsScheduler] 巡检完成: 正常` INFO 日志
-2. **被动 Agent 查 Prometheus**：访问 `http://localhost:8080/api/agent/ops?message=过去1分钟QPS是多少` → 模型应调 `queryMetric` 拿到真实数据后回答
-3. **故障触发告警**：并发访问 `http://localhost:8080/api/debug/deadlock/a` 与 `http://localhost:8080/api/debug/deadlock/b`（相反锁序的两个接口，并发即双锁交叉死锁）→ 等待最多 1 分钟巡检 → 应看到 ERROR 级告警报告，含"blockedThreads: 2"+ 根因分析 + 处置建议
+2. **被动 Agent 查 Prometheus**：访问 `http://localhost:8080/api/agent/ops?message=过去1分钟QPS是多少` → 模型应调 `queryMetric` 拿到真实数据后回答（15s TTL 内重复提问命中缓存，不再打 Prometheus）
+3. **故障触发告警**：先以 `AIOPS_DEBUG_ENABLED=true` 启动（注入端点默认关），再并发访问 `http://localhost:8080/api/debug/deadlock/a` 与 `http://localhost:8080/api/debug/deadlock/b`（相反锁序的两个接口，并发即双锁交叉死锁）→ 等待最多 1 分钟巡检 → 应看到 ERROR 级告警报告，含"blockedThreads: 2"+ 根因分析 + 处置建议
 4. **恢复正常验证（人工操作）**：人工重启应用清除死锁（当前系统不含自动修复）→ 下次巡检恢复 INFO 正常日志

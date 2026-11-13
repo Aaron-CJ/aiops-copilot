@@ -8,9 +8,9 @@
 >
 > 阅读路线：**§1** 注入端点速查，**§2** 五类用例表，**§3** LLM 层手动回归流程，**§4** 度量口径，**§5** 已知边界。
 
-## 1. 注入端点（仅 dev profile 装配）
+## 1. 注入端点（dev profile + 显式开关双重门控）
 
-全部位于 [DebugController](../src/main/java/com/aiops/aiopscopilot/controller/DebugController.java)，`@Profile("dev")`——prod 启动直接 404。多目标部署下注入端点作用于**本应用**（dev 实例自身），巡检以 `APP=<目标名>;` 前缀指纹报告对应目标——把故障注入到哪个实例，就验证哪个目标的事件隔离。若配置了 `AIOPS_API_TOKEN`，这些端点同其余 `/api/**` 一样需要鉴权。巡检周期 60 秒（fixedDelay），注入后最长 60 秒可观察到巡检响应。
+全部位于 [DebugController](../src/main/java/com/aiops/aiopscopilot/controller/DebugController.java)，装配条件（2026-11-13 收紧）：`@Profile("dev")` **且** `aiops.debug.enabled=true`（环境变量 `AIOPS_DEBUG_ENABLED`，默认关）——默认 profile 是 dev，单靠 profile 防不住"忘设环境变量"的部署意外暴露注入端点；评估演练前先 `AIOPS_DEBUG_ENABLED=true` 启动。prod 启动即使误开开关也直接 404。多目标部署下注入端点作用于**本应用**（dev 实例自身），巡检以 `APP=<目标名>;` 前缀指纹报告对应目标——把故障注入到哪个实例，就验证哪个目标的事件隔离。若配置了 `AIOPS_API_TOKEN`，这些端点同其余 `/api/**` 一样需要鉴权。巡检周期 60 秒（fixedDelay），注入后最长 60 秒可观察到巡检响应。
 
 | 端点 | 参数 | 注入效果 | 恢复方式 |
 |------|------|----------|----------|
@@ -59,7 +59,7 @@
 
 1. **虚拟线程死锁不可观测（JDK 21.0.12 实测）**：`ThreadMXBean.findDeadlockedThreads()` 与 `Thread.getAllStackTraces()`（Micrometer 线程状态指标数据源）均不覆盖虚拟线程——**虚拟请求线程上的 synchronized/ReentrantLock 死锁对 blockedThreads 指标与 detectDeadlock() 完全不可见**（本注入器最初直接在请求线程上加锁时实测发现，连续多轮巡检误报 normal）。因此死锁注入刻意把锁竞争放在平台 worker 线程上（对应真实系统 @Async/批处理 worker 池形态）。虚拟线程挂起需引入活跃请求数等业务信号识别，已列入白皮书路线图。
 
-2. **空闲即 QPS=0（实测修正）**：actuator 抓取请求**不计入** `http_server_requests`——本机实测空闲应用（仅 Prometheus 抓取）`qpsLast1m=0.0`。因此无业务流量完成时 ZERO_QPS 特征即成立（ZERO_QPS 已降为兜底特征：死锁等更具体信号存在时指纹不再附加它）；但 LLM 路径下模型对空闲 QPS=0 多判 normal，且 AI 漏报兜底刻意不覆盖 QPS（强改会对空闲系统每轮误报假死）——ZERO_QPS 进指纹发生在模型判异常或降级路径时。真正的全进程假死（连 actuator 都不响应）表现为指标整体变 -1（Prometheus 抓取失败），依赖 LLM 按"-1=查询失败"规则忽略，属于更深的观测边界。
+2. **空闲即 QPS=0（实测修正）**：Prometheus 每 15s 抓取 `/actuator/prometheus` 的请求**会**计入 `http_server_requests_seconds`——它给巡检 QPS 引入 ≈0.067 的恒定基线污染（空闲系统因此永远看不到 qps=0）。快照侧用 **Java 侧减法**排除该基线（`总速率 − actuator 基线`），减法后空闲应用的 `qpsLast1m` 才回到 0.0——所以"空闲即 QPS=0"成立，但成立的原因是**扣掉了自指流量**，而不是 actuator 抓取不计入。详见 [PrometheusTool 双路径设计](aiops-ops-agent-prometheus-tool.md) 的"自指监控的口径处理"。因此 ZERO_QPS 特征（已降为兜底特征：死锁等更具体信号存在时指纹不再附加它）在无业务流量完成时即可成立；但 LLM 路径下模型对空闲 QPS=0 多判 normal，且 AI 漏报兜底刻意不覆盖 QPS（强改会对空闲系统每轮误报假死）——ZERO_QPS 进指纹发生在模型判异常或降级路径时。真正的全进程假死（连 actuator 都不响应）表现为指标整体变 -1（Prometheus 抓取失败），依赖 LLM 按"-1=查询失败"规则忽略，属于更深的观测边界。
 
 3. **F4 无代码兜底是设计而非缺陷**：纯延迟属于语义信号，硬阈值会产生大量误报（定时任务同样推高 max）——这正是白皮书"语义判断替代静态阈值"要解决的场景。
 

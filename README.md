@@ -71,7 +71,7 @@ curl http://localhost:8080/api/health/check
 ## 测试
 
 ```powershell
-./gradlew test              # 142 个单元测试，秒级、零基础设施依赖
+./gradlew test              # 184 个单元测试，秒级、零基础设施依赖（CI 自动执行：.github/workflows/ci.yml）
 ./gradlew integrationTest   # Spring 装配冒烟（需 Milvus 在线）+ 虚拟线程演示基准
 ```
 
@@ -92,14 +92,17 @@ curl http://localhost:8080/api/health/check
 |---|---|
 | `GET /api/agent/ops?message=` | 交互运维 Agent（模型自主调工具取真实指标后作答） |
 | `GET /api/ai/rag?message=` | 知识库问答（带来源引用）；`/rag/stream` 为 SSE 流式 |
+| `GET /api/chat?message=` | 自由对话（SSE 流式，deepseek-r1 思考段与正式回答区分渲染） |
+| `GET /api/test` | 运行时自检：确认 Tomcat 请求线程已切换为虚拟线程（`isVirtual` 字段） |
 | `POST /api/diagnosis` | 手动提交深度诊断；`GET /api/diagnosis/{taskId}` 轮询结果 |
 | `GET /api/health/check` | 依赖一键自检（部署后先跑这个） |
-| `GET /api/debug/*` | 故障注入夹具（仅 dev profile，生产 404），用例见评估手册 |
+| `GET /api/debug/*` | 故障注入夹具（dev profile + `AIOPS_DEBUG_ENABLED=true` 双重门控，默认关；生产 404），用例见评估手册 |
 
 ## 生产部署要点
 
 - 环境变量：`SPRING_PROFILES_ACTIVE=prod`、`AIOPS_API_TOKEN`（必填）、`MILVUS_PASSWORD`（不得为出厂默认
-  `milvus`）——缺失或为默认值时 **拒绝启动**（`ProdSecurityGuard` fail-fast 自检），全部可调参数见
+  `milvus`）——缺失或为默认值时 **拒绝启动**（`ProdSecurityGuard` fail-fast 自检）；评估演练才需要
+  `AIOPS_DEBUG_ENABLED=true`（故障注入端点默认关）。全部可调参数见
   [application.yml](src/main/resources/application.yml) 注释；
 - 单实例红线：IncidentStore / DiagnosisService 都在进程内存，横向扩容前必须先外置状态（演进路径见白皮书第五章）；
 - 镜像构建：仓库根目录 `Dockerfile`（多阶段构建，非 root 运行，`docker/volumes/` 与日志不入镜像）。
