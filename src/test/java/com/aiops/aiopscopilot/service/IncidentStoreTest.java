@@ -20,7 +20,8 @@ import static org.junit.jupiter.api.Assertions.*;
  * <ol>
  *   <li>{@link IncidentStore} 状态机去重（NEW → ACTIVE → RESOLVED、复发重新 NEW、指纹构造）</li>
  *   <li>{@link OpsScheduler#applyThresholdBackstop} AI 漏报兜底（normal 被硬指标强改）</li>
- *   <li>{@link OpsScheduler#fallbackByThreshold} Ollama 降级路径（阈值规则 + JSON 拼装）</li>
+ *   <li>{@link OpsScheduler#fallbackByThreshold} Ollama 降级路径（阈值规则 → 逐目标判定；
+ *       死锁/内存泄漏/QPS 假死的完整场景在 FaultInjectionEvaluationTest F1-F5）</li>
  * </ol>
  * 后两者是 OpsScheduler 的 private 方法，用反射调用——不为测试改生产方法可见性；
  * 构造器其余依赖传 null，因为这两条路径根本不会触达它们。
@@ -296,22 +297,8 @@ class IncidentStoreTest {
     }
 
     // ==================== C. OpsScheduler.fallbackByThreshold（Ollama 降级路径） ====================
-
-    @Test
-    void fallback_blockedAbove0_returnsCritical() throws Exception {
-        OpsScheduler sched = newSchedulerWithNulls();
-        Map<String, Object> snap = new HashMap<>();
-        snap.put("cpuUsage", 0.5);
-        snap.put("blockedThreads", 2.0);
-        snap.put("heapUsage", 0.5);
-        snap.put("qpsLast1m", 100.0);
-        snap.put("gcCountLast5m", 0.0);
-
-        OpsScheduler.TargetJudgment j = invokeFallback(sched, snap);
-
-        assertEquals("critical", j.status(), "BLOCKED>0 应降级为 critical");
-        assertTrue(j.rootCause().contains("代码级兜底"), "rootCause 应含代码级兜底标注");
-    }
+    // 完整场景覆盖（死锁/内存泄漏/QPS 假死的指纹+阈值判定+根因关键词）在
+    // FaultInjectionEvaluationTest F1-F3；此处只保留评估集未覆盖的三条单指标分支。
 
     @Test
     void fallback_cpuAbove90_returnsWarning() throws Exception {
@@ -329,36 +316,9 @@ class IncidentStoreTest {
     }
 
     /**
-     * QPS=0 假死判定带连续确认（ZERO_QPS_CONFIRM_ROUNDS=2）：第 1 轮 warning"待确认"，
-     * 同一实例连续第 2 轮仍 QPS=0 才升级 critical——空闲/低流量系统单轮 QPS=0 是常态，
-     * 单轮直接判 critical 会让空闲环境每分钟误报。
-     * 另做基线门控：从未观测到流量的实例 QPS 恒为 0，不构成假死。
+     * QPS=0 假死判定的完整语义（基线门控 / 连续 2 轮确认 / 恢复归零）由
+     * FaultInjectionEvaluationTest.f3 覆盖（含指纹构造断言），此处不再重复。
      */
-    @Test
-    void fallback_qpsZero_requiresTwoConsecutiveRoundsForCritical() throws Exception {
-        OpsScheduler sched = newSchedulerWithNulls();
-        Map<String, Object> snap = new HashMap<>();
-        snap.put("cpuUsage", 0.5);
-        snap.put("blockedThreads", 0.0);
-        snap.put("heapUsage", 0.5);
-        snap.put("qpsLast1m", 0.0);
-        snap.put("gcCountLast5m", 0.0);
-
-        String idleFromStart = invokeFallback(sched, snap).status();
-        assertEquals("normal", idleFromStart,
-                "从未有流量的空闲实例 QPS=0 是常态，不应判假死");
-
-        // 先观测一轮真实流量建立基线，后续 QPS=0 才是"从有流量跌到零"的假死信号
-        Map<String, Object> traffic = new HashMap<>(snap);
-        traffic.put("qpsLast1m", 50.0);
-        invokeFallback(sched, traffic);
-
-        String firstRound = invokeFallback(sched, snap).status();
-        assertEquals("warning", firstRound, "第 1 轮 QPS=0 应判 warning 待确认");
-
-        String secondRound = invokeFallback(sched, snap).status();
-        assertEquals("critical", secondRound, "连续第 2 轮 QPS=0 应升级 critical（应用假死）");
-    }
 
     @Test
     void fallback_allNormal_returnsNormal() throws Exception {
