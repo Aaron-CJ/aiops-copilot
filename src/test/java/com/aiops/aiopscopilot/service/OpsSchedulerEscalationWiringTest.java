@@ -41,6 +41,15 @@ class OpsSchedulerEscalationWiringTest {
     private static final Map<String, Object> DEADLOCK_BLOCK = Map.of(
             "cpuUsage", 0.2, "heapUsage", 0.3, "qpsLast1m", 1.0,
             "blockedThreads", 2.0, "gcCountLast5m", 0.0, "maxRequestSeconds", 0.2);
+    private static final Map<String, Object> TRAFFIC_BLOCK = Map.of(
+            "cpuUsage", 0.1, "heapUsage", 0.2, "qpsLast1m", 50.0,
+            "blockedThreads", 0.0, "gcCountLast5m", 0.0, "maxRequestSeconds", 0.1);
+    private static final Map<String, Object> ZERO_QPS_BLOCK = Map.of(
+            "cpuUsage", 0.1, "heapUsage", 0.2, "qpsLast1m", 0.0,
+            "blockedThreads", 0.0, "gcCountLast5m", 0.0, "maxRequestSeconds", 0.1);
+    private static final Map<String, Object> QUERY_FAILED_BLOCK = Map.of(
+            "cpuUsage", 0.1, "heapUsage", 0.2, "qpsLast1m", -1,
+            "blockedThreads", 0.0, "gcCountLast5m", 0.0, "maxRequestSeconds", 0.1);
     private static final String SELF = "aiops-copilot";
 
     @BeforeEach
@@ -72,11 +81,41 @@ class OpsSchedulerEscalationWiringTest {
         }
     }
 
+    /** 反射调 handleDegraded：走阈值兜底路径（Ollama 不可用形态），trackUnavailable=true */
+    private void handleDegraded(Map<String, Object> selfBlock) {
+        try {
+            Method m = OpsScheduler.class.getDeclaredMethod(
+                    "handleDegraded", Map.class, long.class, boolean.class);
+            m.setAccessible(true);
+            m.invoke(scheduler, Map.of("targets", Map.of(SELF, selfBlock)),
+                    System.currentTimeMillis(), true);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            throw new RuntimeException(e.getCause());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private static String json(String status, String confidence, String summary,
                                String rootCause, String suggestion) {
         return "{\"status\":\"" + status + "\",\"confidence\":\"" + confidence + "\","
                 + "\"summary\":\"" + summary + "\",\"rootCause\":\"" + rootCause + "\","
                 + "\"suggestion\":\"" + suggestion + "\"}";
+    }
+
+    /**
+     * （2026-11-13 实测发现）：qwen3 偶发省略 {@code {"targets":...}} 外壳直接输出裸数组——
+     * 元素结构与 targets 数组一致，解析层必须尽力接受而非白扔一轮进 parse_error
+     * （连续 2 轮就升级分钟级 r1 深度诊断，代价高）。
+     */
+    @Test
+    void bareArrayOutputWithoutTargetsWrapperIsAccepted() {
+        String reply = "[{\"name\":\"" + SELF + "\",\"status\":\"critical\",\"confidence\":\"high\","
+                + "\"summary\":\"CPU 打满\",\"rootCause\":\"CPU 持续 95%\",\"suggestion\":\"扩容或限流\"}]";
+        handle(reply, NORMAL_BLOCK, false);
+
+        verify(reporter, times(1)).report(startsWith("CRITICAL|APP=" + SELF), eq("critical"),
+                anyString(), anyString(), anyString(), any(), anyString());
     }
 
     /** 首轮解析失败：计数 1，不升级 */
@@ -145,6 +184,31 @@ class OpsSchedulerEscalationWiringTest {
         handle("坏", NORMAL_BLOCK, true);
 
         verify(diagnosisService, never()).submitEscalated(anyString(), anyString(), any(), any());
+    }
+
+    /**
+     * （2026-11-13）：两路径 QPS 归零规则统一——AI 轮观测到 qps=-1（查询失败）也必须打断
+     * "连续零流量"序列。修复前只有 qps&gt;0 才归零：降级轮 QPS=0（计数 1）→ AI 轮查询失败
+     * （计数残留）→ 下一个降级轮 QPS=0 计数到 2，直接跳级 critical 假死。
+     * 修复后与降级路径同口径：qps≠0（&gt;0 有流量 / &lt;0 查询失败）都打断——
+     * "没观测到"不能充当连续假死的一环。
+     */
+    @Test
+    void qpsQueryFailureBreaksConsecutiveZeroQpsChain() {
+        // 1. 基线：观测到真实流量（qps>0 同时建立 observedTraffic 门控）
+        handle(json("normal", "high", "各项指标正常", "N/A", "N/A"), TRAFFIC_BLOCK, false);
+        // 2. 降级轮 QPS=0：计数 1 → warning 待确认
+        handleDegraded(ZERO_QPS_BLOCK);
+        // 3. AI 轮指标拉取失败（qps=-1 哨兵）：修复后必须打断连续计数
+        handle(json("normal", "high", "各项指标正常", "N/A", "N/A"), QUERY_FAILED_BLOCK, false);
+        // 4. 降级轮 QPS=0：计数应从 0 重新开始 → 仍是 warning，而非残留计数直接跳 critical
+        handleDegraded(ZERO_QPS_BLOCK);
+
+        // 降级路径 rawReply=null（不走模型），matcher 用 any() 而非 anyString()
+        verify(reporter, never()).report(anyString(), eq("critical"), anyString(),
+                anyString(), anyString(), any(), any());
+        verify(reporter, atLeastOnce()).report(startsWith("WARNING|APP=" + SELF), eq("warning"),
+                anyString(), anyString(), anyString(), any(), any());
     }
 
     /**

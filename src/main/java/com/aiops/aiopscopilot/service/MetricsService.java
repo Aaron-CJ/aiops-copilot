@@ -38,6 +38,21 @@ public class MetricsService {
     }
 
     /**
+     * 记录一次巡检判定中的契约外 status（模型没给出可判定的级别）。
+     * <p>
+     * 单独计数而非并进 {@link #recordInspection}：recordInspection 是"每轮一条"的轮级指标，
+     * 契约外 status 是"每目标一条"的判定级问题，两者口径与聚合方式都不同。
+     * <p>
+     * 典型成因：模型漏了 status 字段、大小写/空白不一致、或输出 {@code "ok"} 这类契约外措辞。
+     * 该指标持续增长 = 模型的输出契约在漂移，需要调 prompt/换模型。
+     *
+     * @param target 目标名（标签基数受目标列表长度约束，有界）
+     */
+    public void recordStatusInvalid(String target) {
+        meterRegistry.counter("aiops_inspection_status_invalid_total", "target", target).increment();
+    }
+
+    /**
      * 记录一次 AI 模型调用。
      *
      * @param model      模型名（如 qwen3:8b、deepseek-r1:8b）

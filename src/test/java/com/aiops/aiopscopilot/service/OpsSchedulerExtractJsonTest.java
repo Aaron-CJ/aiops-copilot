@@ -69,6 +69,31 @@ class OpsSchedulerExtractJsonTest {
         assertEquals("{\"status\":\"warning\"}", extract(reply));
     }
 
+    /**
+     * 无换行围栏（2026-11-13 修复的实测缺口）：```json{...}``` 整块挤在一行——
+     * 修复前 firstNewline == -1 时开头围栏不剥，解析必然失败，
+     * 连续 2 轮就白白升级一次分钟级 r1 深度诊断。
+     */
+    @Test
+    void fenceWithoutNewlineIsStripped() {
+        String reply = "```json{\"status\":\"critical\"}```";
+        assertEquals("{\"status\":\"critical\"}", extract(reply));
+    }
+
+    /** 无换行且无语言标记：```{...}``` 同样剥掉 */
+    @Test
+    void bareFenceWithoutNewlineIsStripped() {
+        String reply = "```{\"status\":\"normal\"}```";
+        assertEquals("{\"status\":\"normal\"}", extract(reply));
+    }
+
+    /** 无换行围栏后的空白与结尾围栏组合仍正确收尾 */
+    @Test
+    void fenceWithoutNewlineTrailingWhitespaceTrimmed() {
+        String reply = "```json  {\"status\":\"warning\"}```  ";
+        assertEquals("{\"status\":\"warning\"}", extract(reply));
+    }
+
     /** {@code </think>} 思考段残留：取闭合标签之后的内容 */
     @Test
     void thinkTagRemainderIsStripped() {

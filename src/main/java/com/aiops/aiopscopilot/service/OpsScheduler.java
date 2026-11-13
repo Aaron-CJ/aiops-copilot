@@ -69,8 +69,8 @@ import tools.jackson.databind.ObjectMapper;
  *   <li>Ollama 降级：LLM 调用加超时（默认 {@value #LLM_TIMEOUT_SECONDS} 秒，
  *       可经 {@code aiops.inspection.llm-timeout-seconds} 调整），超时/异常走
  *       {@link #fallbackByThreshold} 硬阈值兜底，巡检不会因 Ollama 卡死而完全失效</li>
- *   <li>AI 漏报兜底：AI 判 normal 但 CPU&gt;90%、堆&gt;95% 或 BLOCKED&gt;0 时强改
- *       warning/critical，防止模型误判导致漏报</li>
+ *   <li>AI 漏报兜底：AI 判 normal（或输出契约外 status"判不了"）但 CPU&gt;90%、堆&gt;95%
+ *       或 BLOCKED&gt;0 时强改 warning/critical，防止模型误判或漏报字段导致漏报</li>
  *   <li>升级路由（{@link DiagnosisService}）：
  *       低置信度/连续解析失败、持续 {@value #ESCALATION_PERSIST_MINUTES} 分钟未消除、
  *       critical 且建议含写操作关键词三类信号入异步深度诊断队列，由 r1 worker 串行复核，
@@ -98,6 +98,31 @@ public class OpsScheduler {
     private static final double CPU_WARN_THRESHOLD = 0.90;
     /** 堆使用率严重线：超过即判 critical（95% 留给 GC 与突发分配一点余量） */
     private static final double HEAP_CRITICAL_THRESHOLD = 0.95;
+
+    /** 巡检契约内的 status 取值（Prompt 约定）：normal / warning / critical */
+    static final Set<String> VALID_STATUSES = Set.of("normal", "warning", "critical");
+
+    /**
+     * 契约外 status 的归一化结果：本轮"判不了"这个目标。
+     * <p>
+     * 不是第四种告警级别，而是"判定缺失"的标记——路由层据此跳过该目标：
+     * 既不进状态机（不误报），也不计入 normal 集合（其存量事件不归档，避免误判恢复）。
+     */
+    static final String STATUS_UNKNOWN = "unknown";
+
+    /**
+     * status 的中文同义词映射（最小集）。
+     * <p>
+     * 巡检模型是中文模型，summary/rootCause 本来就是中文，status 偶发写成中文时
+     * 按同义映射收敛，避免白白丢掉一个目标的判定。刻意只收语义无歧义的词：
+     * "异常"这类可对应 warning 也可对应 critical 的词不收（收到就判不了，宁缺勿滥）。
+     */
+    private static final Map<String, String> STATUS_ALIASES = Map.of(
+            "正常", "normal",
+            "警告", "warning",
+            "告警", "warning",
+            "严重", "critical",
+            "危急", "critical");
 
     /** QPS=0 假死判定需要的连续降级轮数：空闲/低流量系统单轮 QPS=0 是常态，
      *  第 1 轮只判 warning"待确认"，连续达到该轮数才升级 critical，避免合法空闲系统被每分钟误报 */
@@ -130,7 +155,8 @@ public class OpsScheduler {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     /** 每目标的连续 QPS=0 计数（键 = 目标名）：升计数在降级路径 fallbackForTarget 内维护，
-     *  归零统一在 routeJudgments 入口——任一路径观测到该目标 QPS&gt;0 都会打断"连续假死"序列；
+     *  归零统一在 routeJudgments 入口——任一路径观测到该目标 QPS≠0（&gt;0 有流量 /
+     *  &lt;0 查询失败）都会打断"连续假死"序列；
      *  达到 ZERO_QPS_CONFIRM_ROUNDS 才判假死 critical */
     private final Map<String, Integer> consecutiveZeroQpsRounds = new ConcurrentHashMap<>();
 
@@ -325,8 +351,8 @@ public class OpsScheduler {
 
         // QPS=0 连续确认计数：本方法只被降级/让路路径调用（巡检单线程串行），实例字段即轮次状态。
         // 零流量轮升计数；其余情形（含指标不可观测 cpu<0）归零——"没观测到"不能当作"连续零流量"。
-        // routeJudgments 入口另补充跨路径归零：任一路径观测到该目标 QPS>0 都会打断序列。
-        // cpu>=0 表示指标拉取正常（不是 -1 哨兵），此时 QPS=0 才有判定意义；
+        // routeJudgments 入口另补充跨路径归零：任一路径观测到该目标 QPS≠0（有流量或查询失败）
+        // 都会打断序列。cpu>=0 表示指标拉取正常（不是 -1 哨兵），此时 QPS=0 才有判定意义；
         // 还要求此前观测到过流量——从未有流量的空闲实例 QPS=0 是常态，不是假死
         if (qps > 0) {
             observedTraffic.put(name, true);
@@ -386,6 +412,31 @@ public class OpsScheduler {
     }
 
     /**
+     * status 归一化：只接受巡检契约内的三个取值，其余一律归为 {@link #STATUS_UNKNOWN}。
+     * <p>
+     * 模型偶尔漏字段、大小写/空白不一致，或输出 {@code "ok"}、{@code "正常"} 这类契约外措辞。
+     * 契约外取值的正确处置是<b>"判不了"</b>——既不能当 normal 静默放过（漏报），
+     * 也不能当异常上报（误报 + 永不归档的幽灵事件）。
+     * <p>
+     * 这道闸门是 {@link #parseJudgments} 与 {@link #routeJudgments} 之间唯一的口径边界：
+     * 过了归一化的 status 必然属于 {@link #VALID_STATUSES} 或 {@link #STATUS_UNKNOWN}，
+     * 因此路由层不必再对 status 做白名单判断。
+     *
+     * @param raw 模型给出的原始 status（可为空——字段缺失时）
+     * @return 契约内的 status，或 {@link #STATUS_UNKNOWN}（判不了）
+     */
+    static String normalizeStatus(String raw) {
+        if (raw == null) {
+            return STATUS_UNKNOWN;
+        }
+        String s = raw.trim().toLowerCase(Locale.ROOT);
+        if (VALID_STATUSES.contains(s)) {
+            return s;
+        }
+        return STATUS_ALIASES.getOrDefault(s, STATUS_UNKNOWN);
+    }
+
+    /**
      * 解析模型输出（先经 {@link #extractJson} 剥离思考段/markdown 包裹）为逐目标判定。
      * <p>
      * 输出契约（Prompt 约定的 JSON 结构）：
@@ -393,7 +444,9 @@ public class OpsScheduler {
      * 刻意不走 Ollama 的 JSON Schema 解码期约束：语法约束显著拖慢生成速度
      * （叠加多目标更长的输出与机器负载，超时预算内无法完成），延迟是每轮的确定性成本，
      * 而解析失败只是偶发且自愈（parse_error 通道 + 下一轮重试）。
-     * 兼容旧单对象契约（仅在快照恰有一个目标时接受，name 取该目标——单目标部署行为不变）。
+     * 兼容旧单对象契约（仅在快照恰有一个目标时接受，name 取该目标——单目标部署行为不变）；
+     * 兼容裸数组形态（2026-11-13 实测：qwen3 偶发省略 {@code {"targets":...}} 外壳直接输出
+     * 判定数组——元素结构一致，尽力解析而非白扔一轮进 parse_error，连续 2 轮就升级 r1 深度诊断）。
      * <p>
      * 无法解析/数组为空返回 null（调用方走 parse_error 通道：原文落 ERROR 日志便于调 prompt，
      * 巡检调度器必须比模型更稳定）；模型编造的未知目标名跳过并 WARN，不让幻觉目标进状态机。
@@ -410,43 +463,79 @@ public class OpsScheduler {
             return null;
         }
         Map<String, Object> targetsBlock = targetsBlockOf(snapshot);
-        List<TargetJudgment> out = new ArrayList<>();
         if (node.path("targets").isArray()) {
-            for (JsonNode t : node.path("targets")) {
-                String name = t.path("name").asString("");
-                if (!targetsBlock.containsKey(name)) {
-                    log.warn("[OpsScheduler] 模型返回了未知目标名，已跳过: {}", name);
-                    continue;
-                }
-                out.add(new TargetJudgment(name,
-                        t.path("status").asString("unknown"),
-                        t.path("confidence").asString("medium"),
-                        t.path("summary").asString("无摘要"),
-                        t.path("rootCause").asString("N/A"),
-                        t.path("suggestion").asString("N/A")));
-            }
-            return out.isEmpty() ? null : out;
+            return judgmentsFromArray(node.path("targets"), targetsBlock);
+        }
+        if (node.isArray()) {
+            return judgmentsFromArray(node, targetsBlock);
         }
         if (node.has("status") && targetsBlock.size() == 1) {
             String name = String.valueOf(targetsBlock.keySet().iterator().next());
-            out.add(new TargetJudgment(name,
-                    node.path("status").asString("unknown"),
+            return List.of(new TargetJudgment(name,
+                    statusOf(node.path("status").asString(""), name),
                     node.path("confidence").asString("medium"),
                     node.path("summary").asString("无摘要"),
                     node.path("rootCause").asString("N/A"),
                     node.path("suggestion").asString("N/A")));
-            return out;
         }
         return null;
     }
 
     /**
+     * 逐目标判定数组（{@code targets} 外壳内或裸数组形态）→ 判定列表。
+     * 模型编造的未知目标名跳过并 WARN；数组为空或全部目标非法返回 null（parse_error 通道）。
+     */
+    private List<TargetJudgment> judgmentsFromArray(JsonNode array, Map<String, Object> targetsBlock) {
+        List<TargetJudgment> out = new ArrayList<>();
+        for (JsonNode t : array) {
+            String name = t.path("name").asString("");
+            if (!targetsBlock.containsKey(name)) {
+                log.warn("[OpsScheduler] 模型返回了未知目标名，已跳过: {}", name);
+                continue;
+            }
+            out.add(new TargetJudgment(name,
+                    statusOf(t.path("status").asString(""), name),
+                    t.path("confidence").asString("medium"),
+                    t.path("summary").asString("无摘要"),
+                    t.path("rootCause").asString("N/A"),
+                    t.path("suggestion").asString("N/A")));
+        }
+        return out.isEmpty() ? null : out;
+    }
+
+    /**
+     * 单个目标的 status 取值 + 契约外取值告警。
+     * <p>
+     * 契约外 status 归一化为 {@link #STATUS_UNKNOWN}（本轮判不了该目标），并记一条
+     * WARN + {@code aiops_inspection_status_invalid_total} 指标——"模型没给出可判定的
+     * 级别"本身是需要被看见的信号（模型输出契约漂移），不能静默吞掉。
+     *
+     * @param raw       模型给出的原始 status
+     * @param targetName 目标名（仅用于日志与指标标签）
+     * @return 契约内 status 或 {@link #STATUS_UNKNOWN}
+     */
+    private String statusOf(String raw, String targetName) {
+        String status = normalizeStatus(raw);
+        if (!STATUS_UNKNOWN.equals(status)) {
+            return status;
+        }
+        log.warn("[OpsScheduler] 目标 {} 的 status 不在契约内（原始值=\"{}\"），本轮判为未知——"
+                + "既不静默放过也不误报异常", targetName, raw);
+        metricsService.recordStatusInvalid(targetName);
+        return STATUS_UNKNOWN;
+    }
+
+    /**
      * 把一轮逐目标判定路由进状态机与报告：
      * <ol>
-     *   <li>每目标：跨路径 QPS 归零/基线 → AI 漏报兜底 → 指纹（APP 前缀）→ 状态机 → 报告/心跳
+     *   <li>每目标：跨路径 QPS 归零/基线 → AI 漏报兜底（normal 与"判不了"都过硬信号闸）→
+     *       指纹（APP 前缀）→ 状态机 → 报告/心跳
      *       → 升级评估（normal+low → LOW_CONFIDENCE；非 normal → chooseEscalationTrigger）</li>
-     *   <li>轮级收口：metrics/审计 END 取各目标最差状态聚合（一轮一条记录，不按目标刷）；
-     *       normal 目标汇总后逐目标递增事件 normal 计数（降级轮不 bump——盲期不归档）</li>
+     *   <li>全部目标判不了（status 全在契约外且兜底未命中）：整轮内容不可信，走 parse_error
+     *       通道（ERROR 日志 + 连续 2 轮升级深度模型）——放在兜底之后，契约漂移不吞硬信号</li>
+     *   <li>轮级收口：metrics/审计 END 取各目标最差状态聚合（一轮一条记录，不按目标刷，
+     *       有判不了的目标时轮级状态抬为 unknown）；normal 目标汇总后逐目标递增事件 normal
+     *       计数（降级轮不 bump——盲期不归档）</li>
      * </ol>
      * 深度诊断升级提交时携带该目标的指标块（而非整轮快照）——r1 的 Prompt 更聚焦，
      * 也不会把其它应用的数据混入对方故障的分析。
@@ -455,21 +544,37 @@ public class OpsScheduler {
                                 long start, boolean degraded, String rawReply) {
         long durationMs = System.currentTimeMillis() - start;
         try {
-            consecutiveParseFailures = 0;
             String worstStatus = "normal";
             String worstFp = "none";
             boolean worstIncidentActive = false;
             boolean allNormal = true;
             Set<String> normalTargets = new HashSet<>();
+            Set<String> unjudgedTargets = new HashSet<>();
             for (TargetJudgment j : judgments) {
                 Map<String, Object> block = blockOf(snapshot, j.target());
-                // QPS>0 的真实观测打断该目标的"连续 QPS=0"计数并建立流量基线，与路径无关
-                if (asDouble(block.get("qpsLast1m")) > 0) {
-                    consecutiveZeroQpsRounds.put(j.target(), 0);
+                double qps = asDouble(block.get("qpsLast1m"));
+                if (qps > 0) {
                     observedTraffic.put(j.target(), true);
                 }
-                // AI 漏报兜底：AI 判 normal 但该目标指标严重超阈值时强改级别
+                // 与降级路径 fallbackForTarget 同一口径（2026-11-13 修复）：只有精确观测到
+                // QPS=0 才允许"连续零流量"序列延续；qps>0（真实流量）与 qps<0（-1 哨兵 = 查询
+                // 失败/无数据）都打断序列——"没观测到"不能充当连续假死的一环，否则一次指标拉取
+                // 失败后残留计数跨轮存活，下一个降级轮直接跳级 critical 假死
+                if (qps != 0) {
+                    consecutiveZeroQpsRounds.put(j.target(), 0);
+                }
+                // AI 漏报兜底先行：AI 判 normal 或"判不了"（契约外 status）但该目标指标
+                // 严重超阈值时强改级别——硬信号（BLOCKED>0/堆>95%/CPU>90%）是确定性观测，
+                // 模型"没说话"不能让死锁漏报一整轮（与降级路径对同一指标的口径一致）
                 String status = applyThresholdBackstop(j.target(), j.status(), block);
+                // 契约外 status 且无硬信号命中：本轮该目标"判不了"——
+                // 既不进状态机（不误报），也不计入 normal 集合（其存量事件不归档，避免误判恢复）。
+                // 轮级状态标 unknown，运维从 aiops_inspection_total{status="unknown"} 可见。
+                if (STATUS_UNKNOWN.equals(status)) {
+                    unjudgedTargets.add(j.target());
+                    allNormal = false;
+                    continue;
+                }
                 // normal 的目标不进状态机——"正常情况应该静默"（旧行为如此，保持）；
                 // AI 对正常目标自报 low confidence 时仍走漏报复核
                 if ("normal".equalsIgnoreCase(status)) {
@@ -515,7 +620,37 @@ public class OpsScheduler {
                     worstIncidentActive = !incident.isNew();
                 }
             }
+            // 全部目标都判不了（status 全在契约外且无硬信号兜底命中）：JSON 本身合法，
+            // 但内容同样不可信——与解析失败走同一条通道（原文落 ERROR 日志便于调 prompt，
+            // 连续 2 轮升级深度模型）。放在兜底之后：有硬信号的目标已在上面被接住，
+            // 走不到这里，"契约漂移"不会吞掉死锁。
+            if (!unjudgedTargets.isEmpty() && unjudgedTargets.size() == judgments.size()) {
+                metricsService.recordInspection(degraded ? "degraded_parse_error" : "parse_error", durationMs);
+                audit.inspectionFinished((degraded ? "degraded_" : "") + "parse_error", durationMs, "none");
+                log.error("[OpsScheduler] 巡检结果中所有目标的 status 均不在契约内，模型原始输出：\n{}", rawReply);
+                if (!degraded) {
+                    consecutiveParseFailures++;
+                    if (consecutiveParseFailures >= PARSE_FAILURE_LIMIT) {
+                        String raw = rawReply == null ? "" : rawReply.substring(0, Math.min(rawReply.length(), 1000));
+                        diagnosisService.submitEscalated(
+                                DiagnosisTask.Trigger.PARSE_FAIL,
+                                "PARSE_FAIL", snapshot,
+                                "快通道连续 " + consecutiveParseFailures
+                                        + " 轮所有目标 status 均不在契约内，最近一次原始输出：\n" + raw);
+                        consecutiveParseFailures = 0;
+                    }
+                }
+                return;
+            }
+            // 走到这里说明至少一个目标判出来了——解析产出可用，解析失败计数归零
+            // （含此前累计的坏输出/契约漂移轮；全判不了轮在上方提前返回、照常累计）
+            consecutiveParseFailures = 0;
             // 轮级收口：metrics 与审计 END 各一条（状态取最差目标，多目标不刷多条轮次记录）
+            // 有目标判不了时，轮级状态抬到 unknown（unknown 的 rank 高于 warning、低于 critical）：
+            // "没判出来"比 warning 更值得注意，但不掩盖 critical。
+            if (!unjudgedTargets.isEmpty() && rank(worstStatus) < rank(STATUS_UNKNOWN)) {
+                worstStatus = STATUS_UNKNOWN;
+            }
             metricsService.recordInspection((degraded ? "degraded_" : "") + worstStatus, durationMs);
             if (allNormal) {
                 reporter.logNormal(snapshot, degraded);
@@ -543,7 +678,6 @@ public class OpsScheduler {
     }
 
     private void handleInspectionResult(String reply, Map<String, Object> snapshot, long start, boolean degraded) {
-        long durationMs = System.currentTimeMillis() - start;
         List<TargetJudgment> judgments = null;
         try {
             judgments = parseJudgments(reply, snapshot);
@@ -552,6 +686,7 @@ public class OpsScheduler {
         }
         if (judgments == null || judgments.isEmpty()) {
             // 解析失败路径——巡检调度器必须比模型更稳定：原文落 ERROR 日志便于调 prompt
+            long durationMs = System.currentTimeMillis() - start;
             metricsService.recordInspection(degraded ? "degraded_parse_error" : "parse_error", durationMs);
             audit.inspectionFinished((degraded ? "degraded_" : "") + "parse_error", durationMs, "none");
             log.error("[OpsScheduler] 巡检结果解析失败，模型原始输出：\n{}", reply);
@@ -571,6 +706,9 @@ public class OpsScheduler {
             }
             return;
         }
+        // "全部目标判不了"（status 全在契约外）的收敛在 routeJudgments 内做：
+        // 必须先让硬信号兜底过一遍——模型对故障目标漏了 status 时，死锁不能因为
+        // "整轮没判出来"而被归进契约漂移通道静默吞掉
         routeJudgments(judgments, snapshot, start, degraded, reply);
     }
 
@@ -641,13 +779,14 @@ public class OpsScheduler {
     }
 
     /**
-     * AI 漏报兜底：AI 判 normal 但该目标指标严重超阈值时强改级别——模型可能对明显异常
-     * 过于保守，关键硬信号（死锁/堆爆/CPU 打满）不允许被一句"正常"盖过去。
+     * AI 漏报兜底：AI 判 normal（或"判不了"——契约外 status）但该目标指标严重超阈值时
+     * 强改级别——模型可能对明显异常过于保守甚至没给出级别，关键硬信号（死锁/堆爆/CPU 打满）
+     * 不允许被一句"正常"或"没说话"盖过去。
      * 每次介入都写审计，便于事后核对是 AI 对还是兜底对；
      * rootCause 的"[代码级兜底已介入：...]"标注由调用方 routeJudgments 追加。
      */
     private String applyThresholdBackstop(String targetName, String status, Map<String, Object> block) {
-        if (!"normal".equalsIgnoreCase(status)) {
+        if (!"normal".equalsIgnoreCase(status) && !STATUS_UNKNOWN.equals(status)) {
             return status;
         }
         double cpu = asDouble(block.get("cpuUsage"));
@@ -719,7 +858,18 @@ public class OpsScheduler {
         if (s.startsWith("```")) {
             int firstNewline = s.indexOf('\n');
             if (firstNewline > 0) {
+                // 标准形态：```language\n...\n``` ——剥到首换行之后
                 s = s.substring(firstNewline + 1);
+            } else {
+                // 无换行围栏（2026-11-13 修复的实测缺口）：```json{...}``` 整块挤在一行——
+                // 此时首换行不存在，旧逻辑直接跳过剥离导致解析失败。只剥开头的 ```
+                // 与紧随的语言标记（JSON 不会以字母开头，循环停在 JSON 首字符上，无歧义）
+                s = s.substring(3);
+                int langEnd = 0;
+                while (langEnd < s.length() && Character.isLetter(s.charAt(langEnd))) {
+                    langEnd++;
+                }
+                s = s.substring(langEnd);
             }
             if (s.endsWith("```")) {
                 s = s.substring(0, s.length() - 3);
