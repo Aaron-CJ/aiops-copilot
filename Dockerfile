@@ -8,7 +8,7 @@ WORKDIR /build
 
 # 先复制 gradle wrapper 和 build 脚本，利用 Docker 缓存层加速构建
 COPY gradle/ ./gradle/
-COPY gradlew build.gradle settings.gradle ./
+COPY gradlew build.gradle settings.gradle gradle.properties ./
 RUN chmod +x gradlew
 
 # 复制源码
@@ -43,6 +43,14 @@ EXPOSE 8080
 # healthcheck 调 /actuator/health），镜像内不装 curl/wget 保持体积
 ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"
 
+# JVM 崩溃日志与堆转储落盘（2026-11-13 B13）：/app 其余目录属 root 不可写，
+# 默认的启动工作目录 hs_err 文件会静默丢失；/app/logs 是 VOLUME 且属 app 用户，
+# 崩溃现场（hs_err / OOM 堆转储）与审计日志落在同一持久卷，重启不丢证据
+ENTRYPOINT ["java", \
+  "-XX:ErrorFile=/app/logs/hs_err_pid%p.log", \
+  "-XX:+HeapDumpOnOutOfMemoryError", "-XX:HeapDumpPath=/app/logs", \
+  "-jar", "/app/app.jar"]
+
 # 部署约束：单实例设计——事件状态机（IncidentStore）与深度诊断任务队列（DiagnosisService）
 # 都在进程内存，审计日志在本地卷。横向扩多副本会导致重复告警、诊断任务不共享、审计分散；
 # 需要多实例时必须先引入共享状态存储（Redis 等）并改造这两处，再考虑扩容。
@@ -56,5 +64,3 @@ ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0"
 #   MILVUS_HOST=宿主机IP  Milvus gRPC 地址
 #   MILVUS_PASSWORD=你的强密码  Milvus 凭据（生产必须改，默认值 milvus 会被启动自检拒绝）
 #   AIOPS_DIAGNOSIS_WORKER_TIMEOUT_MINUTES=15  深度诊断可调参数（队列容量/防抖窗口/超时/保留条数，见 application.yml）
-
-ENTRYPOINT ["java", "-jar", "/app/app.jar"]

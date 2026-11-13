@@ -5,14 +5,28 @@ server:
 aiops:
   security:
     # API 访问令牌：非空时 /api/** 全部需要鉴权（Authorization: Bearer <token>
-    # 或 X-API-Key 头；SSE 接口可用 ?token= 传参）；留空则不鉴权（本地开发默认）。
-    # 生产通过环境变量注入：AIOPS_API_TOKEN=你的强随机令牌
+    # 或 X-API-Key 头；SSE 接口可用 ?token= 传参）；留空则不鉴权（本地开发默认，
+    # 启动时打 WARN 提示）。生产通过环境变量注入：AIOPS_API_TOKEN=你的强随机令牌
     token: ${AIOPS_API_TOKEN:}
+  debug:
+    # 故障注入调试接口（/api/debug/**）总开关，默认关。dev profile + 本开关同时满足才装配——
+    # 默认 profile 是 dev（SPRING_PROFILES_ACTIVE 缺省 dev），单靠 profile 防不住
+    # "忘设环境变量"的部署意外暴露 OOM/死锁/CPU 注入端点。评估演练时显式打开：
+    # AIOPS_DEBUG_ENABLED=true
+    enabled: ${AIOPS_DEBUG_ENABLED:false}
   prometheus:
     # Prometheus HTTP API 地址，供 PrometheusTool 调用 /api/v1/query
     # Agent 把这里当"时序数据的眼睛"——不通过 Grafana 看图，直接读 API
     # Docker 部署时改为宿主机/独立机：PROMETHEUS_BASE_URL=http://host.docker.internal:9090
     base-url: ${PROMETHEUS_BASE_URL:http://localhost:9090}
+    # 被动模式（/api/agent/ops 模型自主查询）的短 TTL 缓存：对齐 Prometheus 15s 抓取间隔，
+    # TTL 内同一 PromQL 不重复打 Prometheus（模型单轮常并发 5-6 次查询）；设 0s 可关闭
+    query-cache-ttl: ${AIOPS_PROM_QUERY_CACHE_TTL:15s}
+  ollama:
+    # Ollama REST（.call() 同步推理）读超时：默认 16m = 深度诊断 15min 硬超时 + 1min 余量——
+    # 合法推理不被截断，但 Ollama 僵死时每个卡死调用 16 分钟后必然终结、线程得以释放
+    #（此前读超时无限，future.cancel 断不了底层 HTTP，每轮超时泄漏 1 个挂死线程）
+    rest-read-timeout: ${AIOPS_OLLAMA_REST_READ_TIMEOUT:16m}
   models:
     # 快速通道模型：定时巡检 + 交互 Agent（关闭思考链，追求低延迟）
     # 深度推理/RAG 模型直接复用下方 spring.ai.ollama.chat.model（deepseek-r1:8b）
@@ -38,7 +52,7 @@ aiops:
     llm-timeout-seconds: ${AIOPS_INSPECTION_LLM_TIMEOUT_SECONDS:45}
   diagnosis:
     # 深度诊断任务队列（DiagnosisService，白皮书 4.2），均可用环境变量覆盖
-    queue-capacity: ${AIOPS_DIAGNOSIS_QUEUE_CAPACITY:20}          # 有界队列容量，满则拒绝并记审计
+    queue-capacity: ${AIOPS_DIAGNOSIS_QUEUE_CAPACITY:20}          # 有界队列容量，满则拒绝并记审计；其中 1/4（至少 1 槽）为自动升级预留，手动提交在空闲槽位不足时先被限流
     dedup-window-minutes: ${AIOPS_DIAGNOSIS_DEDUP_WINDOW_MINUTES:10}   # 同一指纹自动升级的最小间隔
     worker-timeout-minutes: ${AIOPS_DIAGNOSIS_WORKER_TIMEOUT_MINUTES:15} # r1 单次推理硬超时（长思考链纯 CPU 推理可超 15 分钟，超时按设计收敛为 FAILED）
     max-finished-tasks: ${AIOPS_DIAGNOSIS_MAX_FINISHED_TASKS:100} # 终态任务内存保留条数
@@ -61,6 +75,19 @@ spring:
     model:
       chat: ollama
       embedding: ollama
+    # 收紧 Spring AI 框架级重试（2026-11-13 调整）。
+    # 默认值 max-attempts=10 + backoff 倍率 5 + 上限 180s ⇒ 单次失败调用最多重试约 19 分钟，
+    # 而本项目自研了超时（巡检 45s / 深度诊断 15min）、阈值降级、推理让路三层防线——
+    # 框架重试会绕开这三层：巡检超时只中断"等待"，底层虚拟线程继续重试打 Ollama，
+    # 每分钟新增一个 ⇒ Ollama 挂 1 小时后 60 个僵尸重试线程同时在打，
+    # 恢复瞬间被淹没（NUM_PARALLEL=1 时更致命）。
+    # 取 2 = 允许一次快速重试（覆盖瞬时网络抖动），退避压到秒级，不产生重试风暴。
+    retry:
+      max-attempts: 2
+      backoff:
+        initial-interval: 1s
+        multiplier: 2
+        max-interval: 10s
     ollama:
       # Ollama 后台服务地址
       # Docker 部署时改为宿主机/独立机：OLLAMA_BASE_URL=http://host.docker.internal:11434

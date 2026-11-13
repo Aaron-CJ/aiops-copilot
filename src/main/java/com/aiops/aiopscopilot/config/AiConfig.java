@@ -1,11 +1,19 @@
 package com.aiops.aiopscopilot.config;
 
+import java.net.http.HttpClient;
+import java.time.Duration;
+
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.ollama.api.OllamaApi;
 import org.springframework.ai.ollama.api.OllamaChatOptions;
+import org.springframework.ai.retry.RetryUtils;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.web.client.RestClient;
+import org.springframework.web.reactive.function.client.WebClient;
 
 import com.aiops.aiopscopilot.tool.PrometheusTool;
 import com.aiops.aiopscopilot.tool.SystemHealthTools;
@@ -26,6 +34,43 @@ import com.aiops.aiopscopilot.tool.SystemHealthTools;
 @Configuration
 @EnableConfigurationProperties(TargetsProperties.class)
 public class AiConfig {
+
+    /**
+     * 自定义 OllamaApi：给 REST（.call() 同步推理）路径装上连接级超时（2026-11-13）。
+     * <p>
+     * 自动装配的 OllamaApi 用默认请求工厂，<b>读超时为无限</b>——Ollama 进程僵死（接受连接
+     * 但不响应）时，巡检/深度诊断的 {@code future.get(45s/15min)} 超时只中断"等待"，
+     * {@code future.cancel} 断不了底层 HTTP，底层虚拟线程挂死在无超时的读取上：
+     * 巡检每分钟超时一次 ⇒ 每分钟泄漏 1 个卡死线程，Ollama 恢复前只进不出。
+     * <p>
+     * 取值：连接 10s（Ollama 宕机 = 秒级拒连，黑洞地址 10s 打断，叠加 1 次框架重试仍在
+     * 45s 巡检预算内）；读超时默认 16m = 深度诊断 15min 硬超时 + 1min 余量——
+     * 合法推理（r1 长思考链实测可达 15 分钟）绝不被截断，但每个卡死调用 16 分钟后必然
+     * 终结、线程得以释放。可经 {@code aiops.ollama.rest-read-timeout} 覆盖。
+     * <p>
+     * 流式路径（/api/chat、/rag/stream 的 WebClient）不在此设超时：流式增量返回数据，
+     * SSE 挂起由容器异步 I/O 超时兜底（Tomcat async timeout 在无数据时触发），
+     * 对流式连接强行设响应超时反而会误杀长思考的合法停顿。
+     * <p>
+     * 本 Bean 声明后自动顶替自动装配（OllamaApiAutoConfiguration 为
+     * {@code @ConditionalOnMissingBean}），chat / embedding 两个模型共用同一超时基线。
+     * responseErrorHandler 与自动装配保持一致（RetryUtils.DEFAULT_RESPONSE_ERROR_HANDLER），
+     * 4xx/5xx 的重试语义不因本 Bean 改变。
+     */
+    @Bean
+    public OllamaApi ollamaApi(
+            @Value("${spring.ai.ollama.base-url:http://localhost:11434}") String baseUrl,
+            @Value("${aiops.ollama.rest-read-timeout:16m}") Duration restReadTimeout) {
+        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(
+                HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build());
+        factory.setReadTimeout(restReadTimeout);
+        return OllamaApi.builder()
+                .baseUrl(baseUrl)
+                .restClientBuilder(RestClient.builder().requestFactory(factory))
+                .webClientBuilder(WebClient.builder())
+                .responseErrorHandler(RetryUtils.DEFAULT_RESPONSE_ERROR_HANDLER)
+                .build();
+    }
 
     /**
      * 深度通道：使用 yml 默认模型 deepseek-r1:8b（思考链默认开启），

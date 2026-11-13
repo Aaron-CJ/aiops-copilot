@@ -1,0 +1,52 @@
+# 单元测试 CI 门禁（2026-11-13：此前全部单元测试没有任何自动执行的地方）。
+#
+# 刻意只跑 `test`（单元测试集）：集成集（@Tag("integration")，Spring 装配冒烟需 Milvus
+# 在位、演示基准墙钟断言负载下偶发红）按 build.gradle 的分层设计**不进 CI**——
+# "干净 CI 环境不因缺 Milvus 而红"。集成集在本地带基础设施环境以 `gradlew integrationTest`
+# 触发，分层理由见 docs/aiops-reliability-design.md §6.8。
+#
+# action 版本均为创建时从官方 releases 页核实的最新稳定大版本（checkout v7 /
+# setup-java v6 / setup-gradle v6 / upload-artifact v7），升级时逐个核对 changelog。
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: 单元测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 JDK 21（Temurin）
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # 缓存默认开启（Gradle 依赖与构建缓存，主分支回写、PR 分支只读）
+      - name: 配置 Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # 保险：git 若未保存 gradlew 的可执行位，checkout 后直接跑会 EACCES
+      - name: 确保 gradlew 可执行
+        run: chmod +x gradlew
+
+      - name: 运行单元测试（184 个，零基础设施依赖，秒级）
+        run: ./gradlew test
+
+      - name: 上传测试报告
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports
+          path: build/reports/tests/test
+          if-no-files-found: ignore
+          retention-days: 7
