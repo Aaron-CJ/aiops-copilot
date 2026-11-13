@@ -63,3 +63,14 @@ replay_pid*
 
 ### ZCode 会话产物（不属于项目） ###
 .zcode/
+
+### IDE/调试工具产生的截图缓存（不属于项目产物，不随仓库分发） ###
+.screenshots/
+
+### Node.js（万一以后加前端；package-lock.json / yarn.lock 必须提交，否则依赖版本无法复现） ###
+node_modules/
+
+### 系统临时文件 ###
+.DS_Store
+Thumbs.db
+desktop.ini

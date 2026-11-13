@@ -91,3 +91,14 @@ tasks.register('integrationTest', Test) {
 	classpath = sourceSets.test.runtimeClasspath
 	shouldRunAfter tasks.named('test')
 }
+
+// wrapper 发行版固定：任何人/IDE 执行 `gradlew wrapper` 再生成 wrapper 文件时，镜像源、
+// SHA256 校验和、超时重试都会原样写入（此前发生过 wrapper 文件被外部工具用默认官方 URL 覆盖）。
+// 校验和与官方发布页一致：镜像下载内容被篡改时构建直接失败
+tasks.named('wrapper', Wrapper) {
+	distributionUrl = 'https://mirrors.cloud.tencent.com/gradle/gradle-9.9.1-bin.zip'
+	distributionSha256Sum = 'd8a18a7a841dd5df825d35a685fad6f2d7f12ac0c280e57b67c27b4a520ba228'
+	networkTimeout = 10000
+	retries = 3
+	retryBackOffMs = 500
+}
