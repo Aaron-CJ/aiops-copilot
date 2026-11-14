@@ -226,8 +226,10 @@ public class DebugController {
         long deadline = System.nanoTime() + safeSeconds * 1_000_000_000L;
         for (int i = 1; i <= n; i++) {
             Thread.ofVirtual().name("cpu-spike-" + i).start(() -> {
-                // 纯自旋占满 ForkJoinPool 载体线程，推高 process_cpu_usage
+                // 纯自旋占满 ForkJoinPool 载体线程，推高 process_cpu_usage。
+                // onSpinWait 只向 CPU/JVM 提示"忙等"，不 yield、不 sleep、不阻塞，自旋强度不变
                 while (cpuSpikeGeneration.get() == generation && System.nanoTime() < deadline) {
+                    Thread.onSpinWait();
                 }
             });
         }

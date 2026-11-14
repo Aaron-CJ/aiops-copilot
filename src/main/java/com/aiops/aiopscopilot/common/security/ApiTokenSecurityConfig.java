@@ -1,5 +1,6 @@
 package com.aiops.aiopscopilot.common.security;
 
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -56,11 +57,15 @@ public class ApiTokenSecurityConfig {
 
     /**
      * token 非空才装配过滤器的条件（Environment 直读，无 SpEL 引号陷阱）。
+     * <p>
+     * 只依赖 {@code context.getEnvironment()}；{@code metadata} 虽在 Spring 的
+     * {@code @NullMarked} 契约里默认非 null，本条件不读取它，显式放宽为
+     * {@code @Nullable}，使纯单测无需构造无意义的 metadata 桩。
      */
     static class TokenConfigured implements Condition {
 
         @Override
-        public boolean matches(ConditionContext context, AnnotatedTypeMetadata metadata) {
+        public boolean matches(ConditionContext context, @Nullable AnnotatedTypeMetadata metadata) {
             String token = context.getEnvironment().getProperty("aiops.security.token");
             return token != null && !token.isBlank();
         }

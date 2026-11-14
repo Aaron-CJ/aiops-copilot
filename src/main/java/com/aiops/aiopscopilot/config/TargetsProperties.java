@@ -57,7 +57,7 @@ public class TargetsProperties {
             out.add(t);
         }
         if (!selfPresent) {
-            out.add(0, new MonitoredTarget(selfApplication, selfApplication, null));
+            out.addFirst(new MonitoredTarget(selfApplication, selfApplication, null));
         }
         return List.copyOf(out);
     }

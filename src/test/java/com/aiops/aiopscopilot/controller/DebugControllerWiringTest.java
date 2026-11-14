@@ -2,7 +2,6 @@ package com.aiops.aiopscopilot.controller;
 
 import org.junit.jupiter.api.Test;
 
-import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;

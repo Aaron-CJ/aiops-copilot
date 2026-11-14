@@ -3,11 +3,14 @@ package com.aiops.aiopscopilot.common.security;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.ConditionContext;
 import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.env.StandardEnvironment;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * {@link ApiTokenSecurityConfig.TokenConfigured} 装配条件的单测。
@@ -56,34 +59,13 @@ class ApiTokenSecurityConfigTest {
         assertTrue(condition.matches(context(env), null));
     }
 
-    /** 最小 ConditionContext：本条件只读 Environment，其余组件用 null 占位即可 */
-    private static org.springframework.context.annotation.ConditionContext context(
-            StandardEnvironment env) {
-        return new org.springframework.context.annotation.ConditionContext() {
-            @Override
-            public org.springframework.beans.factory.support.BeanDefinitionRegistry getRegistry() {
-                return null;
-            }
-
-            @Override
-            public org.springframework.beans.factory.config.ConfigurableListableBeanFactory getBeanFactory() {
-                return null;
-            }
-
-            @Override
-            public StandardEnvironment getEnvironment() {
-                return env;
-            }
-
-            @Override
-            public org.springframework.core.io.ResourceLoader getResourceLoader() {
-                return null;
-            }
-
-            @Override
-            public ClassLoader getClassLoader() {
-                return null;
-            }
-        };
+    /**
+     * 最小 ConditionContext：本条件只读 Environment；用 Mockito mock 提供，
+     * 避免手写桩为 @NullMarked 契约里非 null 的 getRegistry/getResourceLoader 返回 null。
+     */
+    private static ConditionContext context(StandardEnvironment env) {
+        ConditionContext context = mock(ConditionContext.class);
+        when(context.getEnvironment()).thenReturn(env);
+        return context;
     }
 }

@@ -1,5 +1,6 @@
 package com.aiops.aiopscopilot.config;
 
+import com.aiops.aiopscopilot.common.security.ApiTokenSecurityConfig;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
