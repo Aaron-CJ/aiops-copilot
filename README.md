@@ -71,7 +71,7 @@ curl http://localhost:8080/api/health/check
 ## 测试
 
 ```powershell
-./gradlew test              # 184 个单元测试，秒级、零基础设施依赖（CI 自动执行：.github/workflows/ci.yml）
+./gradlew test              # 205 个单元测试，秒级、零基础设施依赖（CI 自动执行：.github/workflows/ci.yml）
 ./gradlew integrationTest   # Spring 装配冒烟（需 Milvus 在线）+ 虚拟线程演示基准
 ```
 
@@ -92,7 +92,7 @@ curl http://localhost:8080/api/health/check
 |---|---|
 | `GET /api/agent/ops?message=` | 交互运维 Agent（模型自主调工具取真实指标后作答） |
 | `GET /api/ai/rag?message=` | 知识库问答（带来源引用）；`/rag/stream` 为 SSE 流式 |
-| `GET /api/chat?message=` | 自由对话（SSE 流式，deepseek-r1 思考段与正式回答区分渲染） |
+| `GET /api/ai/chat?message=` | 自由对话（SSE 流式，deepseek-r1 思考段以 `<think>...</think>` 包裹推送、与正式回答区分渲染；EventSource 可用 `?token=` 传鉴权） |
 | `GET /api/test` | 运行时自检：确认 Tomcat 请求线程已切换为虚拟线程（`isVirtual` 字段） |
 | `POST /api/diagnosis` | 手动提交深度诊断；`GET /api/diagnosis/{taskId}` 轮询结果 |
 | `GET /api/health/check` | 依赖一键自检（部署后先跑这个） |

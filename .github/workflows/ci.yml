@@ -39,7 +39,7 @@ jobs:
       - name: 确保 gradlew 可执行
         run: chmod +x gradlew
 
-      - name: 运行单元测试（184 个，零基础设施依赖，秒级）
+      - name: 运行单元测试（205 个，零基础设施依赖，秒级）
         run: ./gradlew test
 
       - name: 上传测试报告

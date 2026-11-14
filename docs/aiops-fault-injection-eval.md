@@ -33,23 +33,23 @@
 
 ## 3. LLM 层手动回归流程
 
-0. 前置：`./gradlew test`（确定性层必须全绿）；dev 启动应用 + Ollama + Prometheus + Milvus。
-1. 记录基线：等待 2 轮 normal 巡检（控制台 INFO 一行摘要或审计日志 `巡检|END|status=normal`）。
-2. 按用例表逐个注入，**每轮只注入一类**（避免信号混叠），每类观察至少 3 个巡检周期：
+1. 前置：`./gradlew test`（确定性层必须全绿）；dev 启动应用 + Ollama + Prometheus + Milvus。
+2. 记录基线：等待 2 轮 normal 巡检（控制台 INFO 一行摘要或审计日志 `巡检|END|status=normal`）。
+3. 按用例表逐个注入，**每轮只注入一类**（避免信号混叠），每类观察至少 3 个巡检周期：
    - NEW 轮：记录控制台 ERROR 全量报告 + 审计 `事件|NEW`；
    - ACTIVE 轮：确认降为 INFO 心跳 + 审计 `事件|ACTIVE`；
    - 恢复轮：F2 用 release、F5 自然恢复，确认审计 `事件|RESOLVED`。
-3. 判定：全量报告的根因是否命中用例表"期望根因关键词"列；未命中或误报记入下轮 prompt 优化输入。
-4. F4 语义层专项：注入后 2 分钟窗口内的巡检应报 warning 以上并提及延迟——巡检 Prompt 第 6 条已显式要求关联 maxRequestSeconds；若静默说明 prompt 对延迟信号不敏感。
+4. 判定：全量报告的根因是否命中用例表"期望根因关键词"列；未命中或误报记入下轮 prompt 优化输入。
+5. F4 语义层专项：注入后 2 分钟窗口内的巡检应报 warning 以上并提及延迟——巡检 Prompt 第 6 条已显式要求关联 maxRequestSeconds；若静默说明 prompt 对延迟信号不敏感。
 
 ## 4. 度量口径
 
 | 指标 | 定义 | 数据来源 |
 |------|------|----------|
-| 根因定位准确率 | 命中期望关键词的 NEW 事件数 / NEW 事件总数 | 审计日志 `事件|NEW` + 人工标注 |
-| 误报率（尖峰抑制率） | 1 −（单轮 NEW 后即 RESOLVED 且未复发的事件数 / 单轮 NEW 总数） | 审计 `事件|NEW` 与 `事件|RESOLVED` 配对 |
-| 漏报率 | BACKSTOP 介入次数 / 巡检总次数（AI 判 normal 被代码强改的比例） | 审计 `巡检|BACKSTOP` / `巡检|END` |
-| 平均诊断时长 | LLM 路径巡检 elapsedMs 均值 | 审计 `巡检|END\|status=...\|elapsedMs=` |
+| 根因定位准确率 | 命中期望关键词的 NEW 事件数 / NEW 事件总数 | 审计日志 `事件\|NEW` + 人工标注 |
+| 误报率（尖峰抑制率） | 1 −（单轮 NEW 后即 RESOLVED 且未复发的事件数 / 单轮 NEW 总数） | 审计 `事件\|NEW` 与 `事件\|RESOLVED` 配对 |
+| 漏报率 | BACKSTOP 介入次数 / 巡检总次数（AI 判 normal 被代码强改的比例） | 审计 `巡检\|BACKSTOP` / `巡检\|END` |
+| 平均诊断时长 | LLM 路径巡检 elapsedMs 均值 | 审计 `巡检\|END\|status=...\|elapsedMs=` |
 | 降级率 | degraded_ 前缀巡检数 / 巡检总数 | `aiops_inspection_total{status=~"degraded_.*"}` / `aiops_inspection_total` |
 | 单巡检 Token 消耗 | Ollama 侧统计 | Ollama（`/api/ps`、OLLAMA_DEBUG 日志；应用侧未计量，如实标注） |
 

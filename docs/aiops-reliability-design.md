@@ -1,7 +1,7 @@
 # 事件状态机、降级与深度诊断设计
 
 > 配套白皮书 §4.1（双模型路由 + 可靠性增强）、§4.2/4.3（异步深度诊断与升级路由）与 §5.1（事件生命周期管理）的详细设计文档。
-> 本文档的实现已通过 186 个测试（184 单测 + 2 集成；单测集 2026-11-13 `clean test` 全量全绿，集成集需本地 Milvus/Ollama 基础设施、以 `gradle integrationTest` 触发；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
+> 本文档的实现已通过 207 个测试（205 单测 + 2 集成；单测集 2026-11-14 `clean test` 全量全绿，集成集需本地 Milvus/Ollama 基础设施、以 `gradle integrationTest` 触发；明细见 §6.8）+ 端到端死锁/降级/深度诊断链路验证。
 >
 > 阅读路线：**§1** 讲两条硬约束（告警不刷屏、LLM 挂了巡检不能停）与 AI 漏报兜底，**§2** 事件状态机与指纹去重，**§3** Ollama 降级与阈值兜底，**§4** 单元与端到端验证，**§5** 审计日志，**§6** 异步深度诊断与升级路由全链路。
 
@@ -88,7 +88,7 @@ fingerprint = 异常级别 + "|APP=" + 目标名 + ";" + 指标特征串
 ```java
 CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
         inspectorChatClient.prompt().user(prompt).call().content(), llmCalls);
-return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);  // 45 秒
+return future.get(llmTimeoutSeconds, TimeUnit.SECONDS);  // 默认 45 秒，可经配置覆盖
 ```
 
 - 超时预算：`aiops.inspection.llm-timeout-seconds`（默认 45 = fixedDelay 60 秒的 75%，留余量给指标拉取与解析；多目标部署 Prompt 与输出都更长，实测 2 目标 + 机器负载下 45s 不够，建议 90-150——2026-11-08 双实例实测 49s 的 LLM 轮被 150s 预算吸收）
@@ -99,9 +99,9 @@ return future.get(LLM_TIMEOUT_SECONDS, TimeUnit.SECONDS);  // 45 秒
 
 **查询并行（2026-11-13 优化）**：一个目标的 8 条 PromQL（6 条默认档语义 + 2 条 QPS 子查询）彼此无依赖，此前**串行**执行意味着采集最坏耗时 = 8 × (连接 2s + 读取 5s) ≈ 56s（黑洞地址实测 40s）——采集阶段就吃掉了整个 60s 巡检周期，LLM 的 45s 预算被前置开销挤到周期之外（当时实测巡检周期被拉到 69s）。改为**并行**发起（每条查询一个虚拟线程，墙钟 = 最慢的一条 ≈ 5-7s）后，采集阶段回到预算内，60s 周期重新成立。并行度 = 每目标 ≤8 条；多目标时总量 = 8 × 目标数，Prometheus 侧自行排队（其默认 `query.max-concurrency=20`）。RestClient / JDK HttpClient / Jackson ObjectMapper 均线程安全。回归见 [PrometheusToolSnapshotTest](../src/test/java/com/aiops/aiopscopilot/tool/PrometheusToolSnapshotTest.java)：用 JDK 内置 HttpServer 起假 Prometheus，给每条查询注入固定延迟，以墙钟断言把"并行"钉死（改回串行会立刻红）。
 
-**框架级重试收紧（2026-11-13 调整）**：Spring AI 默认 `max-attempts=10` + 退避倍率 5 + 退避上限 180s ⇒ 单次失败调用最多重试约 **19 分钟**。本项目自研了超时（巡检 45s / 深度诊断 15min）、阈值降级、推理让路三层防线，框架重试会绕开这三层：巡检超时只中断"等待"，底层虚拟线程继续重试打 Ollama，每分钟新增一个 ⇒ Ollama 挂 1 小时后 60 个僵尸重试线程同时在打，恢复瞬间被淹没（NUM_PARALLEL=1 时更致命）。`application.yml` 显式收紧为 `spring.ai.retry.max-attempts: 2`（允许一次快速重试覆盖瞬时抖动）+ 秒级退避（初始 1s / 倍率 2 / 上限 10s），不再产生重试风暴。
+**框架级重试收紧（2026-11-13 调整，2026-11-14 语义修正）**：Spring AI 默认 `max-attempts=10` + 退避倍率 5 + 退避上限 180s ⇒ 单次失败调用最多重试约 **19 分钟**。本项目自研了超时（巡检 45s / 深度诊断 15min）、阈值降级、推理让路三层防线，框架重试会绕开这三层：巡检超时只中断"等待"，底层虚拟线程继续重试打 Ollama，每分钟新增一个 ⇒ Ollama 挂 1 小时后 60 个僵尸重试线程同时在打，恢复瞬间被淹没（NUM_PARALLEL=1 时更致命）。`application.yml` 收紧为 `spring.ai.retry.max-attempts: 1` + 秒级退避（初始 1s / 倍率 2 / 上限 10s）。**语义注意（2026-11-14 实证）**：该属性经 `SpringAiRetryAutoConfiguration` 映射为 spring-core 7 `RetryPolicy.maxRetries`，即"初次之外的额外尝试次数"——此前配 2 实际是 3 次尝试（jshell 实测 `maxRetries(N)` = 初次 + N 次）；且读超时异常（`ResourceAccessException`）在框架重试白名单内、每次重试重新计时，配 2 时僵死调用最长 16m×3=48 分钟才终结。取 1 后终结上界收敛为 16m×2=32 分钟（让路宽限 `zombie-grace-minutes` 按该上界配置）。
 
-**Ollama 连接级超时（2026-11-13 补充）**：重试收紧防的是"失败后的重试风暴"，但防不了"僵死后的永久挂起"——自动装配的 OllamaApi 用默认请求工厂，**读超时无限**：Ollama 进程僵死（接受连接但不响应）时 `future.get(45s/15min)` 只中断"等待"，`future.cancel` 断不了底层 HTTP，巡检每分钟超时一次 ⇒ 每分钟泄漏 1 个挂死在线程读取上的虚拟线程，只进不出。`AiConfig#ollamaApi`（自定义 Bean 顶替自动装配）给 REST `.call()` 路径装上连接 10s + 读超时 16m（= 深度诊断 15min 硬超时 + 1min 余量：合法推理绝不截断，但每个卡死调用 16 分钟后必然终结）。流式路径（WebClient/SSE）不设此超时：流式增量返回数据，SSE 挂起由容器异步 I/O 超时兜底，强行设响应超时会误杀长思考的合法停顿。
+**Ollama 连接级超时（2026-11-13 补充）**：重试收紧防的是"失败后的重试风暴"，但防不了"僵死后的永久挂起"——自动装配的 OllamaApi 用默认请求工厂，**读超时无限**：Ollama 进程僵死（接受连接但不响应）时 `future.get(45s/15min)` 只中断"等待"，`future.cancel` 断不了底层 HTTP，巡检每分钟超时一次 ⇒ 每分钟泄漏 1 个挂死在线程读取上的虚拟线程，只进不出。`AiConfig#ollamaApi`（自定义 Bean 顶替自动装配）给 REST `.call()` 路径装上连接 10s + 读超时 16m（= 深度诊断 15min 硬超时 + 1min 余量：合法推理绝不截断）。注意卡死调用的终结上界是**读超时 × 框架尝试次数**（读超时异常在重试白名单内、每次重试重新计时；`max-attempts=1` 即初次+1 次重试 ⇒ 最长 ≈32 分钟），而非单次读超时 16 分钟（2026-11-14 实证修正）。流式路径（WebClient/SSE）不设此超时：流式增量返回数据，强行设响应超时会误杀长思考的合法停顿。异步超时实测（2026-11-14）：本栈未配置 `spring.mvc.async.request-timeout` 时不会被"30 秒默认值"切断（连续数据流存活 4 分钟、全静默 5 分钟，零 AsyncRequestTimeout），该默认行为随栈版本可能变化，需钉死时可显式配置。
 
 ### 3.2 降级路径
 
@@ -140,6 +140,8 @@ catch (TimeoutException | Exception):
 **QPS=0 连续确认（ZERO_QPS_CONFIRM_ROUNDS=2）**：actuator 抓取已从 QPS 基线中扣除，合法空闲/低流量系统每轮 QPS 都是严格 0——单轮 critical 会让空闲环境每分钟误报一次"应用假死"（告警狼来了效应）。改为连续 2 轮确认：第 1 轮 warning"待确认"，QPS 恢复 >0 即归零计数，连续 2 轮才升级 critical。真实假死只多等 1 分钟确认，换来空闲系统零误报（2026-09-30 实测：空闲系统兜底第 1 轮正确输出 warning 待确认）。AI 路径的巡检 Prompt 同步增加了"CPU 极低且无其他异常时 QPS=0 可能为合法空闲"的边界说明，双路径口径一致。兜底输出改用 ObjectMapper 序列化（原手写 JSON 拼接的转义器漏控制字符，已删除）。
 
 **QPS=0 基线门控（observedTraffic）**：连续确认之上再加一道——QPS=0 只有在"此前观测到过真实流量、随后跌到零"时才构成假死信号。全新启动或长期空闲的实例 QPS 恒为 0，没有基线门控时仍会被连续 2 轮确认误判成 critical 假死（2026-11-07 实测空闲演示环境即触发该误报）。实现：`OpsScheduler.observedTraffic` 在任一路径观测到 QPS>0 时置 true 且不回退（重启才清零）；连续计数的归零由两条路径同一口径维护——`fallbackByThreshold` 内零流量轮升计数、其余归零，`routeJudgments` 入口观测到 QPS≠0（>0 有流量 / <0 查询失败，2026-11-13 补齐后者）都打断序列："没观测到"不能充当连续假死的一环，否则一次指标拉取失败后残留计数跨轮存活，下一个降级轮直接跳级 critical 假死。
+
+**AI 路径空闲门控（2026-11-14）**：基线门控此前只覆盖降级路径——AI 路径的模型按巡检 Prompt 第 3 条仍会对空闲系统的 QPS=0 判"低流量或假死待确认"warning，空闲环境每次 AI 轮都新增/维持一条 ZERO_QPS 事件（实测 9 分钟才自愈）。补齐：AI 判 warning 但该目标从未观测到流量、且指纹**只剩** `ZERO_QPS`（无死锁/高堆/高 CPU/GC 任一硬信号，复用 `fingerprintOf` 判定）时降为 normal 并记审计（`aiStatus=warning` 如实保留），被门控压下的 warning 不触发 low-confidence 深度复核（基线已确定性回答"空闲"，复核同一份快照不产生新信息，只会按防抖周期反复唤醒 r1）；一旦观测过流量，同样的 QPS=0 保持模型判定不动——防"空闲误报"修复引入"假死漏报"。
 
 ### 3.4 AI 漏报兜底（applyThresholdBackstop）
 
@@ -266,14 +268,15 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 
 | 参数 | 值 | 理由 |
 |------|----|------|
-| 队列容量 | 20 | r1 串行且单次数分钟，堆积无意义；满了拒绝 + 审计 `REJECTED|reason=queue_full`，不阻塞巡检线程 |
+| 队列容量 | 20 | r1 串行且单次数分钟，堆积无意义；满了拒绝 + 审计 `REJECTED\|reason=queue_full`，不阻塞巡检线程 |
 | worker 数 | 1（虚拟线程） | Ollama 本身串行推理，多 worker 只会排队争抢；99% 时间阻塞在 HTTP 等待，适合虚拟线程 |
 | 推理硬超时 | 15 分钟 | r1 独占 Ollama 实测最长 6.6 分钟；2026-09-17 端到端实测 worker 与每分钟巡检 qwen3 并发争抢 Ollama 串行推理时单任务 530 秒（8.8 分钟），15 分钟覆盖争抢场景且不误杀；超时任务标 FAILED |
-| 同指纹防抖窗口 | 10 分钟 | 有 PENDING/RUNNING 在途、或窗口内已升级过 → 拒绝（`reason=dedup_window_or_inflight`）；**手动触发不受防抖限制，但受自动升级预留槽位限流**（2026-11-13：空闲槽位不足容量的 1/4（至少 1）时手动先拒，`reason=manual_reserved_for_auto`——手动旁路无防抖也无预留时，一个脚本可瞬间填满队列，4.3 升级链路被 queue_full 静默饿死） |
+| 超时后僵尸宽限 | 20 分钟 | `cancel` 断不掉底层 HTTP：任务超时标 FAILED 后，被放弃的 r1 调用仍占着 Ollama 串行推理（上界 ≈ 读超时 16m × 框架尝试次数 − 任务硬超时 ≈ 17 分钟）。宽限期内 `hasInflightTask()` 继续 true、巡检继续让路，避免 qwen3 与僵尸争抢把"让路"要防的场景原样复现（2026-11-14 审查修复） |
+| 同指纹防抖窗口 | 10 分钟 | 有 PENDING/RUNNING 在途、或窗口内已升级过 → 拒绝（`reason=dedup_window_or_inflight`）；**手动触发不受防抖限制，但受自动升级预留槽位限流**（2026-11-13：空闲槽位不足容量的 1/4（至少 1）时手动先拒，`reason=manual_reserved_for_auto`——手动旁路无防抖也无预留时，一个脚本可瞬间填满队列，4.3 升级链路被 queue_full 静默饿死；容量为 1 的极端配置下唯一槽位即预留槽，手动通道恒被拒） |
 | 终态任务保留 | 最近 100 条 | 内存态，超出按 finishedAt 淘汰最旧 |
 
 > 表中"值"均为生产默认值，已全部外部化到 `application.yml` 的 `aiops.diagnosis.*`
-> （`queue-capacity` / `dedup-window-minutes` / `worker-timeout-minutes` / `max-finished-tasks`），
+> （`queue-capacity` / `dedup-window-minutes` / `worker-timeout-minutes` / `max-finished-tasks` / `zombie-grace-minutes`），
 > 可用同名大写环境变量 `AIOPS_DIAGNOSIS_*` 覆盖，无需改代码重新打包。
 > 抽成可注入参数而非常量的另一个收益：worker 超时分支可用毫秒级 Duration 单测，不必真等 15 分钟。
 
@@ -304,7 +307,7 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 |------|------|
 | `deepDiagnosisSubmitted()` | `深度诊断\|SUBMITTED\|taskId=..\|trigger=..\|fingerprint=..` |
 | `deepDiagnosisFinished()` | `深度诊断\|END\|...\|result=succeeded/failed\|elapsedMs=..` |
-| `deepDiagnosisRejected()` | `深度诊断\|REJECTED\|trigger=..\|fingerprint=..\|reason=dedup_window_or_inflight/queue_full` |
+| `deepDiagnosisRejected()` | `深度诊断\|REJECTED\|trigger=..\|fingerprint=..\|reason=dedup_window_or_inflight/queue_full/manual_reserved_for_auto（仅手动）` |
 
 ### 6.7 送达渠道的边界
 
@@ -316,7 +319,7 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 
 | 测试类 | 用例数 |
 |--------|--------|
-| [DiagnosisServiceTest](../src/test/java/com/aiops/aiopscopilot/service/diagnosis/DiagnosisServiceTest.java) | 18 |
+| [DiagnosisServiceTest](../src/test/java/com/aiops/aiopscopilot/service/diagnosis/DiagnosisServiceTest.java) | 21 |
 | [EscalationRuleTest](../src/test/java/com/aiops/aiopscopilot/service/EscalationRuleTest.java) | 17 |
 | [OpsSchedulerEscalationWiringTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerEscalationWiringTest.java) | 18 |
 | [SnapshotCollectorTest](../src/test/java/com/aiops/aiopscopilot/service/SnapshotCollectorTest.java) | 8 |
@@ -324,23 +327,28 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 | [ApiTokenAuthFilterTest](../src/test/java/com/aiops/aiopscopilot/common/security/ApiTokenAuthFilterTest.java) | 12 |
 | [KnowledgeIngesterTest](../src/test/java/com/aiops/aiopscopilot/service/KnowledgeIngesterTest.java) | 8 |
 | [OpsSchedulerExtractJsonTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerExtractJsonTest.java) | 12 |
-| [OpsSchedulerStatusNormalizeTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerStatusNormalizeTest.java) | 13 |
+| [OpsSchedulerStatusNormalizeTest](../src/test/java/com/aiops/aiopscopilot/service/OpsSchedulerStatusNormalizeTest.java) | 16 |
 | [PrometheusToolTest](../src/test/java/com/aiops/aiopscopilot/tool/PrometheusToolTest.java) | 15 |
-| [PrometheusToolSnapshotTest](../src/test/java/com/aiops/aiopscopilot/tool/PrometheusToolSnapshotTest.java) | 9 |
+| [PrometheusToolSnapshotTest](../src/test/java/com/aiops/aiopscopilot/tool/PrometheusToolSnapshotTest.java) | 10 |
 | [TargetsPropertiesTest](../src/test/java/com/aiops/aiopscopilot/config/TargetsPropertiesTest.java) | 9 |
 | [OpsAlertReporterTest](../src/test/java/com/aiops/aiopscopilot/service/OpsAlertReporterTest.java) | 4 |
 | [DebugControllerWiringTest](../src/test/java/com/aiops/aiopscopilot/controller/DebugControllerWiringTest.java) | 4 |
-| [GlobalExceptionHandlerTest](../src/test/java/com/aiops/aiopscopilot/common/exception/GlobalExceptionHandlerTest.java) | 4 |
+| [DebugControllerTest](../src/test/java/com/aiops/aiopscopilot/controller/DebugControllerTest.java) | 1 |
+| [GlobalExceptionHandlerTest](../src/test/java/com/aiops/aiopscopilot/common/exception/GlobalExceptionHandlerTest.java) | 6 |
 | [ApiTokenSecurityConfigTest](../src/test/java/com/aiops/aiopscopilot/common/security/ApiTokenSecurityConfigTest.java) | 4 |
-| 其余 2 类（明细见下方列表） | 24 |
+| [RequestLimitsTest](../src/test/java/com/aiops/aiopscopilot/common/web/RequestLimitsTest.java) | 5 |
+| [AiChatControllerTest](../src/test/java/com/aiops/aiopscopilot/controller/AiChatControllerTest.java) | 6 |
+| 其余单测 2 类（明细见下方列表） | 22 |
+| integration 集（明细见下方列表） | 2 |
 
 **各测试类关键验证维度**：
 
-- **DiagnosisServiceTest（18 个）**
+- **DiagnosisServiceTest（21 个）**
   - 同指纹 PENDING/RUNNING 在途防抖、窗口内终态防抖与窗口过期放行、不同指纹放行
   - 队列满时自动与手动任务均被拒绝
   - **手动提交限流（2026-11-13）**：手动最多占用 容量 − 预留（1/4、至少 1）个槽位，自动升级在预留槽位上照常入队
   - 15 分钟硬超时按注入阈值（200ms）快速 FAILED 且 error 标明硬超时；`cancel(true)` 中断挂死调用后 worker 继续消费
+  - **（2026-11-14 审查修复）**：从 process 的 catch(Exception) 之外逃逸的 Error（快照序列化 OOM）→ workerLoop Throwable 兜底收敛 FAILED（worker_error）并继续消费——模型调用路径的 Error 会被 Future 包装成 ExecutionException 走正常 FAILED，兜底只拦真正的逸出；终态后的簿记异常不覆盖成功报告且 worker 存活；硬超时后僵尸宽限期内 `hasInflightTask()` 继续 true、宽限期外恢复
   - 手动提交绕防抖；终态淘汰到上限且不误删在途任务；start/stop 生命周期
   - 成功流转 SUCCEEDED 时 prompt 含五段要素、不可信数据声明、人工审批声明
   - 模型异常流转 FAILED 后 worker 继续消费下一条；get 查询
@@ -352,7 +360,7 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
   - severity 大小写不敏感；中英文写关键词与空串
   - low→`low_confidence`；persistent 优先级高于 low；medium/HIGH 不误触发
 
-- **OpsSchedulerEscalationWiringTest（17 个）**
+- **OpsSchedulerEscalationWiringTest（18 个）**
   - 反射调 `handleInspectionResult`/`handleDegraded`：首轮失败不升级、连续 2 轮失败恰好一次 `parse_fail` 且 note 带原始输出
   - 升级后计数归零、成功轮重置计数、原始输出截断 1000 字符
   - 降级路径永不升级（`parse_fail` 与 critical+写建议两条路径都验）
@@ -369,16 +377,19 @@ POST /api/diagnosis（人工）──────┘            │ PENDING
 - **ApiTokenAuthFilterTest（12 个）**：MockHttpServletRequest 纯单测——无凭据/错 token→401 且不放行；Bearer（scheme 大小写不敏感、值首尾空白容忍）、X-API-Key、`?token=`（仅两个 SSE 端点放行，普通端点拒绝）三种方式；空 Bearer 值→401；**context-path 部署按 servletPath 匹配 SSE 白名单（2026-11-13）**、未设 servletPath 时回退 requestURI、带前缀的非 SSE 路径照样 401
 - **KnowledgeIngesterTest（8 个）**：标题提取纯函数（标准标题提取并剥离正文、无标题兜底文件名、文首空行跳过、英文冒号与 trim、单/双引号标题拒绝、空内容兜底）；ingest 接线（mock VectorStore + 真实语料）：新旧 source 双删、切片继承标题 source、标题不入正文
 - **OpsSchedulerExtractJsonTest（12 个）**：反射测 `extractJson`——纯 JSON 透传、```json/```围栏剥离、只有开头围栏、**无换行围栏（```json{...}```，2026-11-13）/无语言标记/无换行+空白组合**、`</think>` 残留剥离、思考段+围栏组合、null→空串、散文原样返回（不做花括号扫描）、围栏后空白 trim
-- **GlobalExceptionHandlerTest（4 个，2026-11-13 新增）**：405/406/415 与坏 JSON 请求体 400 各自返回正确业务码，不再落入 500 兜底
+- **GlobalExceptionHandlerTest（6 个，2026-11-13 新增）**：405/406/415 与坏 JSON 请求体 400 各自返回正确业务码，不再落入 500 兜底；**参数字节非 UTF-8（如 GBK 表单）→ 400**（2026-11-14，实测发现该场景曾误报 500"系统内部错误"）；**客户端断开（SSE 中断）静默完成不回写**（2026-11-14 断连实测：此前落 500 兜底产生 ERROR + handler 二次失败双重噪音）
 - **ApiTokenSecurityConfigTest（4 个，2026-11-13 新增）**：TokenConfigured 条件直读 Environment——未配置/纯空白 token 不装配、含单引号的 SpEL 炸弹 token 正常装配、正常 token 装配
+- **RequestLimitsTest（5 个，2026-11-13 新增）**：checkMessage 消息长度边界（纯单测）——null/空串放行、恰好等于上限放行、超一个字符拒绝（400 业务码含上限值）；**violationMessage 非抛校验（2026-11-14，SSE 端点专用）**——可接受输入返回 null、超限返回与 checkMessage 同文错误文案；运行时 GET query 会先被 Tomcat 的 8KB header 上限拦截，应用层这道边界只能经 POST form body 触达，故以单测钉死而不依赖容器配置
 - **PrometheusToolTest（15 个）**：QPS 减法（正常/基线大于总量钳零/总量缺失哨兵/基线缺失按 0）、`resolvePromql`（默认模板替换 application、覆盖优先且支持占位符、无占位符原样用）、JVM 默认档覆盖除 qpsLast1m 外的全部语义键；反射测 `parseValue`——小数/整数/科学计数法正常解析，NaN（大小写）/空串/脏字符串/null 统一 -1 哨兵（全系统"查询失败"契约）
 - **TargetsPropertiesTest（9 个）**：self 自动在列且不重复、重名/重复 application/指纹分隔符/破坏 PromQL 的字符/空白字段拒绝、自定义目标保留、metrics 防御性不可变拷贝
 - **OpsAlertReporterTest（4 个）**：normal 摘要逐目标列出关键指标（多目标带分隔、单目标无分隔）、缺 targets 块退化为空、error 块透传
-- **OpsSchedulerStatusNormalizeTest（13 个，2026-11-13 新增）**：status 白名单归一化（契约内三值 / 大小写与首尾空白 / 中文同义词最小映射 / 契约外一律"判不了"）；路由层——契约外 status 与缺失 status 均不报 ERROR 告警、不建事件、不污染状态机；对照组（normal 仍静默、critical 仍照常告警）；"判不了"的目标其存量事件不被误归档（没判出来 ≠ 已恢复）；**判不了但硬信号命中仍由 AI 漏报兜底接住**（BLOCKED>0 → critical、CPU>90% → warning 两条都验；"没说话"不能让死锁漏报一整轮）；全部目标判不了（含兜底未命中）走 parse_error 通道（连续 2 轮升级深度诊断）；部分目标判不了时轮级状态取 unknown
+- **OpsSchedulerStatusNormalizeTest（16 个，2026-11-13 新增）**：status 白名单归一化（契约内三值 / 大小写与首尾空白 / 中文同义词最小映射 / 契约外一律"判不了"）；路由层——契约外 status 与缺失 status 均不报 ERROR 告警、不建事件、不污染状态机；对照组（normal 仍静默、critical 仍照常告警）；"判不了"的目标其存量事件不被误归档（没判出来 ≠ 已恢复）；**判不了但硬信号命中仍由 AI 漏报兜底接住**（BLOCKED>0 → critical、CPU>90% → warning 两条都验；"没说话"不能让死锁漏报一整轮）；全部目标判不了（含兜底未命中）走 parse_error 通道（连续 2 轮升级深度诊断）；部分目标判不了时轮级状态取 unknown；**AI 路径空闲基线门控（2026-11-14）**——AI 判 warning 但从未观测到流量且指纹纯 ZERO_QPS 时降为 normal（不报、不建事件，实测空闲环境曾 9 分钟才自愈），对照组：观测过流量后归零照常告警（防"空闲误报"修复引入"假死漏报"）；门控压下的 warning+low 不唤醒深度诊断（防空闲环境按防抖周期反复唤醒 r1）
 - **DebugControllerWiringTest（4 个，2026-11-13 新增）**：ApplicationContextRunner 验证 `@Profile("dev")` + `@ConditionalOnProperty(aiops.debug.enabled)` 双重门控的四种组合——dev+开启装配（演练形态）、dev 未开启不装配（默认安全形态）、prod 误开仍不装配、无 profile 误开仍不装配
-- **PrometheusToolSnapshotTest（9 个，2026-11-13 新增）**：用 JDK 内置 HttpServer 起假 Prometheus（不引新依赖、不需真实基础设施）——默认档 7 条语义键全部回填且 QPS = 总速率 − actuator 基线、每条查询带 application 标签过滤、URL 编码路径未退化（服务端解出的 PromQL 原文含双引号标签值）、显式留空语义记 -1 哨兵且不发查询、自定义 QPS 走单查询跳过减法、8 条查询并行（注入固定延迟后以墙钟断言钉死，改回串行会立刻红）、**跨实例聚合形态**——CPU/BLOCKED 外层 max、堆分代 max by (id)、actuator 基线 sum(rate(...))、**被动模式查询缓存**——TTL 内重复查询只发一次 HTTP、过期重发且不同 PromQL 互相独立
+- **DebugControllerTest（1 个，2026-11-13 新增）**：直接 new 不起 Spring 容器，与 WiringTest 互补（后者锁装配门控，本类锁端点行为）——cpu-spike 入参钳制（seconds 超上限钳到 60）与代数终止（reset 递增 generation 让自旋线程退出，测试 JVM 不留后台自旋线程）；deadlock/slow-request 按设计留作演练手册的人工验证项，不进秒级单测集
+- **AiChatControllerTest（6 个，2026-11-14 新增）**：两个流式端点（/api/ai/chat、/api/ai/rag/stream）的输入契约——缺参与超长消息均以首个 `[ERROR]` 事件返回而非同步抛异常（EventSource 固定 Accept: text/event-stream，同步异常经全局异常器产出 JSON Result 会因内容协商失败退化为容器 406 裸错误）；**SSE 心跳（2026-11-14 断连实测后新增）**——静默期每 15s 一条注释行事件（无 data 字段、EventSource 按规范忽略），数据完成即停（不拖延收尾）；直接 new 不起 Spring 容器
+- **PrometheusToolSnapshotTest（10 个，2026-11-13 新增）**：用 JDK 内置 HttpServer 起假 Prometheus（不引新依赖、不需真实基础设施）——默认档 7 条语义键全部回填且 QPS = 总速率 − actuator 基线、每条查询带 application 标签过滤、URL 编码路径未退化（服务端解出的 PromQL 原文含双引号标签值）、显式留空语义记 -1 哨兵且不发查询（qpsLast1m 留空时只发 6 条默认语义、减法子查询一并跳过）、自定义 QPS 走单查询跳过减法、8 条查询并行（注入固定延迟后以墙钟断言钉死，改回串行会立刻红）、**跨实例聚合形态**——CPU/BLOCKED 外层 max、堆分代 max by (id)、actuator 基线 sum(rate(...))、**被动模式查询缓存**——TTL 内重复查询只发一次 HTTP、过期重发且不同 PromQL 互相独立
 - **其余 22 个**：IncidentStoreTest 17（指纹/状态机/按目标归档隔离/反射兜底/durationOf/TTL 过期/并发防丢失更新；**与评估集 F1/F3 重复的 2 条兜底用例已于 2026-11-13 去重删除**，死锁与 QPS 假死完整场景以 FaultInjectionEvaluationTest 为单一事实来源）+ FaultInjectionEvaluationTest 5（5 类注入的确定性回归）
 - **integration 集（2 个，`gradle integrationTest` 触发）**：AiopsCopilotApplicationTests 1（Spring 装配冒烟，**需 Milvus 可达**：客户端 bean 创建即建 gRPC 连接）+ VirtualThreadVsThreadPoolBenchmarkTest 1（虚拟线程演示基准——墙钟断言在负载下偶发红，不进秒级单测集）
 
-> 合计 **186** 个用例（184 单测 + 2 集成；单测集 2026-11-13 `clean test` 全量全绿）。单测集全部不起容器（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法），均不依赖外部服务；集成集含需 Milvus 的装配冒烟与不依赖基础设施的演示基准。单测集由 [.github/workflows/ci.yml](../.github/workflows/ci.yml) 在 push/PR 时自动执行（2026-11-13 新增；集成集按分层设计不进 CI，见 build.gradle 注释）。
+> 合计 **207** 个用例（205 单测 + 2 集成；单测集 2026-11-14 `clean test` 全量全绿）。单测集全部不起容器（反射/动态代理伪 ChatClient/Mockito/真实 record 夹具四种手法），均不依赖外部服务；集成集含需 Milvus 的装配冒烟与不依赖基础设施的演示基准。单测集由 [.github/workflows/ci.yml](../.github/workflows/ci.yml) 在 push/PR 时自动执行（2026-11-13 新增；集成集按分层设计不进 CI，见 build.gradle 注释）。
 

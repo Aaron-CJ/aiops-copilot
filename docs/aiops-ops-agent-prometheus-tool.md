@@ -53,7 +53,7 @@ cpu>=0 → 应用假死"的兜底判定被静默屏蔽。
 巡检快照的 QPS 因此排除自指流量（减法在 Java 侧完成：PromQL 里 sum() 的无标签向量与 rate() 的带标签向量逐标签匹配不相等，直接相减得空集——2026-11-08 双实例实测踩坑）。**注意不能直接写 `{uri!="/actuator/prometheus"}`**：
 `URI.create` 会把 `%21`（`!`）规范化为字面量 `!`，但保留 `%3D`（`=`），Prometheus 收到后报
 `unexpected character after '!' inside braces`。实际方案是 Java 侧减法：
-`sum(rate(http_server_requests_seconds_count[1m])) - rate(http_server_requests_seconds_count{uri="/actuator/prometheus"}[1m])`，
+`sum(rate(http_server_requests_seconds_count[1m])) - sum(rate(http_server_requests_seconds_count{uri="/actuator/prometheus"}[1m]))`（基线侧同样 sum 聚合：rate() 每副本一条序列，多副本下不聚合的基线会取到"随机一个副本"，减法口径错位），
 两条子查询都只用 `=`（编码路径已验证可用），`totalQps<0` 时保留 -1 哨兵语义。
 maxRequestSeconds 不过滤：actuator 抓取耗时通常 <0.5s，远低于 5s 慢请求阈值，基线无害。
 被动模式 `queryMetric(promql)` 由模型自由构造表达式，不做强制过滤（人机对话场景基线无害，
@@ -63,8 +63,8 @@ maxRequestSeconds 不过滤：actuator 抓取耗时通常 <0.5s，远低于 5s �
 
 > 5 步端到端自检，覆盖"启动 → 首次巡检 → 被动查询 → 故障告警 → 恢复"全链路。
 
-0. **编译通过**：`.\gradlew.bat compileJava`
-1. **首次巡检日志**：启动应用 30 秒后应看到 `[OpsScheduler] 开始巡检...` + `[OpsScheduler] 巡检完成: 正常` INFO 日志
-2. **被动 Agent 查 Prometheus**：访问 `http://localhost:8080/api/agent/ops?message=过去1分钟QPS是多少` → 模型应调 `queryMetric` 拿到真实数据后回答（15s TTL 内重复提问命中缓存，不再打 Prometheus）
-3. **故障触发告警**：先以 `AIOPS_DEBUG_ENABLED=true` 启动（注入端点默认关），再并发访问 `http://localhost:8080/api/debug/deadlock/a` 与 `http://localhost:8080/api/debug/deadlock/b`（相反锁序的两个接口，并发即双锁交叉死锁）→ 等待最多 1 分钟巡检 → 应看到 ERROR 级告警报告，含"blockedThreads: 2"+ 根因分析 + 处置建议
-4. **恢复正常验证（人工操作）**：人工重启应用清除死锁（当前系统不含自动修复）→ 下次巡检恢复 INFO 正常日志
+1. **编译通过**：`.\gradlew.bat compileJava`
+2. **首次巡检日志**：启动应用 30 秒后应看到 `[OpsScheduler] 开始巡检...` + `[OpsScheduler] 巡检完成: 正常` INFO 日志
+3. **被动 Agent 查 Prometheus**：访问 `http://localhost:8080/api/agent/ops?message=过去1分钟QPS是多少` → 模型应调 `queryMetric` 拿到真实数据后回答（15s TTL 内重复提问命中缓存，不再打 Prometheus）
+4. **故障触发告警**：先以 `AIOPS_DEBUG_ENABLED=true` 启动（注入端点默认关），再并发访问 `http://localhost:8080/api/debug/deadlock/a` 与 `http://localhost:8080/api/debug/deadlock/b`（相反锁序的两个接口，并发即双锁交叉死锁）→ 等待最多 1 分钟巡检 → 应看到 ERROR 级告警报告，含"blockedThreads: 2"+ 根因分析 + 处置建议
+5. **恢复正常验证（人工操作）**：人工重启应用清除死锁（当前系统不含自动修复）→ 下次巡检恢复 INFO 正常日志
