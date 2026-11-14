@@ -1,15 +1,20 @@
 package com.aiops.aiopscopilot.common.exception;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpInputMessage;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 
 import com.aiops.aiopscopilot.common.result.Result;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
 
 /**
  * GlobalExceptionHandler 的 HTTP 语义单测（2026-11-13）。
@@ -50,9 +55,36 @@ class GlobalExceptionHandlerTest {
     /** 坏 JSON 请求体：400（参数类问题），不再落 500 兜底 */
     @Test
     void unreadableBodyYields400() {
+        // 构造器形参在 Spring 7 的 @NullMarked 契约下非 null；用 mock 而非 null/cast，
+        // 与真实 MVC 抛出的形态一致（handler 只读 message，不会触碰该对象）
         Result<Void> r = handler.handleHttpMessageNotReadable(
-                new HttpMessageNotReadableException("JSON 解析失败", (org.springframework.http.HttpInputMessage) null));
+                new HttpMessageNotReadableException("JSON 解析失败", mock(HttpInputMessage.class)));
         assertEquals(400, r.getCode());
         assertFalse(r.isSuccess());
+    }
+
+    /**
+     * 请求参数字节无法按 UTF-8 解码（如客户端用 GBK 发中文）：400，不再落 500 兜底
+     * （2026-11-14 实测发现：GBK 字节经 Tomcat 参数解码 → InvalidParameterException →
+     * 兜底误报 500"系统内部错误"，客户端无法区分"请求姿势不对"与"服务坏了"）。
+     */
+    @Test
+    void invalidParameterEncodingYields400() {
+        Result<Void> r = handler.handleInvalidParameterEncoding(
+                new org.apache.tomcat.util.http.InvalidParameterException(
+                        "Character decoding failed. Parameter [message] has been ignored."));
+        assertEquals(400, r.getCode());
+        assertFalse(r.isSuccess());
+        assertTrue(r.getMessage().contains("UTF-8"), r.getMessage());
+    }
+
+    /**
+     * 客户端断开（SSE 流式中断，2026-11-14 断连实测）：静默完成（void 返回，不向死连接
+     * 回写）——此前落 500 兜底产生"系统未知异常" ERROR + handler 二次失败双重噪音。
+     */
+    @Test
+    void clientDisconnectIsHandledSilently() {
+        assertDoesNotThrow(() -> handler.handleClientDisconnect(
+                new AsyncRequestNotUsableException("Connection reset by peer")));
     }
 }
