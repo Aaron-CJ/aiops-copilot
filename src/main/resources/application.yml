@@ -56,6 +56,11 @@ aiops:
     dedup-window-minutes: ${AIOPS_DIAGNOSIS_DEDUP_WINDOW_MINUTES:10}   # 同一指纹自动升级的最小间隔
     worker-timeout-minutes: ${AIOPS_DIAGNOSIS_WORKER_TIMEOUT_MINUTES:15} # r1 单次推理硬超时（长思考链纯 CPU 推理可超 15 分钟，超时按设计收敛为 FAILED）
     max-finished-tasks: ${AIOPS_DIAGNOSIS_MAX_FINISHED_TASKS:100} # 终态任务内存保留条数
+    # 硬超时放弃任务后的"僵尸宽限"（分钟）：cancel 断不掉底层 HTTP，被放弃的 r1 调用仍占着
+    # Ollama 串行推理通道（上界 ≈ 读超时 16m × 框架尝试次数 − 任务硬超时 15m ≈ 17 分钟）。
+    # 宽限期内巡检继续让路走阈值兜底，避免 qwen3 与僵尸争抢互相拖到超时；默认 20 覆盖最坏情形。
+    # 若上调 OLLAMA_REST_READ_TIMEOUT 或框架重试次数，需按"读超时×尝试次数−worker超时+余量"同步放大
+    zombie-grace-minutes: ${AIOPS_DIAGNOSIS_ZOMBIE_GRACE_MINUTES:20}
 
 spring:
   application:
@@ -75,15 +80,20 @@ spring:
     model:
       chat: ollama
       embedding: ollama
-    # 收紧 Spring AI 框架级重试（2026-11-13 调整）。
+    # 收紧 Spring AI 框架级重试（2026-11-13 调整；2026-11-14 语义修正）。
     # 默认值 max-attempts=10 + backoff 倍率 5 + 上限 180s ⇒ 单次失败调用最多重试约 19 分钟，
     # 而本项目自研了超时（巡检 45s / 深度诊断 15min）、阈值降级、推理让路三层防线——
     # 框架重试会绕开这三层：巡检超时只中断"等待"，底层虚拟线程继续重试打 Ollama，
     # 每分钟新增一个 ⇒ Ollama 挂 1 小时后 60 个僵尸重试线程同时在打，
     # 恢复瞬间被淹没（NUM_PARALLEL=1 时更致命）。
-    # 取 2 = 允许一次快速重试（覆盖瞬时网络抖动），退避压到秒级，不产生重试风暴。
+    # 语义注意（2026-11-14 实证）：该值经 SpringAiRetryAutoConfiguration 映射为
+    # RetryPolicy.maxRetries，即"初次之外的额外尝试次数"——此前配 2 实际是 3 次尝试，
+    # 且读超时异常（ResourceAccessException）在框架重试白名单内、每次重试重新计时，
+    # 僵死 Ollama 下单个调用最长 16m×3=48 分钟才终结。取 1 = 初次 + 1 次快速重试
+    # （覆盖瞬时网络抖动），退避压到秒级，不产生重试风暴；僵死调用终结上界收敛为
+    # 16m×2=32 分钟（DiagnosisService 的僵尸宽限按该上界配置，见 zombie-grace-minutes）。
     retry:
-      max-attempts: 2
+      max-attempts: 1
       backoff:
         initial-interval: 1s
         multiplier: 2

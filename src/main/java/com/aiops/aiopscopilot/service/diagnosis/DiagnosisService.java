@@ -48,7 +48,7 @@ import tools.jackson.databind.ObjectMapper;
  * 手动提交不走防抖，但受"自动升级预留槽位"限流（见 {@link #reservedAutoSlots}）。
  * <p>
  * 可调参数（{@code aiops.diagnosis.*}，见 application.yml）：队列容量、防抖窗口、
- * worker 硬超时、终态保留条数。
+ * worker 硬超时、终态保留条数、超时后僵尸宽限。
  */
 @Service
 public class DiagnosisService {
@@ -85,6 +85,19 @@ public class DiagnosisService {
      * future.get 里，是为了让超时分支可以用毫秒级阈值单测，不必真等 15 分钟。
      */
     private final Duration workerTimeout;
+    /**
+     * 硬超时放弃任务后，"僵尸调用"仍可能占用 Ollama 的宽限期（默认 20 分钟）。
+     * <p>
+     * {@code future.cancel(true)} 断不掉底层 HTTP：任务超时标 FAILED 后，被放弃的 r1 调用
+     * 仍在 Ollama 串行推理通道上存活——上界 ≈ 读超时（16m）× 框架尝试次数 − 任务硬超时
+     * （当前配置 16m×2−15m ≈ 17 分钟；读超时异常在框架重试白名单内，每次重试重新计时）。
+     * 宽限期内 {@link #hasInflightTask()} 继续 true，巡检据此让路走阈值兜底，避免
+     * qwen3 与僵尸争抢、45s 连发超时（2026-11-14 审查修复）。
+     * 可经 {@code aiops.diagnosis.zombie-grace-minutes} 调整。
+     */
+    private final Duration zombieGrace;
+    /** 最近一次硬超时时刻（僵尸宽限窗口的起点）；volatile：worker 线程写、调度器线程读 */
+    private volatile Instant lastTaskTimeoutAt = Instant.EPOCH;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private final BlockingQueue<String> pendingTaskIds;
@@ -112,15 +125,18 @@ public class DiagnosisService {
                             @Value("${aiops.diagnosis.queue-capacity:20}") int queueCapacity,
                             @Value("${aiops.diagnosis.dedup-window-minutes:10}") long dedupWindowMinutes,
                             @Value("${aiops.diagnosis.worker-timeout-minutes:15}") long workerTimeoutMinutes,
-                            @Value("${aiops.diagnosis.max-finished-tasks:100}") int maxFinishedTasks) {
+                            @Value("${aiops.diagnosis.max-finished-tasks:100}") int maxFinishedTasks,
+                            @Value("${aiops.diagnosis.zombie-grace-minutes:20}") long zombieGraceMinutes) {
         this(deepModel, snapshotCollector, reporter, audit, metricsService,
-                Duration.ofMinutes(workerTimeoutMinutes), queueCapacity, dedupWindowMinutes, maxFinishedTasks);
+                Duration.ofMinutes(workerTimeoutMinutes), queueCapacity, dedupWindowMinutes,
+                maxFinishedTasks, Duration.ofMinutes(zombieGraceMinutes));
     }
 
     /** 测试入口：直接注入全部可调参数（生产路径始终走上方构造器的 yml 默认值） */
     DiagnosisService(ChatClient deepModel, SnapshotCollector snapshotCollector,
                      OpsAlertReporter reporter, AuditLogger audit, MetricsService metricsService,
-                     Duration workerTimeout, int queueCapacity, long dedupWindowMinutes, int maxFinishedTasks) {
+                     Duration workerTimeout, int queueCapacity, long dedupWindowMinutes,
+                     int maxFinishedTasks, Duration zombieGrace) {
         this.deepModel = deepModel;
         this.snapshotCollector = snapshotCollector;
         this.reporter = reporter;
@@ -130,6 +146,7 @@ public class DiagnosisService {
         this.queueCapacity = queueCapacity;
         this.dedupWindowMinutes = dedupWindowMinutes;
         this.maxFinishedTasks = maxFinishedTasks;
+        this.zombieGrace = zombieGrace;
         this.pendingTaskIds = new ArrayBlockingQueue<>(queueCapacity);
     }
 
@@ -223,14 +240,21 @@ public class DiagnosisService {
     }
 
     /**
-     * 是否有待执行或执行中的深度诊断任务。
+     * 是否有待执行或执行中的深度诊断任务（或僵尸调用仍可能占用 Ollama 的宽限期内）。
      * <p>
      * 供慢通道让路：单 Ollama（CPU 推理且 NUM_PARALLEL=1）下，qwen3 巡检与 r1 深度推理并发会
      * 互相拖慢——实测 r1 被拖到 15 分钟硬超时，巡检也每轮 45 秒超时。巡检侧据此跳过本轮 LLM。
+     * <p>
+     * 无 PENDING/RUNNING 任务不等于 Ollama 空闲：刚被硬超时放弃的调用（僵尸）仍占着
+     * 串行推理通道（见 {@link #zombieGrace}），宽限期内继续让路——否则一次 r1 超时后的
+     * 下一轮巡检就会与僵尸争抢，把"让路"要防的互相拖死场景原样复现（2026-11-14 审查修复）。
      */
     public boolean hasInflightTask() {
-        return tasks.values().stream().anyMatch(t ->
-                t.status() == DiagnosisTask.Status.PENDING || t.status() == DiagnosisTask.Status.RUNNING);
+        if (tasks.values().stream().anyMatch(t ->
+                t.status() == DiagnosisTask.Status.PENDING || t.status() == DiagnosisTask.Status.RUNNING)) {
+            return true;
+        }
+        return Duration.between(lastTaskTimeoutAt, Instant.now()).compareTo(zombieGrace) < 0;
     }
 
     private boolean isDeduplicated(String fingerprint) {
@@ -275,7 +299,20 @@ public class DiagnosisService {
             if (taskId == null) {
                 continue;
             }
-            process(taskId);
+            try {
+                process(taskId);
+            } catch (Throwable t) {
+                // 最后防线（2026-11-14 审查修复）：process 只捕 Exception，Error 级异常
+                // （OOM/StackOverflow）或任何未预见的意外都不允许杀死 worker——它是深度
+                // 通道与"推理让路"语义的单点，worker 一死所有任务永远 PENDING、
+                // hasInflightTask 恒 true、巡检每轮被 diagnosis_running 降级且无自动恢复。
+                // 这里把任务防御性收敛为 FAILED 后继续消费；JVM 若真在垂死，后续循环自然失败
+                log.error("[DiagnosisService] worker 处理任务时发生未捕获异常，任务收敛为 FAILED 并继续消费", t);
+                DiagnosisTask current = tasks.get(taskId);
+                if (current != null && current.finishedAt() == null) {
+                    tasks.put(taskId, current.withFailure("worker_error: " + t));
+                }
+            }
         }
     }
 
@@ -287,23 +324,27 @@ public class DiagnosisService {
         task = task.withRunning();
         tasks.put(taskId, task);
         long start = System.currentTimeMillis();
+        String report = null;
+        String failureReason = null;
         try {
-            String prompt = buildDeepPrompt(task);
-            String report = callDeepModelWithTimeout(prompt);
-            task = task.withSuccess(report);
-            long elapsed = System.currentTimeMillis() - start;
-            audit.deepDiagnosisFinished(taskId, task.trigger(), task.fingerprint(), "succeeded", elapsed);
-            metricsService.recordDiagnosis(task.trigger(), "succeeded", elapsed);
+            report = callDeepModelWithTimeout(buildDeepPrompt(task));
         } catch (Exception e) {
-            String reason = e.getClass().getSimpleName() + ": " + e.getMessage();
-            task = task.withFailure(reason);
-            long elapsed = System.currentTimeMillis() - start;
-            audit.deepDiagnosisFinished(taskId, task.trigger(), task.fingerprint(), "failed", elapsed);
-            metricsService.recordDiagnosis(task.trigger(), "failed", elapsed);
-            log.warn("[DiagnosisService] 深度诊断失败 taskId={} reason={}", taskId, reason, e);
-        } finally {
-            tasks.put(taskId, task);
+            failureReason = e.getClass().getSimpleName() + ": " + e.getMessage();
+            log.warn("[DiagnosisService] 深度诊断失败 taskId={} reason={}", taskId, failureReason, e);
+        }
+        long elapsed = System.currentTimeMillis() - start;
+        // 终态先落账，且只取决于推理结果本身：审计/指标/报告等簿记异常不允许把一份
+        // 耗时数分钟的成功报告改写成 FAILED（2026-11-14 审查修复）
+        task = failureReason == null ? task.withSuccess(report) : task.withFailure(failureReason);
+        tasks.put(taskId, task);
+        String result = failureReason == null ? "succeeded" : "failed";
+        try {
+            audit.deepDiagnosisFinished(taskId, task.trigger(), task.fingerprint(), result, elapsed);
+            metricsService.recordDiagnosis(task.trigger(), result, elapsed);
             reporter.logDeepReport(task, System.currentTimeMillis() - start);
+        } catch (RuntimeException e) {
+            // 任务已终态，簿记失败只损失一条审计/指标/控制台输出，不影响任务结果与 worker 存活
+            log.error("[DiagnosisService] 任务终态后的簿记失败 taskId={} status={}", taskId, task.status(), e);
         }
     }
 
@@ -322,6 +363,9 @@ public class DiagnosisService {
             return future.get(workerTimeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException te) {
             future.cancel(true);
+            // 记录僵尸宽限窗口起点：本调用被放弃后底层 HTTP 仍占用 Ollama 串行推理，
+            // hasInflightTask 在宽限期内继续让路（cancel 断不掉底层 HTTP）
+            lastTaskTimeoutAt = Instant.now();
             // workerTimeout 是可注入 Duration：生产以整分钟为单位注入（上方 @Autowired 构造器），
             // 亚分钟值只可能来自直接注入 Duration 的构造器（测试路径）。toMinutes() 会把亚分钟值
             // 截断为 0，消息将显示"超过 0 分钟"，故按实际量级选择单位。

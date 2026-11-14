@@ -45,12 +45,19 @@ public class AiConfig {
      * <p>
      * 取值：连接 10s（Ollama 宕机 = 秒级拒连，黑洞地址 10s 打断，叠加 1 次框架重试仍在
      * 45s 巡检预算内）；读超时默认 16m = 深度诊断 15min 硬超时 + 1min 余量——
-     * 合法推理（r1 长思考链实测可达 15 分钟）绝不被截断，但每个卡死调用 16 分钟后必然
-     * 终结、线程得以释放。可经 {@code aiops.ollama.rest-read-timeout} 覆盖。
+     * 合法推理（r1 长思考链实测可达 15 分钟）绝不被截断。
+     * 注意卡死调用的终结上界不是单次读超时 16 分钟，而是读超时 × 框架尝试次数
+     * （{@code spring.ai.retry.max-attempts=1} 即初次 + 1 次重试）≈ 32 分钟——读超时异常
+     * 在框架重试白名单内，每次重试重新计时；DiagnosisService 的僵尸宽限
+     * （{@code aiops.diagnosis.zombie-grace-minutes}）按该上界配置（2026-11-14 语义修正）。
+     * 可经 {@code aiops.ollama.rest-read-timeout} 覆盖。
      * <p>
-     * 流式路径（/api/chat、/rag/stream 的 WebClient）不在此设超时：流式增量返回数据，
-     * SSE 挂起由容器异步 I/O 超时兜底（Tomcat async timeout 在无数据时触发），
+     * 流式路径（/api/ai/chat、/api/ai/rag/stream 的 WebClient）不在此设超时：流式增量返回数据，
      * 对流式连接强行设响应超时反而会误杀长思考的合法停顿。
+     * 异步超时实测（2026-11-14，Boot 4.1 / Framework 7 / Tomcat 11，未配置
+     * spring.mvc.async.request-timeout）：不会被"30 秒默认值"切断——连续数据流存活 4 分钟、
+     * 全程静默（r1 思考期）存活 5 分钟，均无 AsyncRequestTimeout；该默认行为随栈版本可能
+     * 变化，如需钉死可显式配置 spring.mvc.async.request-timeout。
      * <p>
      * 本 Bean 声明后自动顶替自动装配（OllamaApiAutoConfiguration 为
      * {@code @ConditionalOnMissingBean}），chat / embedding 两个模型共用同一超时基线。

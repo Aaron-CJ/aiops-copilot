@@ -53,10 +53,19 @@ class DiagnosisServiceTest {
 
     private DiagnosisService newService(ChatClient chatClient, SnapshotCollector collector,
                                         Duration workerTimeout) {
+        return newService(chatClient, collector, workerTimeout, Duration.ZERO);
+    }
+
+    /**
+     * zombieGrace 显式注入：默认 ZERO 保持"无超时即无宽限"的历史语义，
+     * 僵尸宽限的让路行为由专属用例验证。
+     */
+    private DiagnosisService newService(ChatClient chatClient, SnapshotCollector collector,
+                                        Duration workerTimeout, Duration zombieGrace) {
         AuditLogger audit = new AuditLogger();
         return new DiagnosisService(chatClient, collector, new OpsAlertReporter(audit), audit,
                 new MetricsService(new SimpleMeterRegistry()), workerTimeout,
-                QUEUE_CAPACITY, DEDUP_WINDOW_MINUTES, MAX_FINISHED_TASKS);
+                QUEUE_CAPACITY, DEDUP_WINDOW_MINUTES, MAX_FINISHED_TASKS, zombieGrace);
     }
 
     /** 同指纹自动升级：PENDING 在途去重，第二次被拒 */
@@ -185,7 +194,7 @@ class DiagnosisServiceTest {
                 DiagnosisTask.Trigger.PERSISTENT, "FP|OK;",
                 Map.of("cpuUsage", 0.99, "blockedThreads", 2.0), null);
 
-        awaitStatus(task.taskId(), DiagnosisTask.Status.SUCCEEDED, 5000);
+        awaitStatus(task.taskId(), DiagnosisTask.Status.SUCCEEDED);
         DiagnosisTask done = service.get(task.taskId());
         assertEquals(DiagnosisTask.Status.SUCCEEDED, done.status());
         assertTrue(done.report().contains("测试用例"));
@@ -212,7 +221,7 @@ class DiagnosisServiceTest {
 
         DiagnosisTask task = service.submitEscalated(
                 DiagnosisTask.Trigger.PARSE_FAIL, "PARSE_FAIL", Map.of(), null);
-        awaitStatus(task.taskId(), DiagnosisTask.Status.FAILED, 5000);
+        awaitStatus(task.taskId(), DiagnosisTask.Status.FAILED);
 
         DiagnosisTask done = service.get(task.taskId());
         assertEquals(DiagnosisTask.Status.FAILED, done.status());
@@ -235,8 +244,8 @@ class DiagnosisServiceTest {
         DiagnosisTask second = service.submitEscalated(
                 DiagnosisTask.Trigger.LOW_CONFIDENCE, "FP|NEXT;", Map.of(), null);
 
-        awaitStatus(first.taskId(), DiagnosisTask.Status.FAILED, 5000);
-        awaitStatus(second.taskId(), DiagnosisTask.Status.SUCCEEDED, 5000);
+        awaitStatus(first.taskId(), DiagnosisTask.Status.FAILED);
+        awaitStatus(second.taskId(), DiagnosisTask.Status.SUCCEEDED);
         assertEquals("# 第二个任务的报告", service.get(second.taskId()).report());
     }
 
@@ -251,7 +260,7 @@ class DiagnosisServiceTest {
         long t0 = System.currentTimeMillis();
         DiagnosisTask task = service.submitEscalated(
                 DiagnosisTask.Trigger.PERSISTENT, "FP|HANG;", Map.of(), null);
-        awaitStatus(task.taskId(), DiagnosisTask.Status.FAILED, 5000);
+        awaitStatus(task.taskId(), DiagnosisTask.Status.FAILED);
         long elapsedMs = System.currentTimeMillis() - t0;
 
         DiagnosisTask done = service.get(task.taskId());
@@ -275,9 +284,101 @@ class DiagnosisServiceTest {
         DiagnosisTask second = service.submitEscalated(
                 DiagnosisTask.Trigger.LOW_CONFIDENCE, "FP|NEXT;", Map.of(), null);
 
-        awaitStatus(first.taskId(), DiagnosisTask.Status.FAILED, 5000);
-        awaitStatus(second.taskId(), DiagnosisTask.Status.SUCCEEDED, 5000);
+        awaitStatus(first.taskId(), DiagnosisTask.Status.FAILED);
+        awaitStatus(second.taskId(), DiagnosisTask.Status.SUCCEEDED);
         assertEquals("# 超时后的第二个任务报告", service.get(second.taskId()).report());
+    }
+
+    /**
+     * （2026-11-14 审查修复 F2）硬超时放弃任务 ≠ Ollama 空闲：cancel 断不掉底层 HTTP，
+     * 被放弃的调用（僵尸）仍占着串行推理通道——宽限期内 hasInflightTask 继续 true
+     * （巡检继续让路走阈值兜底），宽限期外恢复 false。
+     */
+    @Test
+    void hasInflightTaskStaysTrueDuringZombieGraceAfterTimeout() throws Exception {
+        Deque<Object> results = new ArrayDeque<>(List.of(new BlockingCall(10_000)));
+        ChatClient hangingClient = fakeChatClient(new ArrayList<>(), results);
+        service = newService(hangingClient, null, Duration.ofMillis(200), Duration.ofMillis(700));
+        service.start();
+
+        DiagnosisTask task = service.submitEscalated(
+                DiagnosisTask.Trigger.PERSISTENT, "FP|HANG;", Map.of(), null);
+        awaitStatus(task.taskId(), DiagnosisTask.Status.FAILED);
+        assertTrue(service.hasInflightTask(),
+                "任务已 FAILED 但僵尸调用仍可能占用 Ollama，宽限期内应继续让路");
+
+        Thread.sleep(1_000); // 拨过 700ms 宽限期（留 300ms 余量抗调度抖动）
+        assertFalse(service.hasInflightTask(), "僵尸宽限期外应恢复不让路");
+    }
+
+    /**
+     * （2026-11-14 审查修复 F3）workerLoop 的 Throwable 兜底：模型调用路径的 Error 会被
+     * Future 包装成 ExecutionException（属 Exception，走正常 FAILED），真正能杀死 worker 的
+     * 是从 process 的 catch(Exception) 之外逃逸的 Error——本用例让快照序列化（buildDeepPrompt
+     * 内部只捕 Exception）抛 OOM，验证任务被防御性收敛为 FAILED（worker_error）且 worker
+     * 继续消费下一个任务。worker 是深度通道与"推理让路"语义的单点，一旦死亡所有任务
+     * 永远 PENDING 且无自动恢复。
+     */
+    @Test
+    void workerSurvivesErrorEscapingProcess() throws Exception {
+        ChatClient fakeClient = fakeChatClient(new ArrayList<>(),
+                new ArrayDeque<>(List.of("# Error 后的恢复任务报告")));
+        service = newService(fakeClient, null);
+        service.start();
+
+        DiagnosisTask first = service.submitEscalated(
+                DiagnosisTask.Trigger.PERSISTENT, "FP|OOM;",
+                Map.of("evil", new EvilSnapshotValue()), null);
+        DiagnosisTask second = service.submitEscalated(
+                DiagnosisTask.Trigger.LOW_CONFIDENCE, "FP|NEXT;", Map.of(), null);
+
+        awaitStatus(first.taskId(), DiagnosisTask.Status.FAILED);
+        assertTrue(service.get(first.taskId()).error().contains("worker_error"),
+                "逃逸的 Error 应把任务防御性收敛为 FAILED: " + service.get(first.taskId()).error());
+        awaitStatus(second.taskId(), DiagnosisTask.Status.SUCCEEDED);
+        assertEquals("# Error 后的恢复任务报告", service.get(second.taskId()).report(),
+                "Error 不允许杀死 worker，第二个任务必须继续被消费");
+    }
+
+    /** 快照序列化时抛 Error 的恶意值：模拟 OOM 等从 process 的 catch(Exception) 之外逃逸 */
+    static final class EvilSnapshotValue {
+        @SuppressWarnings("unused") // Jackson 按 bean 属性内省调用
+        public String getVolatileField() {
+            throw new OutOfMemoryError("simulated heap exhaustion");
+        }
+    }
+
+    /**
+     * （2026-11-14 审查修复 F4）任务终态后的簿记（审计/指标）抛异常时，不允许把一份
+     * 耗时数分钟的成功报告改写成 FAILED（原实现 withSuccess 后的簿记在同一 try 内，
+     * 簿记异常会进 catch 分支被 withFailure 覆盖 report=null），worker 也必须继续消费。
+     */
+    @Test
+    void bookkeepingFailureKeepsSuccessReportAndWorkerAlive() throws Exception {
+        Deque<Object> results = new ArrayDeque<>(List.of("# 第一份成功报告", "# 第二份成功报告"));
+        ChatClient fakeClient = fakeChatClient(new ArrayList<>(), results);
+        AuditLogger audit = mock(AuditLogger.class);
+        doThrow(new RuntimeException("audit disk full")).when(audit)
+                .deepDiagnosisFinished(anyString(), anyString(), anyString(), anyString(), anyLong());
+        MetricsService metrics = mock(MetricsService.class);
+        doThrow(new RuntimeException("registry down")).when(metrics)
+                .recordDiagnosis(anyString(), anyString(), anyLong());
+        service = new DiagnosisService(fakeClient, null, new OpsAlertReporter(audit), audit,
+                metrics, Duration.ofMinutes(15), QUEUE_CAPACITY, DEDUP_WINDOW_MINUTES,
+                MAX_FINISHED_TASKS, Duration.ZERO);
+        service.start();
+
+        DiagnosisTask first = service.submitEscalated(
+                DiagnosisTask.Trigger.PERSISTENT, "FP|BK1;", Map.of(), null);
+        DiagnosisTask second = service.submitEscalated(
+                DiagnosisTask.Trigger.LOW_CONFIDENCE, "FP|BK2;", Map.of(), null);
+
+        awaitStatus(first.taskId(), DiagnosisTask.Status.SUCCEEDED);
+        awaitStatus(second.taskId(), DiagnosisTask.Status.SUCCEEDED);
+        assertEquals("# 第一份成功报告", service.get(first.taskId()).report(),
+                "终态后的簿记异常不允许覆盖成功报告");
+        assertEquals("# 第二份成功报告", service.get(second.taskId()).report(),
+                "簿记异常不允许杀死 worker，第二个任务必须继续被消费");
     }
 
     /** 手动提交不走防抖：同指纹（manual）可连续提交 */
@@ -304,7 +405,7 @@ class DiagnosisServiceTest {
 
         DiagnosisTask first = service.submitEscalated(
                 DiagnosisTask.Trigger.PERSISTENT, "FP|WINDOW;", Map.of(), null);
-        awaitStatus(first.taskId(), DiagnosisTask.Status.SUCCEEDED, 5000);
+        awaitStatus(first.taskId(), DiagnosisTask.Status.SUCCEEDED);
 
         // 已 FINISHED 但仍在窗口内：拒绝
         assertNull(service.submitEscalated(
@@ -375,9 +476,12 @@ class DiagnosisServiceTest {
 
     // ==================== 辅助方法 ====================
 
-    private void awaitStatus(String taskId, DiagnosisTask.Status expected, long timeoutMs)
-            throws InterruptedException {
-        long deadline = System.currentTimeMillis() + timeoutMs;
+    /** 异步任务状态等待上限：fake 客户端毫秒级返回，5s 足以覆盖 CI 抖动 */
+    private static final long AWAIT_TIMEOUT_MS = 5_000;
+
+    /** 有界轮询（非忙等）：每 50ms 查一次状态，超时即失败并附上当前状态便于定位 */
+    private void awaitStatus(String taskId, DiagnosisTask.Status expected) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT_MS;
         while (System.currentTimeMillis() < deadline) {
             DiagnosisTask t = service.get(taskId);
             if (t != null && t.status() == expected) {
@@ -386,7 +490,7 @@ class DiagnosisServiceTest {
             Thread.sleep(50);
         }
         DiagnosisTask current = service.get(taskId);
-        fail("任务 " + taskId + " 未在 " + timeoutMs + "ms 内达到 " + expected
+        fail("任务 " + taskId + " 未在 " + AWAIT_TIMEOUT_MS + "ms 内达到 " + expected
                 + "，当前状态=" + (current == null ? "null" : current.status()));
     }
 
@@ -446,14 +550,8 @@ class DiagnosisServiceTest {
     private record BlockingCall(long sleepMillis) {
     }
 
-    private static final class FakeChainHandler implements InvocationHandler {
-        private final List<String> capturedPrompts;
-        private final Deque<Object> results;
-
-        private FakeChainHandler(List<String> capturedPrompts, Deque<Object> results) {
-            this.capturedPrompts = capturedPrompts;
-            this.results = results;
-        }
+    private record FakeChainHandler(List<String> capturedPrompts, Deque<Object> results)
+            implements InvocationHandler {
 
         @Override
         public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
@@ -470,10 +568,10 @@ class DiagnosisServiceTest {
             }
             if ("content".equals(method.getName()) && method.getReturnType() == String.class) {
                 Object next = results.isEmpty() ? "" : results.pollFirst();
-                if (next instanceof BlockingCall block) {
+                if (next instanceof BlockingCall(long sleepMillis)) {
                     // 模拟 Ollama HTTP 永久挂死；sleep 响应中断（cancel(true)），不会泄漏成僵尸线程
                     try {
-                        Thread.sleep(block.sleepMillis());
+                        Thread.sleep(sleepMillis);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         throw new RuntimeException("挂死调用被中断", ie);
