@@ -121,6 +121,34 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * 请求参数字节无法按 UTF-8 解码（如客户端用 GBK 发中文表单/查询串）——Tomcat 在
+     * getParameter 时抛出，经 Spring 参数解析器冒泡。参数类问题应回 400 而非落兜底 500
+     * （2026-11-14 实测：真实客户端发坏编码字节 → 500"系统内部错误"，语义失真）。
+     * 注意这是 org.apache.tomcat.util.http 的异常，与 java.security 的同名类无关；
+     * 若此类请求落在 SSE 端点上，本 JSON 响应会因内容协商退化为 406（与其它同步
+     * 异常 handler 同一边界，SSE 端点的输入校验已前移进控制器）。
+     */
+    @ExceptionHandler(org.apache.tomcat.util.http.InvalidParameterException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Result<Void> handleInvalidParameterEncoding(org.apache.tomcat.util.http.InvalidParameterException e) {
+        log.warn("请求参数编码错误（非 UTF-8 字节）: {}", e.getMessage());
+        return Result.fail(ResultCode.BAD_REQUEST, "请求参数编码错误（需 UTF-8）");
+    }
+
+    /**
+     * 客户端断开（SSE 流式中途消失，容器异步错误通知）：响应通道已不可用，任何回写——
+     * 包括本 handler 的 JSON——都会二次失败并刷 "Failure in @ExceptionHandler"。
+     * 降为 debug 记录并静默完成，不再落 500 兜底（2026-11-14 断连实测：
+     * 此前产生"系统未知异常" ERROR + handler 二次失败双重噪音）。
+     * 注：配合 SSE 心跳（AiChatController），断开在 ≤15s 的下一次心跳写时即被发现。
+     */
+    @ExceptionHandler(org.springframework.web.context.request.async.AsyncRequestNotUsableException.class)
+    public void handleClientDisconnect(
+            org.springframework.web.context.request.async.AsyncRequestNotUsableException e) {
+        log.debug("客户端已断开（SSE 流式中断）: {}", e.getMessage());
+    }
+
+    /**
      * 处理未知异常
      */
     @ExceptionHandler(Exception.class)

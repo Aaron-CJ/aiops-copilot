@@ -2,6 +2,7 @@ package com.aiops.aiopscopilot.controller;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -20,6 +21,7 @@ import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -55,6 +57,38 @@ public class AiChatController {
      *  0.50 为 bge-m3 中文语料的经验起点，需结合 [RAG] 命中日志中的实际分数断层校准 */
     private static final double RAG_SIMILARITY_THRESHOLD = 0.50;
 
+    /**
+     * SSE 心跳间隔：数据流叠加 SSE 注释行（线上形态 {@code :ping}），EventSource 按规范忽略、
+     * 不污染"事件按序拼接即为完整回复"的契约。动机（2026-11-14 断连实测）：r1 思考期正文
+     * 静默可达数分钟，此前客户端断开要等<b>首次内容写</b>才暴露（实测滞后 3.5 分钟，
+     * r1 调用与虚拟线程被滞留）——心跳让死客户端在 15s 内随写失败显形，同时防中间代理
+     * 按空闲超时掐断静默连接。
+     */
+    static final Duration HEARTBEAT_INTERVAL = Duration.ofSeconds(15);
+
+    /** 心跳事件：仅注释行，无 data 字段 */
+    private static ServerSentEvent<String> heartbeatEvent() {
+        return ServerSentEvent.<String>builder().comment("ping").build();
+    }
+
+    private static ServerSentEvent<String> dataEvent(String data) {
+        return ServerSentEvent.builder(data).build();
+    }
+
+    /**
+     * 数据流叠加心跳（提取为纯函数便于单测）：心跳流随数据完成而停止
+     * （{@code takeUntilOther}），保证完成语义不变；客户端断开在下次心跳写时即暴露。
+     *
+     * @param data     正文事件流（已含 [ERROR] 兜底，不再向上抛错）
+     * @param interval 心跳间隔（生产 15s，单测注入毫秒级）
+     */
+    static Flux<ServerSentEvent<String>> withHeartbeat(Flux<String> data, Duration interval) {
+        Flux<ServerSentEvent<String>> heartbeat = Flux.interval(interval)
+                .map(i -> heartbeatEvent())
+                .takeUntilOther(data.ignoreElements().onErrorComplete());
+        return data.map(AiChatController::dataEvent).mergeWith(heartbeat);
+    }
+
     private final ChatClient deepseekChatClient;
     private final VectorStore vectorStore;
     private final KnowledgeIngester knowledgeIngester;
@@ -74,26 +108,34 @@ public class AiChatController {
     }
 
     /**
-     * 流式对话接口：以 SSE 逐段推送模型输出，事件按序拼接即为完整回复。
-     *
+     * 流式对话接口：以 SSE 逐段推送模型输出，data 事件按序拼接即为完整回复
+     * （流内每 15s 携带一条 {@code :ping} 注释心跳，EventSource 忽略之）。
+     * <p>
      * 开启 thinking 后 Ollama 会把 deepseek-r1 的思考过程放在单独的 thinking 字段返回，
      * 这里将其重新包装为 <think>...</think> 并与最终回答按序推送，前端可据此区分渲染；
      * 思考内容由模型自行决定，简单问题可能没有思考段。
-     *
+     * <p>
      * 注意：SSE 响应头在首个事件写入时即提交为 200，此后模型调用出错无法再返回
-     * 错误状态码，会改以 [ERROR] 开头的文本事件推送。
+     * 错误状态码，会改以 [ERROR] 开头的 data 事件推送；入参缺失/超长同样以 [ERROR]
+     * 事件返回而非抛异常（EventSource 下同步异常会因内容协商退化为容器裸错误）。
      *
      * @param message 用户提问
-     * @return SSE 事件流（思考过程 + 最终回答）
+     * @return SSE 事件流（思考过程 + 最终回答 + 心跳注释行）
      */
     @GetMapping(value = "/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<String> chat(@RequestParam String message, HttpServletResponse response) {
-        RequestLimits.checkMessage(message);
+    public Flux<ServerSentEvent<String>> chat(@RequestParam(required = false) String message, HttpServletResponse response) {
+        // 输入异常（缺参/超长）在返回 Flux 之前收敛为 [ERROR] 事件而非同步抛异常：
+        // EventSource 固定 Accept: text/event-stream，抛出的 BusinessException 经全局
+        // 异常器产出 JSON Result 会因内容协商失败退化为容器 406 裸错误（2026-11-14 审查修复）
+        String inputError = message == null ? "缺少 message 参数" : RequestLimits.violationMessage(message);
+        if (inputError != null) {
+            return Flux.just(dataEvent("[ERROR] " + inputError));
+        }
         // SSE 响应的 Content-Type 默认不带 charset；提前声明响应编码，
         // 让 Tomcat 提交响应头时追加 charset=UTF-8，避免浏览器中文乱码
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
         AtomicBoolean thinkingOpened = new AtomicBoolean(false);
-        return deepseekChatClient.prompt()
+        Flux<String> contentFlux = deepseekChatClient.prompt()
                 .options(OllamaChatOptions.builder().enableThinking())
                 .user(message)
                 .stream()
@@ -127,6 +169,7 @@ public class AiChatController {
                 .onErrorResume(e -> Flux.concat(
                         closeThinkingTagIfOpen(thinkingOpened),
                         Flux.just("[ERROR] " + e.getMessage())));
+        return withHeartbeat(contentFlux, HEARTBEAT_INTERVAL);
     }
 
     /** 思考段已打开则补 {@code </think>}，未打开则什么都不发（幂等：compareAndSet 保证只发一次） */
@@ -181,17 +224,22 @@ public class AiChatController {
      * @return SSE 事件流（最终回答，按序拼接即为完整回复）
      */
     @GetMapping(value = "/rag/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<String> ragStream(@RequestParam String message, HttpServletResponse response) {
-        RequestLimits.checkMessage(message);
+    public Flux<ServerSentEvent<String>> ragStream(@RequestParam(required = false) String message, HttpServletResponse response) {
+        // 同 /chat：输入异常收敛为 [ERROR] 事件，不走全局异常器的 JSON Result（SSE 下
+        // 会因内容协商失败退化为容器 406 裸错误）
+        String inputError = message == null ? "缺少 message 参数" : RequestLimits.violationMessage(message);
+        if (inputError != null) {
+            return Flux.just(dataEvent("[ERROR] " + inputError));
+        }
         // 同 /chat：提前声明编码，让响应头携带 charset=UTF-8，避免浏览器中文乱码
         response.setCharacterEncoding(StandardCharsets.UTF_8.name());
         RAGContext context = retrieveContext(message);
         if (context == null) {
-            return Flux.just("知识库中未找到相关信息");
+            return Flux.just(dataEvent("知识库中未找到相关信息"));
         }
         metricsService.recordRAGRetrieval(true, context.chunkCount(), context.retrievalMs());
         long aiStart = System.currentTimeMillis();
-        return deepseekChatClient.prompt()
+        Flux<String> content = deepseekChatClient.prompt()
                 .system(RAG_SYSTEM_PROMPT)
                 .user(ragUserPrompt(context.text(), message))
                 .stream()
@@ -201,6 +249,7 @@ public class AiChatController {
                         "/api/ai/rag/stream", System.currentTimeMillis() - aiStart))
                 .doOnError(e -> log.error("[AiChatController] /api/ai/rag/stream 流式输出异常", e))
                 .onErrorResume(e -> Flux.just("[ERROR] " + e.getMessage()));
+        return withHeartbeat(content, HEARTBEAT_INTERVAL);
     }
 
     /** RAG 系统 Prompt：强约束基于知识库作答并注明来源，抑制幻觉。 */
