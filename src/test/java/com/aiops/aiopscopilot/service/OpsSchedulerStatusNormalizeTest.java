@@ -10,11 +10,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Method;
-import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 /**
@@ -46,9 +44,13 @@ class OpsSchedulerStatusNormalizeTest {
             "cpuUsage", 0.1, "heapUsage", 0.2, "qpsLast1m", 5.0,
             "blockedThreads", 0.0, "gcCountLast5m", 0.0, "maxRequestSeconds", 0.1);
 
+    /** 空闲实例快照块：其余指标健康，仅 QPS=0（从未有流量的常态） */
+    private static final Map<String, Object> IDLE_BLOCK = Map.of(
+            "cpuUsage", 0.0, "heapUsage", 0.15, "qpsLast1m", 0.0,
+            "blockedThreads", 0.0, "gcCountLast5m", 0.0, "maxRequestSeconds", 0.1);
+
     private IncidentStore incidentStore;
     private OpsAlertReporter reporter;
-    private MetricsService metricsService;
     private SimpleMeterRegistry registry;
     private DiagnosisService diagnosisService;
     private OpsScheduler scheduler;
@@ -59,7 +61,7 @@ class OpsSchedulerStatusNormalizeTest {
         incidentStore = new IncidentStore();
         reporter = mock(OpsAlertReporter.class);
         registry = new SimpleMeterRegistry();
-        metricsService = new MetricsService(registry);
+        MetricsService metricsService = new MetricsService(registry);
         diagnosisService = mock(DiagnosisService.class);
         scheduler = new OpsScheduler(null, null, reporter, metricsService,
                 incidentStore, new AuditLogger(), diagnosisService, 45);
@@ -248,6 +250,68 @@ class OpsSchedulerStatusNormalizeTest {
                 anyString(), anyString(), anyString(), any(), anyString());
         assertEquals(1, incidentStore.activeCount(), "只有 app-2 应有事件");
     }
+
+    // ==================== C. 空闲基线门控：QPS=0 的 warning 不建事件 ====================
+
+    /**
+     * 从未观测到流量的实例，QPS=0 是常态而非假死前兆。
+     * <p>
+     * 模型按 Prompt 第 3 条仍会判"低流量或假死待确认"warning（实测空闲基线轮即触发），
+     * 若放行则空闲环境每轮新增一条 ZERO_QPS 事件、9 分钟后才自愈。
+     * 门控：无任何其它硬信号时降为 normal——不报、不建事件。
+     */
+    @Test
+    void idleZeroQpsWarningIsSuppressed() throws Exception {
+        handleMulti("{\"targets\":[{\"name\":\"" + SELF + "\",\"status\":\"warning\",\"confidence\":\"high\","
+                + "\"summary\":\"各项指标正常\",\"rootCause\":\"N/A\",\"suggestion\":\"N/A\"}]}",
+                Map.of(SELF, IDLE_BLOCK));
+
+        verify(reporter, never()).report(anyString(), anyString(), anyString(),
+                anyString(), anyString(), any(), anyString());
+        assertEquals(0, incidentStore.activeCount(), "空闲实例的 QPS=0 warning 不得建事件");
+    }
+
+    /**
+     * 对照组：观测到过流量后归零，就是真实的假死前兆，门控必须放行——
+     * 否则修复"空闲误报"会把"假死漏报"引进来。
+     */
+    @Test
+    void zeroQpsWarningStillRaisedAfterTrafficWasObserved() throws Exception {
+        // 第一轮有真实流量：observedTraffic 置位
+        handleMulti("{\"targets\":[{\"name\":\"" + SELF + "\",\"status\":\"normal\",\"confidence\":\"high\","
+                + "\"summary\":\"各项指标正常\",\"rootCause\":\"N/A\",\"suggestion\":\"N/A\"}]}",
+                Map.of(SELF, HEALTHY_BLOCK));
+        // 第二轮流量归零：应正常报 warning 并建事件
+        handleMulti("{\"targets\":[{\"name\":\"" + SELF + "\",\"status\":\"warning\",\"confidence\":\"high\","
+                + "\"summary\":\"QPS 归零，疑似假死\",\"rootCause\":\"QPS=0\",\"suggestion\":\"确认服务状态\"}]}",
+                Map.of(SELF, IDLE_BLOCK));
+
+        verify(reporter, times(1)).report(startsWith("WARNING|APP=" + SELF + ";ZERO_QPS;"), eq("warning"),
+                anyString(), anyString(), anyString(), any(), anyString());
+        assertEquals(1, incidentStore.activeCount(), "有流量后归零是真实假死信号，必须报");
+    }
+
+    /**
+     * 门控压下的 warning（status 被改为 normal）不得落入 normal+low 的
+     * LOW_CONFIDENCE 升级分支——否则空闲环境按防抖周期（10 分钟）反复唤醒 r1
+     * 去"复核"一个确定性空闲的目标（独占 Ollama 1.7-6.6 分钟并触发巡检让路），
+     * 且升级 note 会失真地声称"模型判为 normal"（实际判的是 warning）。
+     */
+    @Test
+    void suppressedWarningWithLowConfidenceDoesNotWakeDeepDiagnosis() throws Exception {
+        handleMulti("{\"targets\":[{\"name\":\"" + SELF + "\",\"status\":\"warning\",\"confidence\":\"low\","
+                + "\"summary\":\"低流量或假死待确认\",\"rootCause\":\"QPS=0\",\"suggestion\":\"观察\"}]}",
+                Map.of(SELF, IDLE_BLOCK));
+
+        verify(diagnosisService, never()).submitEscalated(any(), anyString(), any(), anyString());
+        verify(reporter, never()).report(anyString(), anyString(), anyString(),
+                anyString(), anyString(), any(), anyString());
+        assertEquals(0, incidentStore.activeCount());
+    }
+
+    // normal+low（非门控路径）的漏报复核升级已由 OpsSchedulerEscalationWiringTest
+    // .normalWithLowConfidenceSubmitsLowConfidenceReview 单一事实来源覆盖（断言更细：
+    // 精确指纹与精确快照块），且该用例同样流经门控分支（normal 时门控跳过），不再重复。
 
     // ==================== 辅助方法 ====================
 

@@ -567,6 +567,19 @@ public class OpsScheduler {
                 // 严重超阈值时强改级别——硬信号（BLOCKED>0/堆>95%/CPU>90%）是确定性观测，
                 // 模型"没说话"不能让死锁漏报一整轮（与降级路径对同一指标的口径一致）
                 String status = applyThresholdBackstop(j.target(), j.status(), block);
+                // 空闲基线门控（与降级路径 fallbackForTarget 的 observedTraffic 口径对齐）：
+                // 从未观测到流量的实例 QPS=0 是常态，不是假死前兆；模型按 Prompt 第 3 条仍会判
+                // "低流量或假死待确认"warning，若放行则空闲环境每轮新增一条事件（实测 9 分钟才自愈）。
+                // 仅在指纹只剩 ZERO_QPS（无死锁/高堆/高 CPU/GC 等硬信号）时降为 normal——
+                // 一旦观测过流量，同样的 QPS=0 就是真实假死信号，保持模型判定不动。
+                boolean idleSuppressed = false;
+                if ("warning".equalsIgnoreCase(status)
+                        && !observedTraffic.getOrDefault(j.target(), false)
+                        && IncidentStore.fingerprintOf(j.target(), status, block).endsWith(";ZERO_QPS;")) {
+                    audit.backstopTriggered(j.target(), status, "normal", "qpsLast1m", qps);
+                    status = "normal";
+                    idleSuppressed = true;
+                }
                 // 契约外 status 且无硬信号命中：本轮该目标"判不了"——
                 // 既不进状态机（不误报），也不计入 normal 集合（其存量事件不归档，避免误判恢复）。
                 // 轮级状态标 unknown，运维从 aiops_inspection_total{status="unknown"} 可见。
@@ -579,7 +592,12 @@ public class OpsScheduler {
                 // AI 对正常目标自报 low confidence 时仍走漏报复核
                 if ("normal".equalsIgnoreCase(status)) {
                     normalTargets.add(j.target());
-                    if (!degraded && "low".equalsIgnoreCase(j.confidence())) {
+                    // 空闲门控压下的 warning 不走 low-confidence 复核：模型的"没把握"来自
+                    // QPS=0 的语义歧义（空闲 vs 假死），基线已确定性回答"空闲"；r1 看到的
+                    // 是同一份快照，复核不产生新信息，却会按防抖周期（10 分钟）反复唤醒
+                    // 单实例 Ollama（1.7-6.6 分钟/次）并触发巡检让路。模型真判 normal + low
+                    // （非门控路径）的漏报复核不受影响。
+                    if (!degraded && !idleSuppressed && "low".equalsIgnoreCase(j.confidence())) {
                         String fp = IncidentStore.fingerprintOf(j.target(), "normal", block);
                         diagnosisService.submitEscalated(
                                 DiagnosisTask.Trigger.LOW_CONFIDENCE,
@@ -618,6 +636,9 @@ public class OpsScheduler {
                     worstStatus = status;
                     worstFp = fp;
                     worstIncidentActive = !incident.isNew();
+                } else if (rank(status) == rank(worstStatus) && !incident.isNew()) {
+                    // 同级出现已跨周期的事件：|active 标记如实反映（首个同级 NEW 不掩盖后续 ACTIVE）
+                    worstIncidentActive = true;
                 }
             }
             // 全部目标都判不了（status 全在契约外且无硬信号兜底命中）：JSON 本身合法，
@@ -678,10 +699,11 @@ public class OpsScheduler {
     }
 
     private void handleInspectionResult(String reply, Map<String, Object> snapshot, long start, boolean degraded) {
-        List<TargetJudgment> judgments = null;
+        List<TargetJudgment> judgments;
         try {
             judgments = parseJudgments(reply, snapshot);
         } catch (Exception e) {
+            // 解析异常与"解析不出判定"同通道收敛，统一由下方 judgments == null || isEmpty() 处理
             judgments = null;
         }
         if (judgments == null || judgments.isEmpty()) {
@@ -782,7 +804,8 @@ public class OpsScheduler {
      * AI 漏报兜底：AI 判 normal（或"判不了"——契约外 status）但该目标指标严重超阈值时
      * 强改级别——模型可能对明显异常过于保守甚至没给出级别，关键硬信号（死锁/堆爆/CPU 打满）
      * 不允许被一句"正常"或"没说话"盖过去。
-     * 每次介入都写审计，便于事后核对是 AI 对还是兜底对；
+     * 每次介入都写审计，便于事后核对是 AI 对还是兜底对：aiStatus 透传原始判定
+     * （normal 或 unknown——"模型没给出可判定级别"不得冒充"模型判了 normal"，2026-11-14 修正）；
      * rootCause 的"[代码级兜底已介入：...]"标注由调用方 routeJudgments 追加。
      */
     private String applyThresholdBackstop(String targetName, String status, Map<String, Object> block) {
@@ -795,17 +818,17 @@ public class OpsScheduler {
 
         // BLOCKED > 0 比 CPU 更严重，直接 critical
         if (blocked > 0) {
-            audit.backstopTriggered(targetName, "normal", "critical", "blockedThreads", blocked);
+            audit.backstopTriggered(targetName, status, "critical", "blockedThreads", blocked);
             return "critical";
         }
         // 堆内存 > 95% 也直接 critical
         if (heap > HEAP_CRITICAL_THRESHOLD) {
-            audit.backstopTriggered(targetName, "normal", "critical", "heapUsage", heap);
+            audit.backstopTriggered(targetName, status, "critical", "heapUsage", heap);
             return "critical";
         }
         // CPU > 90% 强改 warning
         if (cpu > CPU_WARN_THRESHOLD) {
-            audit.backstopTriggered(targetName, "normal", "warning", "cpuUsage", cpu);
+            audit.backstopTriggered(targetName, status, "warning", "cpuUsage", cpu);
             return "warning";
         }
         return status;
@@ -820,7 +843,10 @@ public class OpsScheduler {
                 + "请对 targets 中的每个目标逐一判断是否异常，逐目标考虑：\n"
                 + "1) CPU 使用率过高（>" + CPU_WARN_THRESHOLD + " 警告；持续接近 100% 且伴随其它异常时可判 critical。"
                 + "代码级兜底以同一 0.90 线判 warning，口径一致）\n"
-                + "2) 堆内存是否接近 OOM（注意持续增长比绝对值更重要）\n"
+                + "2) 堆内存使用率 heapUsage（已用/上限，0-1 比例）：>0.95 必须判 critical，"
+                + ">0.90 判 warning（与代码级兜底同一 0.95 线，口径一致）；"
+                + "再结合 heapMemoryByGen 中 Old 代占用是否显著偏高、gcCountLast5m 是否明显增长，"
+                + "判断是否疑似内存泄漏——此时 rootCause 必须点明'内存泄漏'并给出 Old 区/GC 的具体证据，不得填 N/A\n"
                 + "3) QPS 是否异常下跌（端口还在但 QPS=0 是应用假死信号；"
                 + "但若 CPU 同样极低且无 BLOCKED/慢请求等其他异常，也可能是合法的空闲低流量系统，"
                 + "此时判 warning 并注明'低流量或假死待确认'，不要直接判 critical）\n"
@@ -831,6 +857,12 @@ public class OpsScheduler {
                 + "6) maxRequestSeconds（请求最大延迟，秒）显著偏高（如 >5 秒）说明存在慢接口，"
                 + "应结合 QPS 下跌趋势判断是否拖垮整体吞吐\n"
                 + "7) 一个目标的异常与其它目标无关，不要跨目标推断\n\n"
+                + "输出前逐目标自检（硬性，违反即视为错误判定）：\n"
+                + "- heapUsage>0.95 或 blockedThreads>0 的目标 status 必须是 critical；\n"
+                + "- heapUsage>0.90 或 cpuUsage>0.90 的目标 status 至少 warning；\n"
+                + "- 上述任一命中时 rootCause 不得填 N/A。\n"
+                + "示例：某目标 heapUsage=0.96、heapMemoryByGen 中 G1 Old Gen 约 9.5e8 字节、gcCountLast5m 在增长，"
+                + "则 status=critical，rootCause 写\"堆内存使用率 0.96 超过 0.95 严重线，Old 区占用约 947MB 且持续增长，疑似内存泄漏\"。\n\n"
                 + "仅输出严格的 JSON（不要 markdown 代码块、不要任何解释文字），对每个目标输出一条判定，格式：\n"
                 + "{\"targets\":[{\"name\":\"目标名（逐字复制）\",\"status\":\"normal|warning|critical\","
                 + "\"confidence\":\"high|medium|low\",\"summary\":\"一句话摘要（正常填'各项指标正常'）\","
