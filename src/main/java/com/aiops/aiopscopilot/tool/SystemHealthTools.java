@@ -91,7 +91,6 @@ public class SystemHealthTools {
         }
 
         result.put("deadlockDetected", true);
-        result.put("deadlockedThreadCount", ids.length);
 
         List<Map<String, Object>> threads = new ArrayList<>(ids.length);
         for (long id : ids) {
@@ -109,6 +108,9 @@ public class SystemHealthTools {
             thread.put("topStackFrames", formatStack(info.getStackTrace()));
             threads.add(thread);
         }
+        // 计数以实际取到详情的线程为准（getThreadInfo 极端竞态下可能对个别 id 返回 null）——
+        // count 与列表不一致会让模型读到自相矛盾的工具输出（2026-11-14 审查修复）
+        result.put("deadlockedThreadCount", threads.size());
         result.put("deadlockedThreads", threads);
         return result;
     }

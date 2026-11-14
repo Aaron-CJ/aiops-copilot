@@ -244,31 +244,19 @@ public class PrometheusTool {
         }
 
         // ② 查询计划：默认 QPS 拆成两条独立子查询并行发起，最后在 Java 侧相减
-        List<QueryJob> jobs = new ArrayList<>();
-        for (Map.Entry<String, String> e : plan.entrySet()) {
-            jobs.add(new QueryJob(e.getKey(), e.getValue(), "heapMemoryByGen".equals(e.getKey())));
-        }
-        if (qpsOverride == null) {
-            String app = target.application();
-            jobs.add(new QueryJob(QPS_TOTAL_JOB,
-                    "sum(rate(http_server_requests_seconds_count{application=\"" + app + "\"}[1m]))", false));
-            // 基线侧同样 sum 聚合：rate() 每副本一条序列，不聚合时减法用的是
-            // "随机一个副本"的基线，多副本下总-基线口径错位（副本数 × 0.067 的偏差）
-            jobs.add(new QueryJob(QPS_ACTUATOR_JOB,
-                    "sum(rate(http_server_requests_seconds_count{application=\"" + app + "\",uri=\"/actuator/prometheus\"}[1m]))", false));
-        }
+        List<QueryJob> jobs = buildQueryJobs(plan, qpsOverride, target.application());
 
         // ③ 并行执行全部查询 → ④ 组装快照
         Map<String, Object> values = runJobs(jobs);
         for (String key : JVM_DEFAULT_PROFILE.keySet()) {
             // 没进计划 = 显式留空覆盖（该目标无此语义）→ -1 哨兵
-            snapshot.put(key, values.containsKey(key) ? values.get(key) : -1.0);
+            snapshot.put(key, values.getOrDefault(key, -1.0));
         }
         if (qpsOverride == null) {
             // QPS = 总速率 - actuator 抓取基线，减法在 Java 侧完成而非 PromQL（实测踩坑）：
             // sum() 产出无标签向量，rate() 产出带标签向量，PromQL 算术逐标签匹配不相等 →
-            // 相减得空集（多实例下还是 many-to-many 直接报错）。任何一侧查询失败（-1）→
-            // 整体 -1 哨兵，AI 按"查询失败"忽略。
+            // 相减得空集（多实例下还是 many-to-many 直接报错）。总速率侧查询失败 →
+            // 整体 -1 哨兵（基线侧失败按 0，见 qpsFrom），AI 按"查询失败"忽略。
             snapshot.put("qpsLast1m", qpsFrom(
                     asDouble(values.get(QPS_TOTAL_JOB)), asDouble(values.get(QPS_ACTUATOR_JOB))));
         } else if (qpsOverride.isBlank()) {
@@ -277,6 +265,35 @@ public class PrometheusTool {
             snapshot.put("qpsLast1m", values.get("qpsLast1m"));
         }
         return snapshot;
+    }
+
+    /**
+     * ② 把①产出的语义查询计划展开为可并行执行的作业列表。
+     * <p>
+     * 默认 QPS 路径额外拆成"总速率"与"actuator 抓取基线"两条独立子查询，
+     * 相减留到 Java 侧完成（见 querySnapshot ④）；目标已用非空 PromQL 覆盖 qpsLast1m 时，
+     * 该语义已在 plan 内，不再追加子查询。
+     *
+     * @param plan        语义键 → PromQL（① 已应用目标覆盖）
+     * @param qpsOverride 目标对 qpsLast1m 的原始覆盖：null=默认减法路径，空白=无此语义，非空=单条查询
+     * @param application 目标标签值，用于默认 QPS 子查询的 application 过滤
+     */
+    private static List<QueryJob> buildQueryJobs(Map<String, String> plan, String qpsOverride,
+                                                 String application) {
+        List<QueryJob> jobs = new ArrayList<>();
+        for (Map.Entry<String, String> e : plan.entrySet()) {
+            jobs.add(new QueryJob(e.getKey(), e.getValue(), "heapMemoryByGen".equals(e.getKey())));
+        }
+        if (qpsOverride == null) {
+            jobs.add(new QueryJob(QPS_TOTAL_JOB,
+                    "sum(rate(http_server_requests_seconds_count{application=\"" + application + "\"}[1m]))", false));
+            // 基线侧同样 sum 聚合：rate() 每副本一条序列，不聚合时减法用的是
+            // "随机一个副本"的基线，多副本下总-基线口径错位（副本数 × 0.067 的偏差）
+            jobs.add(new QueryJob(QPS_ACTUATOR_JOB,
+                    "sum(rate(http_server_requests_seconds_count{application=\"" + application
+                            + "\",uri=\"/actuator/prometheus\"}[1m]))", false));
+        }
+        return jobs;
     }
 
     /**
@@ -324,7 +341,9 @@ public class PrometheusTool {
 
     /**
      * Java 侧 QPS 减法的纯函数形态：总速率 - actuator 基线，结果钳到 ≥0。
-     * 任一侧查询失败（-1 哨兵）→ 整体 -1（AI 按"查询失败"忽略，而非误读为 0 流量）。
+     * 总速率侧查询失败（-1 哨兵）→ 整体 -1（AI 按"查询失败"忽略，而非误读为 0 流量）；
+     * 基线侧失败按 0 处理——基线只是自抓取污染的扣除项，缺失时最多高估一个抓取基线
+     * （≈0.067），把整个读数丢成"查询失败"反而更失真（qpsFrom_actuatorMissing_treatedAsZero 锁定）。
      */
     static double qpsFrom(double totalQps, double actuatorQps) {
         if (totalQps < 0) {

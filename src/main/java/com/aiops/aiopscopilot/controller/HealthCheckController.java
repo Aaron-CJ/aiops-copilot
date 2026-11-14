@@ -3,6 +3,7 @@ package com.aiops.aiopscopilot.controller;
 import java.io.File;
 import java.net.http.HttpClient;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -65,6 +66,7 @@ public class HealthCheckController {
         factory.setReadTimeout(PROBE_READ_TIMEOUT);
         this.restClient = RestClient.builder().requestFactory(factory).build();
         this.ollamaBaseUrl = ollamaBaseUrl;
+        // Milvus standalone 的 9091 健康端口只提供明文 HTTP（无 TLS），按实际协议拼接，勿改成 https
         this.milvusHealthUrl = "http://" + milvusHost + ":" + MILVUS_HEALTH_PORT;
         this.prometheusBaseUrl = prometheusBaseUrl;
         this.requiredModels = List.of(fastModel, chatModel, embeddingModel);
@@ -86,8 +88,10 @@ public class HealthCheckController {
         Map<String, Object> info = new LinkedHashMap<>();
         try {
             String body = restClient.get().uri(ollamaBaseUrl + "/api/tags").retrieve().body(String.class);
+            // 响应体只解析一次复用（此前每个模型各 readTree 一遍，2026-11-14 审查微优化）
+            List<String> modelNames = parseModelNames(body);
             List<String> missing = requiredModels.stream()
-                    .filter(model -> !modelPresent(body, model))
+                    .filter(model -> !modelPresent(modelNames, model))
                     .toList();
             if (missing.isEmpty()) {
                 info.put("status", "UP");
@@ -103,19 +107,24 @@ public class HealthCheckController {
         return info;
     }
 
-    /** Ollama /api/tags 中是否已拉取指定模型（配置写 qwen3:8b，回报可能是 qwen3:8b:latest） */
-    private boolean modelPresent(String tagsBody, String required) {
+    /** /api/tags 响应中的模型名列表；非法 JSON 按空列表处理（各模型如实报缺失） */
+    private List<String> parseModelNames(String tagsBody) {
         try {
+            List<String> names = new ArrayList<>();
             for (JsonNode model : objectMapper.readTree(tagsBody).path("models")) {
-                String name = model.path("name").asString("");
-                if (name.equals(required) || name.startsWith(required + ":")) {
-                    return true;
-                }
+                names.add(model.path("name").asString(""));
             }
-        } catch (Exception ignored) {
-            // 响应体不是合法 JSON：按"不在位"处理，由 missing 列表如实暴露
+            return names;
+        } catch (Exception e) {
+            // 响应体不是合法 JSON：按"全不在位"处理，由 missing 列表如实暴露
+            return List.of();
         }
-        return false;
+    }
+
+    /** 模型是否在位（配置写 qwen3:8b，回报可能是 qwen3:8b:latest） */
+    private boolean modelPresent(List<String> modelNames, String required) {
+        return modelNames.stream()
+                .anyMatch(name -> name.equals(required) || name.startsWith(required + ":"));
     }
 
     private Map<String, Object> checkMilvus() {

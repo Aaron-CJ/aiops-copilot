@@ -234,6 +234,24 @@ class PrometheusToolSnapshotTest {
                 "留空语义不应发查询: " + receivedQueries);
     }
 
+    /**
+     * qpsLast1m 显式留空 = 该目标没有 QPS 语义：结果记 -1 哨兵，
+     * 且默认减法路径的两条子查询都不发（buildQueryJobs 只在 qpsOverride == null 时追加）。
+     */
+    @Test
+    void blankQpsOverrideYieldsMinusOneAndSkipsSubtractionQueries() {
+        PrometheusTool tool = new PrometheusTool(baseUrl);
+        Map<String, Object> snapshot = tool.querySnapshot(new MonitoredTarget("pay", "payment-gateway",
+                Map.of("qpsLast1m", "")));
+
+        assertEquals(-1.0, (Double) snapshot.get("qpsLast1m"), 1e-9, "留空的 QPS 语义应记 -1 哨兵");
+        assertEquals(6, requestCount.get(), "仅 6 条默认语义查询，不追加 QPS 子查询");
+        assertFalse(receivedQueries.stream()
+                        .anyMatch(q -> q.contains("http_server_requests_seconds_count")),
+                "不应发起默认 QPS 减法路径的子查询: " + receivedQueries);
+        assertEquals(0.42, (Double) snapshot.get("cpuUsage"), 1e-9, "其余语义键仍应正常回填");
+    }
+
     /** 目标自定义 QPS 表达式：单条查询，跳过内置的 Java 侧减法 */
     @Test
     void qpsOverrideUsesSingleQueryAndSkipsSubtraction() {
