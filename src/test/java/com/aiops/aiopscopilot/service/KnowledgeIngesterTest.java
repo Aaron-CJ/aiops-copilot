@@ -123,7 +123,10 @@ class KnowledgeIngesterTest {
         assertTrue(added.stream().allMatch(d ->
                 "CloudWeaver 内部行政规定".equals(d.getMetadata().get("source"))),
                 "每个切片必须继承标题 source，RAG 引用才会一致");
-        assertTrue(added.stream().noneMatch(d -> d.getText().contains("知识库：CloudWeaver")),
-                "标题行不应进入任何切片正文");
+        // Spring AI 2.0 的 Document.getText() 标注 @Nullable；无正文自然不含标题行
+        assertTrue(added.stream().noneMatch(d -> {
+            String text = d.getText();
+            return text != null && text.contains("知识库：CloudWeaver");
+        }), "标题行不应进入任何切片正文");
     }
 }

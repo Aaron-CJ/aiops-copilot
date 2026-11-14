@@ -11,7 +11,6 @@ import com.aiops.aiopscopilot.tool.PrometheusTool;
 import com.aiops.aiopscopilot.tool.SystemHealthTools;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 /**

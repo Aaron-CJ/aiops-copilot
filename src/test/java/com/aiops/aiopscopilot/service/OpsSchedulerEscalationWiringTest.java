@@ -12,7 +12,6 @@ import com.aiops.aiopscopilot.service.diagnosis.DiagnosisService;
 import com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 /**
@@ -230,20 +229,16 @@ class OpsSchedulerEscalationWiringTest {
      * 继续降级走心跳，且降级 normal 轮不 bumpNormal——事件不得被"降级 normal"错误归档。
      */
     @Test
-    void threeDegradedRoundsRaiseLlmUnavailableIncident() throws Exception {
-        Method degrade = OpsScheduler.class.getDeclaredMethod("handleDegraded", Map.class, long.class, boolean.class);
-        degrade.setAccessible(true);
-        Map<String, Object> snapshot = Map.of("targets", Map.of(SELF, NORMAL_BLOCK));
-
+    void threeDegradedRoundsRaiseLlmUnavailableIncident() {
         for (int i = 0; i < 3; i++) {
-            degrade.invoke(scheduler, snapshot, System.currentTimeMillis(), true);
+            handleDegraded(NORMAL_BLOCK);
         }
         verify(reporter, times(1)).report(eq("CRITICAL|LLM_UNAVAILABLE;"), eq("critical"),
                 anyString(), anyString(), anyString(), any(), any());
 
         // 第 4、5 轮继续降级：同指纹心跳而非重复报告；绝无 RESOLVED（盲期不归档）
-        degrade.invoke(scheduler, snapshot, System.currentTimeMillis(), true);
-        degrade.invoke(scheduler, snapshot, System.currentTimeMillis(), true);
+        handleDegraded(NORMAL_BLOCK);
+        handleDegraded(NORMAL_BLOCK);
         verify(reporter, times(2)).logHeartbeat(any());
         verify(reporter, never()).logResolved(any());
         verify(diagnosisService, never()).submitEscalated(anyString(), anyString(), any(), any());

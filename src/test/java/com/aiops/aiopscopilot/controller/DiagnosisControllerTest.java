@@ -10,7 +10,6 @@ import com.aiops.aiopscopilot.service.diagnosis.DiagnosisTask.Trigger;
 import com.aiops.aiopscopilot.service.diagnosis.DiagnosisTaskFixtures;
 
 import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 /**

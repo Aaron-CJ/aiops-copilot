@@ -19,8 +19,8 @@ import static org.junit.jupiter.api.Assertions.*;
  * 覆盖三块逻辑：
  * <ol>
  *   <li>{@link IncidentStore} 状态机去重（NEW → ACTIVE → RESOLVED、复发重新 NEW、指纹构造）</li>
- *   <li>{@link OpsScheduler#applyThresholdBackstop} AI 漏报兜底（normal 被硬指标强改）</li>
- *   <li>{@link OpsScheduler#fallbackByThreshold} Ollama 降级路径（阈值规则 → 逐目标判定；
+ *   <li>{@code OpsScheduler#applyThresholdBackstop} AI 漏报兜底（normal 被硬指标强改）</li>
+ *   <li>{@code OpsScheduler#fallbackByThreshold} Ollama 降级路径（阈值规则 → 逐目标判定；
  *       死锁/内存泄漏/QPS 假死的完整场景在 FaultInjectionEvaluationTest F1-F5）</li>
  * </ol>
  * 后两者是 OpsScheduler 的 private 方法，用反射调用——不为测试改生产方法可见性；
